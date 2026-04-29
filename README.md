@@ -22,8 +22,8 @@ Cinnamon has no association, endorsement, or any connection whatsoever with any 
 
 Photos/Videos of Cinnamon running!
 
-Snowdin!!! (From @casrielasriel)  
+Like the forest before snowdin!
 <img src="/resources/readme/screenshots/pic1.jpg" height="128px"></img>  
 
-Asriel!! (From @abrahamgvitar in the discord)  
-<video src="https://github.com/Project-Sunshine-Native/cinnamon/raw/refs/heads/main/resources/readme/screenshots/vid1.mp4" width="50%" controls></video>  
+Undyne the Undying!!
+<iframe width="560" height="315" src="https://www.youtube.com/embed/QqKhSn0SHL8?si=gTCYZ5W_iv9pbTRr" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
