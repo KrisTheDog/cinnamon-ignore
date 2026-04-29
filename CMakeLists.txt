@@ -1,12 +1,6 @@
-cmake_minimum_required (VERSION 3.14)
+cmake_minimum_required(VERSION 3.21)
 
-project(
-    Cinnamon
-    VERSION 1.2
-    LANGUAGES C
-)
-
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+project(Cinnamon VERSION 1.2 LANGUAGES C)
 
 set(COMMON_SOURCES
     src/audio_system.h
@@ -45,10 +39,6 @@ set(COMMON_SOURCES
     src/vm_builtins.h
 )
 
-include_directories(vendor)
-
-find_package(SDL2 REQUIRED)
-
 if(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
     set(WIIU_SOURCES
         src/wiiu/wiiu_audio_system.c
@@ -63,17 +53,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
         src/wiiu/wiiu_file_system.h
     )
 
-    add_executable(
-        Cinnamon 
-        ${COMMON_SOURCES} 
-        ${WIIU_SOURCES}
+    find_package(SDL2 CONFIG REQUIRED)
+
+    add_executable(Cinnamon ${COMMON_SOURCES} ${WIIU_SOURCES})
+
+    target_include_directories(Cinnamon PRIVATE
+        src
+        vendor
     )
 
     target_link_libraries(Cinnamon PRIVATE SDL2::SDL2)
 
     wut_create_rpx(Cinnamon)
 
-    wut_create_wuhb(Cinnamon 
+    wut_create_wuhb(Cinnamon
         NAME "UNDERTALE"
         SHORTNAME "UNDERTALE"
         AUTHOR "Toby Fox, Project Sunshine"
@@ -83,5 +76,5 @@ if(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
         CONTENT resources/wiiu/content
     )
 else()
-    message(FATAL_ERROR "Platform is not supported or incorrectly provided!")
+     message(FATAL_ERROR "Platform is not supported or incorrectly provided!")
 endif()

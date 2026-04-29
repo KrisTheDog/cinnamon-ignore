@@ -16,6 +16,19 @@ Cinnamon aims to be a open source re-implementation of GameMaker 1.4's (gms2 soo
 
 Games like UNDERTALE have already been successfully ported to the Wii U and 3DS and are playable the whole way through. While only Bytecode version 16 is supported as of now, more bytecodes and features will be implemented in the future.
 
+## Building For Wii U
+
+You must have a proper devkitPro Wii U enviroment set up and configured for your platform.
+
+Configure with the Wii U CMake wrapper and then build:
+
+```bash
+powerpc-eabi-cmake -S . -B build/wiiu
+cmake --build build/wiiu
+```
+
+This produces `Cinnamon.elf`, `Cinnamon.rpx`, and a `.wuhb` bundle in `build/wiiu`.
+
 ## Disclaimer
 
 Cinnamon has no association, endorsement, or any connection whatsoever with any of the software that it facilitates, and does not provide any of the software it can run by itself. In order to use Cinnamon, you will need to provide your own game files.

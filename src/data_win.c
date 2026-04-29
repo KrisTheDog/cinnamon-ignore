@@ -333,7 +333,7 @@ static void parseLANG(BinaryReader* reader, DataWin* dw) {
     }
 }
 
-static void parse   (BinaryReader* reader, DataWin* dw) {
+static void parseEXTN(BinaryReader* reader, DataWin* dw) {
     Extn* e = &dw->extn;
 
     uint32_t extCount;
