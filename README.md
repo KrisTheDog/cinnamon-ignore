@@ -1,7 +1,7 @@
 <h1 align="center">Cinnamon</h1>
 
 <p align="center">
-    <img src="icon.png" height="128px"></img>
+    <img src="/resources/readme/icon/icon.png" height="128px"></img>
 </p>
 <p align="center">
     <a href="https://discord.gg/AahyBCvVR2"><img src="https://img.shields.io/discord/1406856655920168971?color=5865F2&logo=discord&logoColor=white&label=discord"></a>
@@ -19,3 +19,11 @@ Games like UNDERTALE have already been successfully ported to the Wii U and 3DS 
 ## Disclaimer
 
 Cinnamon has no association, endorsement, or any connection whatsoever with any of the software that it facilitates, and does not provide any of the software it can run by itself. In order to use Cinnamon, you will need to provide your own game files.
+
+Photos/Videos of Cinnamon running!
+
+Snowdin!!! (From @casrielasriel)
+<img src="/resources/readme/screenshots/pic1.jpg" height="128px"></img>
+
+Asriel!! (From @abrahamgvitar in the discord)
+<video src="/resources/readme/screenshots/vid1.mp4" width="50%" controls></video>
