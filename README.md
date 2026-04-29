@@ -22,8 +22,8 @@ Cinnamon has no association, endorsement, or any connection whatsoever with any 
 
 Photos/Videos of Cinnamon running!
 
-Like the forest before snowdin!
+Like the forest before snowdin!  
 <img src="/resources/readme/screenshots/pic1.jpg" height="128px"></img>  
 
-Undyne the Undying!!
-<iframe width="560" height="315" src="https://www.youtube.com/embed/QqKhSn0SHL8?si=gTCYZ5W_iv9pbTRr" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+Undyne the Undying!!  
+https://www.youtube.com/watch?v=QqKhSn0SHL8
