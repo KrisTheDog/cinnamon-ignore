@@ -1,8 +1,13 @@
 <h1 align="center">Cinnamon</h1>
 
 <p align="center">
-<a href="https://discord.gg/AahyBCvVR2"><img src="https://img.shields.io/discord/1406856655920168971?color=5865F2&logo=discord&logoColor=white&label=discord"></a>
+    <img src="icon.png" height="128px"></img>
 </p>
+<p align="center">
+    <a href="https://discord.gg/AahyBCvVR2"><img src="https://img.shields.io/discord/1406856655920168971?color=5865F2&logo=discord&logoColor=white&label=discord"></a>
+</p>
+
+---
 
 > [!IMPORTANT]  
 > Cinnamon is not finished and will have bugs. 3DS is going through a rewrite so you cannot build at this time.
