@@ -26,4 +26,4 @@ Snowdin!!! (From @casrielasriel)
 <img src="/resources/readme/screenshots/pic1.jpg" height="128px"></img>  
 
 Asriel!! (From @abrahamgvitar in the discord)  
-<video src="/resources/readme/screenshots/vid1.mp4" width="50%" controls></video>  
+<video src="https://github.com/Project-Sunshine-Native/cinnamon/blob/main/resources/readme/screenshots/vid1.mp4" width="50%" controls></video>  
