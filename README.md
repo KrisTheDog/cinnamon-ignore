@@ -22,8 +22,8 @@ Cinnamon has no association, endorsement, or any connection whatsoever with any 
 
 Photos/Videos of Cinnamon running!
 
-Snowdin!!! (From @casrielasriel)
-<img src="/resources/readme/screenshots/pic1.jpg" height="128px"></img>
+Snowdin!!! (From @casrielasriel)  
+<img src="/resources/readme/screenshots/pic1.jpg" height="128px"></img>  
 
-Asriel!! (From @abrahamgvitar in the discord)
-<video src="/resources/readme/screenshots/vid1.mp4" width="50%" controls></video>
+Asriel!! (From @abrahamgvitar in the discord)  
+<video src="/resources/readme/screenshots/vid1.mp4" width="50%" controls></video>  
