@@ -56,6 +56,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
     find_package(SDL2 CONFIG REQUIRED)
 
     add_executable(Cinnamon ${COMMON_SOURCES} ${WIIU_SOURCES})
+    set_target_properties(Cinnamon PROPERTIES OUTPUT_NAME undertale)
 
     target_include_directories(Cinnamon PRIVATE
         src

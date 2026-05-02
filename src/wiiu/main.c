@@ -443,23 +443,32 @@ static void accumulateClassicButtonsToDesiredKeys(bool* desiredKeys, RunnerKeybo
     }
 }
 
-static void accumulateDirectionalInputToDesiredKeys(bool* desiredKeys, WiiUInputState* inputState, RunnerKeyboardState* keyboard, uint32_t held, const VPADStatus* status) {
-    const float pressDeadzone = 0.35f;
-    const float releaseDeadzone = 0.20f;
+static bool axisPressedNegative(float value, bool wasHeld) {
+    const float pressDeadzone = 0.40f;
+    const float releaseDeadzone = 0.24f;
+    return value <= -(wasHeld ? releaseDeadzone : pressDeadzone);
+}
 
+static bool axisPressedPositive(float value, bool wasHeld) {
+    const float pressDeadzone = 0.40f;
+    const float releaseDeadzone = 0.24f;
+    return value >= (wasHeld ? releaseDeadzone : pressDeadzone);
+}
+
+static void accumulateDirectionalInputToDesiredKeys(bool* desiredKeys, WiiUInputState* inputState, RunnerKeyboardState* keyboard, uint32_t held, const VPADStatus* status) {
     bool leftWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_LEFT)];
     bool rightWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_RIGHT)];
     bool upWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_UP)];
     bool downWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_DOWN)];
 
     bool leftHeld = (held & VPAD_BUTTON_LEFT) != 0 ||
-        status->leftStick.x <= -(leftWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedNegative(status->leftStick.x, leftWasHeld);
     bool rightHeld = (held & VPAD_BUTTON_RIGHT) != 0 ||
-        status->leftStick.x >= (rightWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedPositive(status->leftStick.x, rightWasHeld);
     bool upHeld = (held & VPAD_BUTTON_UP) != 0 ||
-        status->leftStick.y >= (upWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedPositive(status->leftStick.y, upWasHeld);
     bool downHeld = (held & VPAD_BUTTON_DOWN) != 0 ||
-        status->leftStick.y <= -(downWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedNegative(status->leftStick.y, downWasHeld);
 
     setDesiredKeyState(desiredKeys, keyboard, VK_LEFT, leftHeld);
     setDesiredKeyState(desiredKeys, keyboard, VK_RIGHT, rightHeld);
@@ -474,22 +483,19 @@ static void accumulateProDirectionalInputToDesiredKeys(
     uint32_t held,
     const KPADStatus* status
 ) {
-    const float pressDeadzone = 0.35f;
-    const float releaseDeadzone = 0.20f;
-
     bool leftWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_LEFT)];
     bool rightWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_RIGHT)];
     bool upWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_UP)];
     bool downWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_DOWN)];
 
     bool leftHeld = (held & WPAD_PRO_BUTTON_LEFT) != 0 ||
-        status->pro.leftStick.x <= -(leftWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedNegative(status->pro.leftStick.x, leftWasHeld);
     bool rightHeld = (held & WPAD_PRO_BUTTON_RIGHT) != 0 ||
-        status->pro.leftStick.x >= (rightWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedPositive(status->pro.leftStick.x, rightWasHeld);
     bool upHeld = (held & WPAD_PRO_BUTTON_UP) != 0 ||
-        status->pro.leftStick.y >= (upWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedPositive(status->pro.leftStick.y, upWasHeld);
     bool downHeld = (held & WPAD_PRO_BUTTON_DOWN) != 0 ||
-        status->pro.leftStick.y <= -(downWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedNegative(status->pro.leftStick.y, downWasHeld);
 
     setDesiredKeyState(desiredKeys, keyboard, VK_LEFT, leftHeld);
     setDesiredKeyState(desiredKeys, keyboard, VK_RIGHT, rightHeld);
@@ -504,22 +510,19 @@ static void accumulateClassicDirectionalInputToDesiredKeys(
     uint32_t held,
     const KPADStatus* status
 ) {
-    const float pressDeadzone = 0.35f;
-    const float releaseDeadzone = 0.20f;
-
     bool leftWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_LEFT)];
     bool rightWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_RIGHT)];
     bool upWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_UP)];
     bool downWasHeld = inputState->keyHeld[resolveMappedKey(keyboard, VK_DOWN)];
 
     bool leftHeld = (held & WPAD_CLASSIC_BUTTON_LEFT) != 0 ||
-        status->classic.leftStick.x <= -(leftWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedNegative(status->classic.leftStick.x, leftWasHeld);
     bool rightHeld = (held & WPAD_CLASSIC_BUTTON_RIGHT) != 0 ||
-        status->classic.leftStick.x >= (rightWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedPositive(status->classic.leftStick.x, rightWasHeld);
     bool upHeld = (held & WPAD_CLASSIC_BUTTON_UP) != 0 ||
-        status->classic.leftStick.y >= (upWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedPositive(status->classic.leftStick.y, upWasHeld);
     bool downHeld = (held & WPAD_CLASSIC_BUTTON_DOWN) != 0 ||
-        status->classic.leftStick.y <= -(downWasHeld ? releaseDeadzone : pressDeadzone);
+        axisPressedNegative(status->classic.leftStick.y, downWasHeld);
 
     setDesiredKeyState(desiredKeys, keyboard, VK_LEFT, leftHeld);
     setDesiredKeyState(desiredKeys, keyboard, VK_RIGHT, rightHeld);
@@ -1003,6 +1006,44 @@ int main(int argc, char* argv[]) {
         if (VPADRead(VPAD_CHAN_0, &vpadStatus, 1, &error) > 0 && error == VPAD_READ_SUCCESS) {
             accumulateButtonsToDesiredKeys(desiredKeys, runner->keyboard, vpadStatus.hold);
             accumulateDirectionalInputToDesiredKeys(desiredKeys, &inputState, runner->keyboard, vpadStatus.hold, &vpadStatus);
+        }
+
+        repeat(7, channel) {
+            KPADStatus kpadStatus;
+            KPADError kpadError = KPAD_ERROR_OK;
+            memset(&kpadStatus, 0, sizeof(kpadStatus));
+
+            if (KPADReadEx((KPADChan) channel, &kpadStatus, 1, &kpadError) <= 0 || kpadError != KPAD_ERROR_OK) {
+                continue;
+            }
+
+            switch (kpadStatus.extensionType) {
+                case WPAD_EXT_CORE:
+                case WPAD_EXT_MPLUS:
+                    accumulateWiimoteButtonsToDesiredKeys(desiredKeys, runner->keyboard, kpadStatus.hold);
+                    break;
+                case WPAD_EXT_PRO_CONTROLLER:
+                    accumulateProButtonsToDesiredKeys(desiredKeys, runner->keyboard, kpadStatus.pro.hold);
+                    accumulateProDirectionalInputToDesiredKeys(
+                        desiredKeys,
+                        &inputState,
+                        runner->keyboard,
+                        kpadStatus.pro.hold,
+                        &kpadStatus
+                    );
+                    break;
+                case WPAD_EXT_CLASSIC:
+                case WPAD_EXT_MPLUS_CLASSIC:
+                    accumulateClassicButtonsToDesiredKeys(desiredKeys, runner->keyboard, kpadStatus.classic.hold);
+                    accumulateClassicDirectionalInputToDesiredKeys(
+                        desiredKeys,
+                        &inputState,
+                        runner->keyboard,
+                        kpadStatus.classic.hold,
+                        &kpadStatus
+                    );
+                    break;
+            }
         }
 
         syncDesiredKeysToKeyboard(&inputState, runner->keyboard, desiredKeys);
