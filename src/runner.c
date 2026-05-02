@@ -13,6 +13,14 @@
 
 #include <stb/ds/stb_ds.h>
 
+__attribute__((weak)) void Runner_platformBootLog(const char* message) {
+    (void) message;
+}
+
+static void Runner_bootLog(const char* message) {
+    Runner_platformBootLog(message);
+}
+
 // ===[ Helper: Find event action in object hierarchy ]===
 // Walks the parent chain starting from objectIndex to find an event handler.
 // Returns the EventAction's codeId, or -1 if not found.
@@ -469,6 +477,10 @@ static Instance* createAndInitInstance(Runner* runner, int32_t instanceId, int32
 
 static void initRoom(Runner* runner, int32_t roomIndex)
 {
+    char bootBuffer[128];
+    snprintf(bootBuffer, sizeof(bootBuffer), "runner: initRoom begin room=%d", roomIndex);
+    Runner_bootLog(bootBuffer);
+
     DataWin* dataWin = runner->dataWin;
     require(roomIndex >= 0 && dataWin->room.count > (uint32_t) roomIndex);
 
@@ -573,6 +585,7 @@ static void initRoom(Runner* runner, int32_t roomIndex)
     // This ensures that when an instance's Create event reads another instance    // (e.g. obj_mainchara reading obj_markerA.x), the target already exists.
 
     // Pass 1: Create all instances without firing events
+    Runner_bootLog("runner: initRoom pass1 begin");
     repeat(room->gameObjectCount, i) {
         RoomGameObject* roomObj = &room->gameObjects[i];
 
@@ -593,8 +606,10 @@ static void initRoom(Runner* runner, int32_t roomIndex)
         inst->imageYscale = (double) roomObj->scaleY;
         inst->imageAngle = (double) roomObj->rotation;
     }
+    Runner_bootLog("runner: initRoom pass1 end");
 
     // Pass 2: Fire events for newly created instances (in room definition order)
+    Runner_bootLog("runner: initRoom pass2 begin");
     repeat(room->gameObjectCount, i) {
         RoomGameObject* roomObj = &room->gameObjects[i];
 
@@ -616,13 +631,16 @@ static void initRoom(Runner* runner, int32_t roomIndex)
         Runner_executeEvent(runner, inst, EVENT_CREATE, 0);
         executeCode(runner, inst, roomObj->creationCode);
     }
+    Runner_bootLog("runner: initRoom pass2 end");
 
     // Run room creation code
+    Runner_bootLog("runner: initRoom creation code begin");
     if (room->creationCodeId >= 0 && dataWin->code.count > (uint32_t) room->creationCodeId) {
         // Room creation code runs in global context (no specific instance)
         RValue result = VM_executeCode(runner->vmContext, room->creationCodeId);
         RValue_free(&result);
     }
+    Runner_bootLog("runner: initRoom creation code end");
 
     // Mark this room as initialized for persistent room support
     savedState->initialized = true;
@@ -659,29 +677,122 @@ static void initRoom(Runner* runner, int32_t roomIndex)
         }
 #endif
     }
+
+    Runner_bootLog("runner: initRoom end");
 }
 
 // ===[ Public API ]===
+
+static void cleanupState(Runner* runner) {
+    if (runner == nullptr) return;
+
+    if (runner->audioSystem != nullptr &&
+        runner->audioSystem->vtable != nullptr &&
+        runner->audioSystem->vtable->stopAll != nullptr) {
+        runner->audioSystem->vtable->stopAll(runner->audioSystem);
+    }
+
+    repeat(arrlen(runner->instances), i) {
+        Instance_free(runner->instances[i]);
+    }
+    arrfree(runner->instances);
+    runner->instances = nullptr;
+
+    if (runner->savedRoomStates != nullptr) {
+        repeat(runner->dataWin->room.count, i) {
+            SavedRoomState* state = &runner->savedRoomStates[i];
+            int32_t savedCount = (int32_t) arrlen(state->instances);
+            repeat(savedCount, j) {
+                Instance_free(state->instances[j]);
+            }
+            arrfree(state->instances);
+            hmfree(state->tileLayerMap);
+            memset(state, 0, sizeof(*state));
+        }
+    }
+
+    hmfree(runner->tileLayerMap);
+    runner->tileLayerMap = nullptr;
+}
+
+static void Runner_clearKeyboardState(RunnerKeyboardState* keyboard) {
+    if (keyboard == nullptr) return;
+
+    memset(keyboard->keyDown, 0, sizeof(keyboard->keyDown));
+    memset(keyboard->keyPressed, 0, sizeof(keyboard->keyPressed));
+    memset(keyboard->keyReleased, 0, sizeof(keyboard->keyReleased));
+#ifdef __WIIU__
+    keyboard->currentKey = VK_NOKEY;
+#endif
+    keyboard->lastKey = VK_NOKEY;
+}
+
+static void Runner_resetVMState(VMContext* vm) {
+    if (vm == nullptr) return;
+
+    if (vm->globalVars != nullptr) {
+        repeat(vm->globalVarCount, i) {
+            RValue_free(&vm->globalVars[i]);
+            vm->globalVars[i].type = RVALUE_UNDEFINED;
+        }
+    }
+
+    RValue_freeAllRValuesInMap(vm->globalArrayMap);
+    hmfree(vm->globalArrayMap);
+    vm->globalArrayMap = nullptr;
+
+    hmfree(vm->globalArrayVarTracker);
+    vm->globalArrayVarTracker = nullptr;
+
+    vm->bytecodeBase = nullptr;
+    vm->ip = 0;
+    vm->codeEnd = 0;
+    vm->currentCodeName = nullptr;
+    vm->currentInstance = nullptr;
+    vm->otherInstance = nullptr;
+    vm->currentEventType = -1;
+    vm->currentEventSubtype = -1;
+    vm->currentEventObjectIndex = -1;
+    vm->actionRelativeFlag = false;
+}
 
 Runner* Runner_create(DataWin* dataWin, VMContext* vm, FileSystem* fileSystem) {
     Runner* runner = safeCalloc(1, sizeof(Runner));
     runner->dataWin = dataWin;
     runner->vmContext = vm;
     runner->fileSystem = fileSystem;
-    runner->frameCount = 0;
-    runner->instances = nullptr;
-    runner->pendingRoom = -1;
-    runner->gameStartFired = false;
-    runner->currentRoomIndex = -1;
-    runner->currentRoomOrderPosition = -1;
-    runner->nextInstanceId = dataWin->gen8.lastObj + 1;
     runner->keyboard = RunnerKeyboard_create();
     runner->savedRoomStates = safeCalloc(dataWin->room.count, sizeof(SavedRoomState));
 
     // Link runner to VM context
     vm->runner = (struct Runner*) runner;
 
+    Runner_reset(runner);
+
     return runner;
+}
+
+void Runner_reset(Runner* runner) {
+    if (runner == nullptr) return;
+
+    cleanupState(runner);
+    Runner_resetVMState(runner->vmContext);
+    Runner_clearKeyboardState(runner->keyboard);
+
+    runner->currentRoom = nullptr;
+    runner->currentRoomIndex = -1;
+    runner->currentRoomOrderPosition = -1;
+    runner->pendingRoom = -1;
+    runner->gameStartFired = false;
+    runner->frameCount = 0;
+    runner->nextInstanceId = runner->dataWin->gen8.lastObj + 1;
+    memset(runner->backgrounds, 0, sizeof(runner->backgrounds));
+    runner->backgroundColor = 0;
+    runner->drawBackgroundColor = false;
+    runner->shouldExit = false;
+    memset(runner->viewAngles, 0, sizeof(runner->viewAngles));
+    runner->viewCurrent = -1;
+    runner->drawSpriteDecimationPhase = 0;
 }
 
 Instance* Runner_createInstance(Runner* runner, double x, double y, int32_t objectIndex) {
@@ -718,12 +829,14 @@ void Runner_cleanupDestroyedInstances(Runner* runner) {
 }
 
 void Runner_initFirstRoom(Runner* runner) {
+    Runner_bootLog("runner: initFirstRoom begin");
     DataWin* dataWin = runner->dataWin;
     require(dataWin->gen8.roomOrderCount > 0);
 
     int32_t firstRoomIndex = dataWin->gen8.roomOrder[0];
 
     // Run global init scripts first
+    Runner_bootLog("runner: global init begin");
     repeat(dataWin->glob.count, i) {
         int32_t codeId = dataWin->glob.codeIds[i];
         if (codeId >= 0 && dataWin->code.count > (uint32_t) codeId) {
@@ -732,16 +845,21 @@ void Runner_initFirstRoom(Runner* runner) {
             RValue_free(&result);
         }
     }
+    Runner_bootLog("runner: global init end");
 
     // Initialize the first room
     initRoom(runner, firstRoomIndex);
 
     // Fire Game Start for all instances
+    Runner_bootLog("runner: game start begin");
     Runner_executeEventForAll(runner, EVENT_OTHER, OTHER_GAME_START);
     runner->gameStartFired = true;
+    Runner_bootLog("runner: game start end");
 
     // Fire Room Start for all instances
+    Runner_bootLog("runner: room start begin");
     Runner_executeEventForAll(runner, EVENT_OTHER, OTHER_ROOM_START);
+    Runner_bootLog("runner: room start end");
 }
 
 // ===[ Collision Event Dispatch ]===
@@ -1182,7 +1300,20 @@ void Runner_step(Runner* runner) {
     }
 
     // Handle room transition
-    if (runner->pendingRoom >= 0) {
+    if (runner->pendingRoom == ROOM_RESTARTGAME) {
+        fprintf(stderr, "Runner: game_restart requested, resetting game state\n");
+        runner->pendingRoom = -1;
+
+        if (runner->renderer != nullptr &&
+            runner->renderer->vtable != nullptr &&
+            runner->renderer->vtable->onRoomEnd != nullptr) {
+            runner->renderer->vtable->onRoomEnd(runner->renderer);
+        }
+
+        Runner_reset(runner);
+        Runner_initFirstRoom(runner);
+        return;
+    } else if (runner->pendingRoom >= 0) {
         int32_t oldRoomIndex = runner->currentRoomIndex;
         Room* oldRoom = runner->currentRoom;
         const char* oldRoomName = oldRoom->name;
@@ -1677,27 +1808,8 @@ char* Runner_dumpStateJson(Runner* runner) {
 void Runner_free(Runner* runner) {
     if (runner == nullptr) return;
 
-    // Free all instances
-    repeat(arrlen(runner->instances), i) {
-        Instance_free(runner->instances[i]);
-    }
-    arrfree(runner->instances);
-
-    // Free saved room states
-    if (runner->savedRoomStates != nullptr) {
-        repeat(runner->dataWin->room.count, i) {
-            SavedRoomState* state = &runner->savedRoomStates[i];
-            int32_t savedCount = (int32_t) arrlen(state->instances);
-            repeat(savedCount, j) {
-                Instance_free(state->instances[j]);
-            }
-            arrfree(state->instances);
-            hmfree(state->tileLayerMap);
-        }
-        free(runner->savedRoomStates);
-    }
-
-    hmfree(runner->tileLayerMap);
+    cleanupState(runner);
+    free(runner->savedRoomStates);
     shfree(runner->disabledObjects);
     RunnerKeyboard_free(runner->keyboard);
     free(runner);

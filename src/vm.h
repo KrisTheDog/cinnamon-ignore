@@ -26,6 +26,8 @@
 #define INSTANCE_LOCAL     (-7)
 #define INSTANCE_STACKTOP  (-9)
 
+#define ROOM_RESTARTGAME   (-200)
+
 // ===[ Variable Types (upper 5 bits of varRef, extracted with (varRef >> 24) & 0xF8) ]===
 #define VARTYPE_ARRAY     0x00
 #define VARTYPE_STACKTOP  0x80

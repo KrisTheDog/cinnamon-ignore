@@ -40,6 +40,12 @@ static float WiiUAudio_clampSample(float sample) {
     return sample;
 }
 
+static float WiiUAudio_clampStreamGain(float gain) {
+    if (gain < 0.0f) return 0.0f;
+    if (gain > 1.0f) return 1.0f;
+    return gain;
+}
+
 static void WiiUAudio_resetInstance(WiiUSoundInstance* inst) {
     if (inst->audioStream != NULL) {
         SDL_FreeAudioStream(inst->audioStream);
@@ -369,6 +375,7 @@ static void WiiUAudio_callback(void* userdata, Uint8* stream, int len) {
         if (step <= 0.0) step = 1.0;
 
         if (inst->streaming) {
+            gain = WiiUAudio_clampStreamGain(gain);
             uint32_t channelCount = (uint32_t) (wiiu->audioSpec.channels > 0 ? wiiu->audioSpec.channels : 2);
             uint32_t outFrames = sampleCount / channelCount;
             uint32_t neededFrames = (uint32_t) (outFrames * step) + 4;
@@ -661,8 +668,28 @@ static void WiiUAudioSystem_init(AudioSystem* audio, DataWin* dataWin, FileSyste
 static void WiiUAudioSystem_destroy(AudioSystem* audio) {
     WiiUAudioSystem* wiiu = (WiiUAudioSystem*) audio;
     if (wiiu->deviceId != 0) {
+        SDL_PauseAudioDevice(wiiu->deviceId, 1);
+        SDL_LockAudioDevice(wiiu->deviceId);
+        repeat(MAX_WIIU_SOUND_INSTANCES, i) {
+            WiiUSoundInstance* inst = &wiiu->instances[i];
+            if (inst->audioStream != NULL) {
+                SDL_FreeAudioStream(inst->audioStream);
+                inst->audioStream = NULL;
+            }
+            if (inst->vorbisStream != NULL) {
+                stb_vorbis_close(inst->vorbisStream);
+                inst->vorbisStream = NULL;
+            }
+            inst->streaming = false;
+            inst->active = false;
+        }
+        SDL_UnlockAudioDevice(wiiu->deviceId);
+
         SDL_CloseAudioDevice(wiiu->deviceId);
         wiiu->deviceId = 0;
+    }
+    repeat(MAX_WIIU_SOUND_INSTANCES, i) {
+        WiiUAudio_resetInstance(&wiiu->instances[i]);
     }
     if (wiiu->decodedSounds != NULL) {
         repeat(wiiu->base.dataWin->sond.count, i) {

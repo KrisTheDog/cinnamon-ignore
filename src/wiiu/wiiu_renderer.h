@@ -16,6 +16,12 @@ typedef struct {
 } WiiUTexturePage;
 
 typedef struct {
+    bool ready;
+    GX2ColorBuffer colorBuffer;
+    GX2Texture presentTexture;
+} WiiURenderTarget;
+
+typedef struct {
     float x;
     float y;
     float z;
@@ -66,6 +72,7 @@ typedef struct {
     WiiUTexturePage* texturePages;
     uint32_t texturePageCount;
     WiiUTexturePage whiteTexture;
+    WiiURenderTarget sceneTarget;
 
     GX2RBuffer batchVertexBuffer;
     WiiUBatchVertex* batchVertices;
@@ -96,6 +103,7 @@ typedef struct {
     uint8_t clearB;
 
     uint32_t perfFrameCount;
+    double perfSceneMs;
     double perfRenderTvMs;
     double perfRenderDrcMs;
     uint32_t perfFlushCount;

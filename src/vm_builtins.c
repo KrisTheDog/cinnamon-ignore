@@ -2342,8 +2342,13 @@ static RValue builtinWindowGetHeight(VMContext* ctx, [[maybe_unused]] RValue* ar
     return RValue_makeReal((double) ctx->dataWin->gen8.defaultWindowHeight);
 }
 
-// Game stubs
-STUB_RETURN_UNDEFINED(game_restart)
+// Game functions
+static RValue builtin_game_restart(VMContext* ctx, [[maybe_unused]] RValue* args, [[maybe_unused]] int32_t argCount) {
+    Runner* runner = requireNotNullMessage(ctx->runner, "VM: game_restart called but no runner!");
+    runner->pendingRoom = ROOM_RESTARTGAME;
+    return RValue_makeUndefined();
+}
+
 static RValue builtinGameEnd(VMContext* ctx, [[maybe_unused]] RValue* args, [[maybe_unused]] int32_t argCount) {
     Runner* runner = (Runner*) ctx->runner;
     runner->shouldExit = true;

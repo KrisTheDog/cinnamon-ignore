@@ -21,6 +21,7 @@
 #include <gx2r/draw.h>
 #include <gx2r/surface.h>
 #include <coreinit/memdefaultheap.h>
+#include <coreinit/time.h>
 
 #include <math.h>
 #include <limits.h>
@@ -29,11 +30,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
-#include <stb/image/stb_image.h>
 
 #include "../matrix_math.h"
+#include <stb/image/stb_image.h>
 #include "../text_utils.h"
 #include "../utils.h"
 
@@ -52,6 +51,15 @@ static void WiiURenderer_bootLog(const char* message) {
     WiiURenderer_platformBootLog(message);
 }
 
+static void WiiURenderer_releaseTextureBlob(DataWin* dataWin, uint32_t index);
+static void WiiURenderer_emitVertex(WiiURenderer* renderer, WiiUVec2 clip, float u, float v, uint32_t color, float alpha);
+static void WiiURenderer_computeOutputLayout(WiiUPresentLayout* layout, uint32_t outputWidth, uint32_t outputHeight, uint32_t sourceWidth, uint32_t sourceHeight, bool preferIntegerScale);
+static bool WiiURenderer_initLinearTexture(GX2Texture* texture, uint32_t width, uint32_t height);
+static void WiiURenderer_destroyRenderTarget(WiiURenderTarget* target);
+static bool WiiURenderer_initRenderTarget(WiiURenderTarget* target, uint32_t width, uint32_t height);
+static void WiiURenderer_ensureSceneTarget(WiiURenderer* renderer, uint32_t width, uint32_t height);
+static void WiiURenderer_computeIntegerBlitRect(uint32_t sourceWidth, uint32_t sourceHeight, uint32_t targetWidth, uint32_t targetHeight, float* left, float* top, float* right, float* bottom);
+
 static void* WiiURenderer_gpuAlloc(size_t alignment, size_t size) {
     void* ptr = MEMAllocFromDefaultHeapEx((uint32_t) size, (int32_t) alignment);
     requireMessage(ptr != NULL, "Wii U GPU allocation failed");
@@ -64,10 +72,8 @@ static void WiiURenderer_gpuFree(void* ptr) {
     }
 }
 
-static double WiiURenderer_elapsedMs(const struct timespec* start, const struct timespec* end) {
-    double seconds = (double) (end->tv_sec - start->tv_sec);
-    double nanos = (double) (end->tv_nsec - start->tv_nsec);
-    return seconds * 1000.0 + nanos / 1000000.0;
+static double WiiURenderer_elapsedMs(OSTime start, OSTime end) {
+    return (double) OSTicksToMicroseconds(end - start) / 1000.0;
 }
 
 static float WiiURenderer_snapPixel(float value) {
@@ -75,18 +81,63 @@ static float WiiURenderer_snapPixel(float value) {
 }
 
 static void WiiURenderer_updatePresentLayout(WiiURenderer* renderer) {
-    renderer->presentLayout.targetWidth = 640;
-    renderer->presentLayout.targetHeight = 480;
-    renderer->presentLayout.xOffset = (WIIU_RENDER_WIDTH - renderer->presentLayout.targetWidth) / 2u;
-    renderer->presentLayout.yOffset = (WIIU_RENDER_HEIGHT - renderer->presentLayout.targetHeight) / 2u;
+    uint32_t srcW = (renderer->frameWidth  > 0) ? (uint32_t) renderer->frameWidth  : 640u;
+    uint32_t srcH = (renderer->frameHeight > 0) ? (uint32_t) renderer->frameHeight : 480u;
+    WiiURenderer_computeOutputLayout(
+        &renderer->presentLayout,
+        WIIU_RENDER_WIDTH,
+        WIIU_RENDER_HEIGHT,
+        srcW,
+        srcH,
+        false
+    );
+}
+
+static void WiiURenderer_computeOutputLayout(
+    WiiUPresentLayout* layout,
+    uint32_t outputWidth,
+    uint32_t outputHeight,
+    uint32_t sourceWidth,
+    uint32_t sourceHeight,
+    bool preferIntegerScale
+) {
+    if (layout == NULL || sourceWidth == 0 || sourceHeight == 0 || outputWidth == 0 || outputHeight == 0) {
+        return;
+    }
+
+    float fitScale = fminf(
+        (float) outputWidth / (float) sourceWidth,
+        (float) outputHeight / (float) sourceHeight
+    );
+    float scale = fitScale;
+
+    if (preferIntegerScale) {
+        float integerScale = floorf(fitScale);
+        if (integerScale >= 2.0f) {
+            scale = integerScale;
+        }
+    }
+
+    float targetWidth = (float) sourceWidth * scale;
+    float targetHeight = (float) sourceHeight * scale;
+    if (targetWidth > (float) outputWidth) targetWidth = (float) outputWidth;
+    if (targetHeight > (float) outputHeight) targetHeight = (float) outputHeight;
+
+    uint32_t snappedWidth = (uint32_t) lroundf(targetWidth);
+    uint32_t snappedHeight = (uint32_t) lroundf(targetHeight);
+    if (snappedWidth > outputWidth) snappedWidth = outputWidth;
+    if (snappedHeight > outputHeight) snappedHeight = outputHeight;
+
+    layout->targetWidth = (float) snappedWidth;
+    layout->targetHeight = (float) snappedHeight;
+    layout->xOffset = (outputWidth - snappedWidth) / 2u;
+    layout->yOffset = (outputHeight - snappedHeight) / 2u;
 }
 
 void WiiURenderer_refreshOutputState(WiiURenderer* renderer) {
     if (renderer == NULL) return;
 
     WiiURenderer_updatePresentLayout(renderer);
-    GX2SetTVScale(WIIU_RENDER_WIDTH, WIIU_RENDER_HEIGHT);
-    GX2SetDRCScale(WIIU_RENDER_WIDTH, WIIU_RENDER_HEIGHT);
 }
 
 
@@ -96,6 +147,93 @@ static void WiiURenderer_destroyTexturePage(WiiUTexturePage* page) {
         WiiURenderer_gpuFree(page->texture.surface.image);
     }
     memset(page, 0, sizeof(*page));
+}
+
+static void WiiURenderer_destroyRenderTarget(WiiURenderTarget* target) {
+    if (target->colorBuffer.surface.image != NULL) {
+        WiiURenderer_gpuFree(target->colorBuffer.surface.image);
+    }
+    memset(target, 0, sizeof(*target));
+}
+
+static bool WiiURenderer_initRenderTarget(WiiURenderTarget* target, uint32_t width, uint32_t height) {
+    memset(target, 0, sizeof(*target));
+
+    target->colorBuffer.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    target->colorBuffer.surface.width = width;
+    target->colorBuffer.surface.height = height;
+    target->colorBuffer.surface.depth = 1;
+    target->colorBuffer.surface.mipLevels = 1;
+    target->colorBuffer.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    target->colorBuffer.surface.aa = GX2_AA_MODE1X;
+    target->colorBuffer.surface.use = GX2_SURFACE_USE_COLOR_BUFFER;
+    target->colorBuffer.surface.tileMode = GX2_TILE_MODE_DEFAULT;
+    GX2CalcSurfaceSizeAndAlignment(&target->colorBuffer.surface);
+    target->colorBuffer.surface.image = WiiURenderer_gpuAlloc(target->colorBuffer.surface.alignment, target->colorBuffer.surface.imageSize);
+    memset(target->colorBuffer.surface.image, 0, target->colorBuffer.surface.imageSize);
+
+    target->colorBuffer.viewMip = 0;
+    target->colorBuffer.viewFirstSlice = 0;
+    target->colorBuffer.viewNumSlices = 1;
+    target->colorBuffer.aaBuffer = NULL;
+    target->colorBuffer.aaSize = 0;
+    GX2InitColorBufferRegs(&target->colorBuffer);
+    GX2Invalidate(
+        GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_COLOR_BUFFER,
+        target->colorBuffer.surface.image,
+        target->colorBuffer.surface.imageSize
+    );
+
+    memset(&target->presentTexture, 0, sizeof(target->presentTexture));
+    target->presentTexture.surface = target->colorBuffer.surface;
+    target->presentTexture.viewFirstMip = 0;
+    target->presentTexture.viewNumMips = 1;
+    target->presentTexture.viewFirstSlice = 0;
+    target->presentTexture.viewNumSlices = 1;
+    target->presentTexture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+    GX2InitTextureRegs(&target->presentTexture);
+
+    target->ready = true;
+    return true;
+}
+
+static void WiiURenderer_ensureSceneTarget(WiiURenderer* renderer, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) return;
+
+    if (renderer->sceneTarget.ready &&
+        renderer->sceneTarget.colorBuffer.surface.width == width &&
+        renderer->sceneTarget.colorBuffer.surface.height == height) {
+        return;
+    }
+
+    WiiURenderer_destroyRenderTarget(&renderer->sceneTarget);
+    WiiURenderer_initRenderTarget(&renderer->sceneTarget, width, height);
+}
+
+static void WiiURenderer_computeIntegerBlitRect(
+    uint32_t sourceWidth,
+    uint32_t sourceHeight,
+    uint32_t targetWidth,
+    uint32_t targetHeight,
+    float* left,
+    float* top,
+    float* right,
+    float* bottom
+) {
+    uint32_t scaleX = targetWidth / sourceWidth;
+    uint32_t scaleY = targetHeight / sourceHeight;
+    uint32_t scale = scaleX < scaleY ? scaleX : scaleY;
+    if (scale < 1u) scale = 1u;
+
+    uint32_t rectW = sourceWidth * scale;
+    uint32_t rectH = sourceHeight * scale;
+    uint32_t offX = (targetWidth - rectW) / 2u;
+    uint32_t offY = (targetHeight - rectH) / 2u;
+
+    *left = ((float) offX / (float) targetWidth) * 2.0f - 1.0f;
+    *right = ((float) (offX + rectW) / (float) targetWidth) * 2.0f - 1.0f;
+    *top = 1.0f - ((float) offY / (float) targetHeight) * 2.0f;
+    *bottom = 1.0f - ((float) (offY + rectH) / (float) targetHeight) * 2.0f;
 }
 
 
@@ -137,7 +275,6 @@ static bool WiiURenderer_uploadTexturePage(WiiUTexturePage* page, const uint8_t*
             (size_t) width * 4u
         );
     }
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, page->texture.surface.image, page->texture.surface.imageSize);
     page->ready = true;
     return true;
 }
@@ -147,29 +284,50 @@ static void WiiURenderer_loadTexturePages(WiiURenderer* renderer, DataWin* dataW
     renderer->texturePages = safeCalloc(renderer->texturePageCount, sizeof(WiiUTexturePage));
 
     repeat(renderer->texturePageCount, i) {
-        uint8_t* pngData = DataWin_loadTexture(dataWin, i);
-        if (pngData == NULL) continue;
+        Texture* tex = &dataWin->txtr.textures[i];
+        if (tex->blobSize == 0 || tex->blobOffset == 0) continue;
+        if (tex->blobSize > 50u * 1024u * 1024u) continue;
 
-        int width = 0;
-        int height = 0;
-        int channels = 0;
-        uint8_t* pixels = stbi_load_from_memory(
-            pngData,
-            (int) dataWin->txtr.textures[i].blobSize,
-            &width,
-            &height,
-            &channels,
-            4
-        );
+        uint8_t* pngData = NULL;
+        bool ownBlob = false;
+        if (tex->loaded && tex->blobData != NULL) {
+            pngData = tex->blobData;
+        } else {
+            if (dataWin->file == NULL) continue;
+            if (fseek(dataWin->file, (long) tex->blobOffset, SEEK_SET) != 0) continue;
+            pngData = malloc(tex->blobSize);
+            if (pngData == NULL) continue;
+            size_t got = fread(pngData, 1, tex->blobSize, dataWin->file);
+            if (got != tex->blobSize) { free(pngData); continue; }
+            ownBlob = true;
+        }
+
+        int width = 0, height = 0, channels = 0;
+        uint8_t* pixels = stbi_load_from_memory(pngData, (int) tex->blobSize,
+                                                 &width, &height, &channels, 4);
+        if (ownBlob) { free(pngData); pngData = NULL; }
+        else         { WiiURenderer_releaseTextureBlob(dataWin, i); }
+
         if (pixels == NULL) continue;
 
-        WiiURenderer_uploadTexturePage(&renderer->texturePages[i], pixels, (uint32_t) width, (uint32_t) height);
+        WiiURenderer_uploadTexturePage(&renderer->texturePages[i], pixels,
+                                       (uint32_t) width, (uint32_t) height);
         stbi_image_free(pixels);
+    }
+
+    repeat(renderer->texturePageCount, i) {
+        if (!renderer->texturePages[i].ready) continue;
+        GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
+                      renderer->texturePages[i].texture.surface.image,
+                      renderer->texturePages[i].texture.surface.imageSize);
     }
 
     {
         const uint8_t whitePixel[4] = { 255, 255, 255, 255 };
         WiiURenderer_uploadTexturePage(&renderer->whiteTexture, whitePixel, 1, 1);
+        GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
+                      renderer->whiteTexture.texture.surface.image,
+                      renderer->whiteTexture.texture.surface.imageSize);
     }
 }
 
@@ -233,9 +391,22 @@ static void WiiURenderer_mapVertexBuffer(WiiURenderer* renderer) {
     }
 }
 
+static void WiiURenderer_releaseTextureBlob(DataWin* dataWin, uint32_t index) {
+    if (dataWin == NULL || index >= dataWin->txtr.count) return;
+
+    if (dataWin->txtr.textures[index].blobData != NULL) {
+        free(dataWin->txtr.textures[index].blobData);
+        dataWin->txtr.textures[index].blobData = NULL;
+    }
+    dataWin->txtr.textures[index].loaded = false;
+}
+
 static void WiiURenderer_pushCommand(WiiURenderer* renderer, const WiiUQuadCommand* command) {
     if (renderer->commandCount >= renderer->commandCapacity) {
-        renderer->commandCapacity = renderer->commandCapacity == 0 ? 1024 : renderer->commandCapacity * 2;
+        uint32_t newCapacity = renderer->commandCapacity == 0 ? 1024 : renderer->commandCapacity * 2;
+        if (newCapacity > 8192) newCapacity = 8192;
+        if (renderer->commandCount >= newCapacity) return; // drop rather than crash
+        renderer->commandCapacity = newCapacity;
         renderer->commands = safeRealloc(renderer->commands, (size_t) renderer->commandCapacity * sizeof(WiiUQuadCommand));
     }
     renderer->commands[renderer->commandCount++] = *command;
@@ -277,6 +448,45 @@ static void WiiURenderer_setCommonState(bool blendEnabled) {
     GX2SetAlphaTest(TRUE, GX2_COMPARE_FUNC_GREATER, 0.0f);
 }
 
+static void WiiURenderer_emitClipVertex(
+    WiiURenderer* renderer,
+    float clipX,
+    float clipY,
+    float u,
+    float v
+) {
+    uint32_t index = renderer->batchVertexCount++;
+    WiiUBatchVertex* vertex = &renderer->batchVertices[index];
+
+    vertex->x = clipX;
+    vertex->y = clipY;
+    vertex->z = 0.0f;
+    vertex->w = 1.0f;
+    vertex->u = u;
+    vertex->v = v;
+    vertex->r = 1.0f;
+    vertex->g = 1.0f;
+    vertex->b = 1.0f;
+    vertex->a = 1.0f;
+}
+
+static void WiiURenderer_emitSolidClipVertex(
+    WiiURenderer* renderer,
+    float clipX,
+    float clipY,
+    uint32_t color,
+    float alpha
+) {
+    WiiURenderer_emitVertex(
+        renderer,
+        (WiiUVec2) { clipX, clipY },
+        0.0f,
+        0.0f,
+        color,
+        alpha
+    );
+}
+
 static void WiiURenderer_flushVerticesWithTexture(WiiURenderer* renderer, uint32_t vertexCount, GX2Texture* texture) {
     if (vertexCount == 0 || texture == NULL) return;
 
@@ -305,6 +515,51 @@ static void WiiURenderer_flushVertices(WiiURenderer* renderer, uint32_t vertexCo
     WiiURenderer_flushVerticesWithTexture(renderer, vertexCount, texture);
 }
 
+static void WiiURenderer_renderLetterboxMasksToTarget(
+    WiiURenderer* renderer,
+    uint32_t targetWidth,
+    uint32_t targetHeight,
+    const WiiUPresentLayout* layout
+) {
+    uint32_t presentWidth = (uint32_t) lroundf(layout->targetWidth);
+    uint32_t presentHeight = (uint32_t) lroundf(layout->targetHeight);
+    if (presentWidth >= targetWidth && presentHeight >= targetHeight) return;
+
+    float left = ((float) layout->xOffset / (float) targetWidth) * 2.0f - 1.0f;
+    float right = ((float) (layout->xOffset + presentWidth) / (float) targetWidth) * 2.0f - 1.0f;
+    WiiURenderer_bindShader(renderer);
+    WiiURenderer_setCommonState(false);
+    GX2SetViewport(0.0f, 0.0f, (float) targetWidth, (float) targetHeight, 0.0f, 1.0f);
+    GX2SetScissor(0, 0, targetWidth, targetHeight);
+    WiiURenderer_ensureVertexCapacity(renderer, 12);
+    WiiURenderer_mapVertexBuffer(renderer);
+    renderer->batchVertexCount = 0;
+
+    #define WIIU_EMIT_MASK_QUAD(x0, y0, x1, y1) \
+        do { \
+            WiiURenderer_emitSolidClipVertex(renderer, (x0), (y0), 0x000000, 1.0f); \
+            WiiURenderer_emitSolidClipVertex(renderer, (x1), (y0), 0x000000, 1.0f); \
+            WiiURenderer_emitSolidClipVertex(renderer, (x0), (y1), 0x000000, 1.0f); \
+            WiiURenderer_emitSolidClipVertex(renderer, (x0), (y1), 0x000000, 1.0f); \
+            WiiURenderer_emitSolidClipVertex(renderer, (x1), (y0), 0x000000, 1.0f); \
+            WiiURenderer_emitSolidClipVertex(renderer, (x1), (y1), 0x000000, 1.0f); \
+        } while (0)
+
+    if (left > -1.0f) {
+        WIIU_EMIT_MASK_QUAD(-1.0f, 1.0f, left, -1.0f);
+    }
+    if (right < 1.0f) {
+        WIIU_EMIT_MASK_QUAD(right, 1.0f, 1.0f, -1.0f);
+    }
+
+    #undef WIIU_EMIT_MASK_QUAD
+
+    if (renderer->batchVertexCount > 0) {
+        WiiURenderer_flushVertices(renderer, renderer->batchVertexCount, -1);
+        renderer->batchVertexCount = 0;
+    }
+}
+
 static WiiUVec2 WiiURenderer_worldToGame(WiiURenderer* renderer, float worldX, float worldY) {
     WiiUVec2 result;
     result.x = (float) renderer->portX + (worldX - (float) renderer->viewX) * renderer->viewScaleX;
@@ -312,14 +567,20 @@ static WiiUVec2 WiiURenderer_worldToGame(WiiURenderer* renderer, float worldX, f
     return result;
 }
 
-static WiiUVec2 WiiURenderer_gameToClip(const WiiURenderer* renderer, WiiUVec2 point) {
+static WiiUVec2 WiiURenderer_gameToClip(
+    const WiiURenderer* renderer,
+    WiiUVec2 point,
+    uint32_t targetWidth,
+    uint32_t targetHeight,
+    const WiiUPresentLayout* layout
+) {
     WiiUVec2 result;
-    float targetX = (float) renderer->presentLayout.xOffset +
-        ((point.x / (float) renderer->frameWidth) * (float) renderer->presentLayout.targetWidth);
-    float targetY = (float) renderer->presentLayout.yOffset +
-        ((point.y / (float) renderer->frameHeight) * (float) renderer->presentLayout.targetHeight);
-    result.x = (targetX / (float) WIIU_RENDER_WIDTH) * 2.0f - 1.0f;
-    result.y = 1.0f - (targetY / (float) WIIU_RENDER_HEIGHT) * 2.0f;
+    float targetX = (float) layout->xOffset +
+        ((point.x / (float) renderer->frameWidth) * layout->targetWidth);
+    float targetY = (float) layout->yOffset +
+        ((point.y / (float) renderer->frameHeight) * layout->targetHeight);
+    result.x = (targetX / (float) targetWidth) * 2.0f - 1.0f;
+    result.y = 1.0f - (targetY / (float) targetHeight) * 2.0f;
     return result;
 }
 
@@ -339,6 +600,30 @@ static void WiiURenderer_emitVertex(WiiURenderer* renderer, WiiUVec2 clip, float
     vertex->a = alpha;
 }
 
+static bool WiiURenderer_quadIntersectsView(
+    const WiiURenderer* renderer,
+    WiiUVec2 p00,
+    WiiUVec2 p10,
+    WiiUVec2 p01
+) {
+    WiiUVec2 p11 = {
+        p10.x + (p01.x - p00.x),
+        p10.y + (p01.y - p00.y)
+    };
+
+    float minX = fminf(fminf(p00.x, p10.x), fminf(p01.x, p11.x));
+    float maxX = fmaxf(fmaxf(p00.x, p10.x), fmaxf(p01.x, p11.x));
+    float minY = fminf(fminf(p00.y, p10.y), fminf(p01.y, p11.y));
+    float maxY = fmaxf(fmaxf(p00.y, p10.y), fmaxf(p01.y, p11.y));
+
+    float viewMinX = (float) renderer->portX;
+    float viewMinY = (float) renderer->portY;
+    float viewMaxX = viewMinX + (float) renderer->portW;
+    float viewMaxY = viewMinY + (float) renderer->portH;
+
+    return maxX >= viewMinX && minX <= viewMaxX && maxY >= viewMinY && minY <= viewMaxY;
+}
+
 static void WiiURenderer_appendQuad(
     WiiURenderer* renderer,
     int32_t texturePageId,
@@ -353,6 +638,7 @@ static void WiiURenderer_appendQuad(
     float alpha
 ) {
     if (renderer->frameWidth <= 0 || renderer->frameHeight <= 0) return;
+    if (!WiiURenderer_quadIntersectsView(renderer, p00, p10, p01)) return;
 
     WiiUQuadCommand command;
     memset(&command, 0, sizeof(command));
@@ -387,6 +673,7 @@ static void WiiURenderer_appendGradientQuad(
     float alpha
 ) {
     if (renderer->frameWidth <= 0 || renderer->frameHeight <= 0) return;
+    if (!WiiURenderer_quadIntersectsView(renderer, p00, p10, p01)) return;
 
     WiiUQuadCommand command;
     memset(&command, 0, sizeof(command));
@@ -406,14 +693,20 @@ static void WiiURenderer_appendGradientQuad(
     renderer->queuedQuadCount++;
 }
 
-static void WiiURenderer_buildQuadVertices(WiiURenderer* renderer, const WiiUQuadCommand* command) {
+static void WiiURenderer_buildQuadVertices(
+    WiiURenderer* renderer,
+    const WiiUQuadCommand* command,
+    uint32_t targetWidth,
+    uint32_t targetHeight,
+    const WiiUPresentLayout* layout
+) {
     WiiURenderer_ensureVertexCapacity(renderer, WIIU_VERTICES_PER_QUAD);
     WiiURenderer_mapVertexBuffer(renderer);
-    WiiUVec2 c00 = WiiURenderer_gameToClip(renderer, command->p00);
-    WiiUVec2 c10 = WiiURenderer_gameToClip(renderer, command->p10);
-    WiiUVec2 c01 = WiiURenderer_gameToClip(renderer, command->p01);
+    WiiUVec2 c00 = WiiURenderer_gameToClip(renderer, command->p00, targetWidth, targetHeight, layout);
+    WiiUVec2 c10 = WiiURenderer_gameToClip(renderer, command->p10, targetWidth, targetHeight, layout);
+    WiiUVec2 c01 = WiiURenderer_gameToClip(renderer, command->p01, targetWidth, targetHeight, layout);
     WiiUVec2 p11 = { command->p10.x + (command->p01.x - command->p00.x), command->p10.y + (command->p01.y - command->p00.y) };
-    WiiUVec2 c11 = WiiURenderer_gameToClip(renderer, p11);
+    WiiUVec2 c11 = WiiURenderer_gameToClip(renderer, p11, targetWidth, targetHeight, layout);
 
     if (command->gradient) {
         WiiURenderer_emitVertex(renderer, c00, command->u0, command->v0, command->color0, command->alpha);
@@ -432,15 +725,19 @@ static void WiiURenderer_buildQuadVertices(WiiURenderer* renderer, const WiiUQua
     }
 }
 
-static void WiiURenderer_renderCommandsToTarget(WiiURenderer* renderer) {
-    uint32_t presentWidth = (uint32_t) lroundf(renderer->presentLayout.targetWidth);
-    uint32_t presentHeight = (uint32_t) lroundf(renderer->presentLayout.targetHeight);
+static void WiiURenderer_renderCommandsToTarget(
+    WiiURenderer* renderer,
+    uint32_t targetWidth,
+    uint32_t targetHeight,
+    const WiiUPresentLayout* layout
+) {
+    uint32_t presentWidth = (uint32_t) lroundf(layout->targetWidth);
+    uint32_t presentHeight = (uint32_t) lroundf(layout->targetHeight);
 
-    // Render fills the full 854x480 framebuffer
-    GX2SetViewport(0.0f, 0.0f, (float) WIIU_RENDER_WIDTH, (float) WIIU_RENDER_HEIGHT, 0.0f, 1.0f);
+    GX2SetViewport(0.0f, 0.0f, (float) targetWidth, (float) targetHeight, 0.0f, 1.0f);
     GX2SetScissor(
-        (uint32_t) renderer->presentLayout.xOffset,
-        (uint32_t) renderer->presentLayout.yOffset,
+        layout->xOffset,
+        layout->yOffset,
         presentWidth,
         presentHeight
     );
@@ -462,13 +759,75 @@ static void WiiURenderer_renderCommandsToTarget(WiiURenderer* renderer) {
         }
 
         currentTexturePageId = command->texturePageId;
-        WiiURenderer_buildQuadVertices(renderer, command);
+        WiiURenderer_buildQuadVertices(renderer, command, targetWidth, targetHeight, layout);
     }
 
     if (renderer->batchVertexCount > 0) {
         WiiURenderer_flushVertices(renderer, renderer->batchVertexCount, currentTexturePageId);
         renderer->batchVertexCount = 0;
     }
+}
+
+static void WiiURenderer_renderCommandsToSceneTarget(WiiURenderer* renderer) {
+    if (!renderer->sceneTarget.ready) return;
+
+    uint32_t targetWidth = renderer->sceneTarget.colorBuffer.surface.width;
+    uint32_t targetHeight = renderer->sceneTarget.colorBuffer.surface.height;
+    WiiUPresentLayout layout = {
+        .targetWidth = (float) targetWidth,
+        .targetHeight = (float) targetHeight,
+        .xOffset = 0,
+        .yOffset = 0,
+    };
+
+    WiiURenderer_renderCommandsToTarget(renderer, targetWidth, targetHeight, &layout);
+    GX2DrawDone();
+    GX2Invalidate(
+        GX2_INVALIDATE_MODE_COLOR_BUFFER | GX2_INVALIDATE_MODE_TEXTURE,
+        renderer->sceneTarget.colorBuffer.surface.image,
+        renderer->sceneTarget.colorBuffer.surface.imageSize
+    );
+}
+
+static void WiiURenderer_renderPresentTextureToTarget(
+    WiiURenderer* renderer,
+    GX2ColorBuffer* targetBuffer,
+    uint32_t targetWidth,
+    uint32_t targetHeight,
+    const WiiUPresentLayout* layout,
+    GX2Texture* texture
+) {
+    if (targetBuffer == NULL || layout == NULL || texture == NULL) return;
+
+    uint32_t presentWidth = (uint32_t) lroundf(layout->targetWidth);
+    uint32_t presentHeight = (uint32_t) lroundf(layout->targetHeight);
+    if (presentWidth == 0 || presentHeight == 0) return;
+
+    float x0 = ((float) layout->xOffset / (float) targetWidth) * 2.0f - 1.0f;
+    float y0 = 1.0f - ((float) (layout->yOffset + presentHeight) / (float) targetHeight) * 2.0f;
+    float x1 = ((float) (layout->xOffset + presentWidth) / (float) targetWidth) * 2.0f - 1.0f;
+    float y1 = 1.0f - ((float) layout->yOffset / (float) targetHeight) * 2.0f;
+
+    GX2SetColorBuffer(targetBuffer, GX2_RENDER_TARGET_0);
+    WiiURenderer_bindShader(renderer);
+    WiiURenderer_setCommonState(false);
+    GX2SetAlphaTest(FALSE, GX2_COMPARE_FUNC_ALWAYS, 0.0f);
+    GX2SetViewport(0.0f, 0.0f, (float) targetWidth, (float) targetHeight, 0.0f, 1.0f);
+    GX2SetScissor(layout->xOffset, layout->yOffset, presentWidth, presentHeight);
+
+    WiiURenderer_ensureVertexCapacity(renderer, WIIU_VERTICES_PER_QUAD);
+    WiiURenderer_mapVertexBuffer(renderer);
+    renderer->batchVertexCount = 0;
+
+    WiiURenderer_emitClipVertex(renderer, x0, y1, 0.0f, 0.0f);
+    WiiURenderer_emitClipVertex(renderer, x1, y1, 1.0f, 0.0f);
+    WiiURenderer_emitClipVertex(renderer, x0, y0, 0.0f, 1.0f);
+    WiiURenderer_emitClipVertex(renderer, x0, y0, 0.0f, 1.0f);
+    WiiURenderer_emitClipVertex(renderer, x1, y1, 1.0f, 0.0f);
+    WiiURenderer_emitClipVertex(renderer, x1, y0, 1.0f, 1.0f);
+
+    WiiURenderer_flushVerticesWithTexture(renderer, renderer->batchVertexCount, texture);
+    renderer->batchVertexCount = 0;
 }
 
 static bool WiiURenderer_initShaderPipeline(WiiURenderer* renderer) {
@@ -518,11 +877,8 @@ static void WiiURenderer_init(Renderer* base, DataWin* dataWin) {
         return;
     }
 
-    // Scale TV and DRC scan buffers from 854x480 up to their native output resolution.
-    // This means we render once at 480p and GX2 handles the upscale, avoiding manual
-    // nearest-neighbour present layout math entirely.
     WiiURenderer_refreshOutputState(renderer);
-    WiiURenderer_bootLog("wiiu_renderer: GX2 scale set to 854x480");
+    WiiURenderer_bootLog("wiiu_renderer: manual present layout ready");
 
     renderer->clearR = 0;
     renderer->clearG = 0;
@@ -537,6 +893,7 @@ static void WiiURenderer_destroy(Renderer* base) {
     WiiURenderer* renderer = (WiiURenderer*) base;
 
     WiiURenderer_freeTexturePages(renderer);
+    WiiURenderer_destroyRenderTarget(&renderer->sceneTarget);
     WiiURenderer_destroyVertexBuffer(renderer);
     if (renderer->shaderReady) {
         WHBGfxFreeShaderGroup(&renderer->shaderGroup);
@@ -552,6 +909,7 @@ static void WiiURenderer_beginFrame(Renderer* base, int32_t gameW, int32_t gameH
     WiiURenderer* renderer = (WiiURenderer*) base;
     renderer->frameWidth = gameW;
     renderer->frameHeight = gameH;
+    WiiURenderer_ensureSceneTarget(renderer, (uint32_t) gameW, (uint32_t) gameH);
     WiiURenderer_updatePresentLayout(renderer);
     renderer->viewX = 0;
     renderer->viewY = 0;
@@ -566,6 +924,10 @@ static void WiiURenderer_beginFrame(Renderer* base, int32_t gameW, int32_t gameH
     renderer->commandCount = 0;
     renderer->batchVertexCount = 0;
     renderer->queuedQuadCount = 0;
+    if (renderer->commandCapacity > 2048 && renderer->commands != NULL) {
+        renderer->commandCapacity = 2048;
+        renderer->commands = safeRealloc(renderer->commands, (size_t) renderer->commandCapacity * sizeof(WiiUQuadCommand));
+    }
 }
 
 static void WiiURenderer_beginView(Renderer* base, int32_t viewX, int32_t viewY, int32_t viewW, int32_t viewH, int32_t portX, int32_t portY, int32_t portW, int32_t portH, float viewAngle) {
@@ -592,6 +954,7 @@ static void WiiURenderer_endFrame(Renderer* base) {
     WiiURenderer* renderer = (WiiURenderer*) base;
     GX2ColorBuffer* tvScan = WHBGfxGetTVColourBuffer();
     GX2ColorBuffer* drcScan = WHBGfxGetDRCColourBuffer();
+    bool traceFrame = renderer->debugFrameIndex < 2;
     if (!renderer->shaderReady || tvScan == NULL || drcScan == NULL) {
         WiiURenderer_bootLog("wiiu_renderer: missing scan buffers");
         return;
@@ -647,60 +1010,107 @@ static void WiiURenderer_endFrame(Renderer* base) {
         }
     }
 
-    struct timespec tvStart;
-    struct timespec tvEnd;
-    struct timespec drcStart;
-    struct timespec drcEnd;
+    OSTime tvStart = 0;
+    OSTime tvEnd = 0;
+    OSTime drcStart = 0;
+    OSTime drcEnd = 0;
+    WiiUPresentLayout tvLayout = { 0 };
+    WiiUPresentLayout drcLayout = { 0 };
+    GX2ContextState* tvContext = WHBGfxGetTVContextState();
 
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: before WHBGfxBeginRender");
     WHBGfxBeginRender();
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: after WHBGfxBeginRender");
     WiiURenderer_refreshOutputState(renderer);
-
-    // Render DRC at 854x480
-    clock_gettime(CLOCK_MONOTONIC, &drcStart);
-    WHBGfxBeginRenderDRC();
-    GX2SetScissor(0, 0, WIIU_RENDER_WIDTH, WIIU_RENDER_HEIGHT);
-    WHBGfxClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    GX2SetScissor(
-        (uint32_t) renderer->presentLayout.xOffset,
-        (uint32_t) renderer->presentLayout.yOffset,
-        (uint32_t) lroundf(renderer->presentLayout.targetWidth),
-        (uint32_t) lroundf(renderer->presentLayout.targetHeight)
+    WiiURenderer_computeOutputLayout(
+        &drcLayout,
+        drcScan->surface.width,
+        drcScan->surface.height,
+        (uint32_t) renderer->frameWidth,
+        (uint32_t) renderer->frameHeight,
+        false
     );
-    WHBGfxClearColor(
-        (float) renderer->clearR / 255.0f,
-        (float) renderer->clearG / 255.0f,
-        (float) renderer->clearB / 255.0f,
-        1.0f
+    WiiURenderer_computeOutputLayout(
+        &tvLayout,
+        tvScan->surface.width,
+        tvScan->surface.height,
+        (uint32_t) renderer->frameWidth,
+        (uint32_t) renderer->frameHeight,
+        true
     );
-    WiiURenderer_renderCommandsToTarget(renderer);
-    WHBGfxFinishRenderDRC();
-    GX2DrawDone();
-    clock_gettime(CLOCK_MONOTONIC, &drcEnd);
 
-    // Render TV at 854x480
-    clock_gettime(CLOCK_MONOTONIC, &tvStart);
+    tvStart = OSGetTime();
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: before WHBGfxBeginRenderTV");
     WHBGfxBeginRenderTV();
-    GX2SetScissor(0, 0, WIIU_RENDER_WIDTH, WIIU_RENDER_HEIGHT);
-    WHBGfxClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    GX2SetScissor(
-        (uint32_t) renderer->presentLayout.xOffset,
-        (uint32_t) renderer->presentLayout.yOffset,
-        (uint32_t) lroundf(renderer->presentLayout.targetWidth),
-        (uint32_t) lroundf(renderer->presentLayout.targetHeight)
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: after WHBGfxBeginRenderTV");
+
+    GX2SetColorBuffer(&renderer->sceneTarget.colorBuffer, GX2_RENDER_TARGET_0);
+    GX2SetViewport(
+        0.0f,
+        0.0f,
+        (float) renderer->sceneTarget.colorBuffer.surface.width,
+        (float) renderer->sceneTarget.colorBuffer.surface.height,
+        0.0f,
+        1.0f
     );
-    WHBGfxClearColor(
+    GX2SetScissor(0, 0, renderer->sceneTarget.colorBuffer.surface.width, renderer->sceneTarget.colorBuffer.surface.height);
+    GX2ClearColor(
+        &renderer->sceneTarget.colorBuffer,
         (float) renderer->clearR / 255.0f,
         (float) renderer->clearG / 255.0f,
         (float) renderer->clearB / 255.0f,
         1.0f
     );
-    WiiURenderer_renderCommandsToTarget(renderer);
+    if (tvContext != NULL) {
+        GX2SetContextState(tvContext);
+    }
+    GX2SetColorBuffer(&renderer->sceneTarget.colorBuffer, GX2_RENDER_TARGET_0);
+    WiiURenderer_renderCommandsToSceneTarget(renderer);
+    GX2SetColorBuffer(tvScan, GX2_RENDER_TARGET_0);
+    GX2SetViewport(0.0f, 0.0f, (float) tvScan->surface.width, (float) tvScan->surface.height, 0.0f, 1.0f);
+    GX2SetScissor(0, 0, tvScan->surface.width, tvScan->surface.height);
+    WHBGfxClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    WiiURenderer_renderPresentTextureToTarget(
+        renderer,
+        tvScan,
+        tvScan->surface.width,
+        tvScan->surface.height,
+        &tvLayout,
+        &renderer->sceneTarget.presentTexture
+    );
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: before WHBGfxFinishRenderTV");
     WHBGfxFinishRenderTV();
-    WHBGfxFinishRender();
-    clock_gettime(CLOCK_MONOTONIC, &tvEnd);
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: after WHBGfxFinishRenderTV");
+    tvEnd = OSGetTime();
 
-    renderer->perfRenderTvMs += WiiURenderer_elapsedMs(&tvStart, &tvEnd);
-    renderer->perfRenderDrcMs += WiiURenderer_elapsedMs(&drcStart, &drcEnd);
+    drcStart = OSGetTime();
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: before WHBGfxBeginRenderDRC");
+    WHBGfxBeginRenderDRC();
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: after WHBGfxBeginRenderDRC");
+    GX2SetScissor(0, 0, drcScan->surface.width, drcScan->surface.height);
+    WHBGfxClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    WiiURenderer_renderPresentTextureToTarget(
+        renderer,
+        drcScan,
+        drcScan->surface.width,
+        drcScan->surface.height,
+        &drcLayout,
+        &renderer->sceneTarget.presentTexture
+    );
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: before WHBGfxFinishRenderDRC");
+    WHBGfxFinishRenderDRC();
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: after WHBGfxFinishRenderDRC");
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: before GX2DrawDone");
+    GX2DrawDone();
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: after GX2DrawDone");
+    drcEnd = OSGetTime();
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: before WHBGfxFinishRender");
+    WHBGfxFinishRender();
+    if (traceFrame) WiiURenderer_bootLog("wiiu_renderer: after WHBGfxFinishRender");
+
+    renderer->perfSceneMs += 0.0;
+    renderer->perfRenderTvMs += WiiURenderer_elapsedMs(tvStart, tvEnd);
+    renderer->perfRenderDrcMs += WiiURenderer_elapsedMs(drcStart, drcEnd);
     renderer->perfQuadCount += renderer->queuedQuadCount;
     renderer->perfFrameCount++;
 
@@ -709,16 +1119,18 @@ static void WiiURenderer_endFrame(Renderer* base) {
         snprintf(
             perfBuffer,
             sizeof(perfBuffer),
-            "wiiu_renderer: avg over %u frames tv=%.2fms drc=%.2fms total=%.2fms quads=%u flush=%u",
+            "wiiu_renderer: avg over %u frames scene=%.2fms tv=%.2fms drc=%.2fms total=%.2fms quads=%u flush=%u",
             renderer->perfFrameCount,
+            renderer->perfSceneMs / (double) renderer->perfFrameCount,
             renderer->perfRenderTvMs / (double) renderer->perfFrameCount,
             renderer->perfRenderDrcMs / (double) renderer->perfFrameCount,
-            (renderer->perfRenderTvMs + renderer->perfRenderDrcMs) / (double) renderer->perfFrameCount,
+            (renderer->perfSceneMs + renderer->perfRenderTvMs + renderer->perfRenderDrcMs) / (double) renderer->perfFrameCount,
             renderer->perfQuadCount / renderer->perfFrameCount,
             renderer->perfFlushCount / renderer->perfFrameCount
         );
         WiiURenderer_bootLog(perfBuffer);
         renderer->perfFrameCount = 0;
+        renderer->perfSceneMs = 0.0;
         renderer->perfRenderTvMs = 0.0;
         renderer->perfRenderDrcMs = 0.0;
         renderer->perfFlushCount = 0;

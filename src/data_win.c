@@ -1371,10 +1371,10 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
 
     logMemUse("After STRG load");
 
-    // Pass 2: Parse all chunks directly from the FILE* stream.
-    // On a fast-I/O device there is no benefit to bulk-loading each chunk
-    // into a malloc'd buffer before parsing — doing so wastes RAM and adds
-    // an extra allocation/free per chunk. Parse directly from the reader.
+    // Pass 2: Parse each chunk through a temporary in-memory buffer where it
+    // materially helps correctness. Large metadata chunks like CODE/TXTR/AUDO
+    // only need pointer-table access and/or immediately copy the data they
+    // retain, so buffering them just doubles I/O and spikes memory use.
     BinaryReader_seek(&reader, 8);
     int chunkIndex = 0;
 
@@ -1386,9 +1386,21 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
         uint32_t chunkLength = BinaryReader_readUint32(&reader);
         size_t chunkDataStart = BinaryReader_getPosition(&reader);
         size_t chunkEnd = chunkDataStart + chunkLength;
+        uint8_t* chunkBuffer = NULL;
 
         if (options.progressCallback) {
             options.progressCallback(chunkName, chunkIndex, totalChunks, dw, options.progressCallbackUserData);
+        }
+
+        bool useChunkBuffer =
+            chunkLength > 0 &&
+            memcmp(chunkName, "CODE", 4) != 0 &&
+            memcmp(chunkName, "TXTR", 4) != 0 &&
+            memcmp(chunkName, "AUDO", 4) != 0;
+
+        if (useChunkBuffer) {
+            chunkBuffer = BinaryReader_readBytesAt(&reader, chunkDataStart, chunkLength);
+            BinaryReader_setBuffer(&reader, chunkBuffer, chunkDataStart, chunkLength);
         }
 
         if (options.parseGen8 && memcmp(chunkName, "GEN8", 4) == 0) {
@@ -1489,9 +1501,11 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
             printf("Unknown chunk: %.4s (length %u at offset 0x%zX)\n", chunkName, chunkLength, chunkDataStart - 8);
         }
 
-        // Seek to chunk end to skip any unread data or trailing padding.
-        // On a fast-I/O device this fseek is essentially free.
-        fseek(reader.file, (long) chunkEnd, SEEK_SET);
+        if (chunkBuffer != NULL) {
+            BinaryReader_clearBuffer(&reader);
+            safeFree(chunkBuffer);
+        }
+        BinaryReader_seek(&reader, chunkEnd);
         chunkIndex++;
     }
 
@@ -1661,7 +1675,6 @@ void DataWin_free(DataWin* dw) {
 
     // TPAG
     safeFree(dw->tpag.items);
-    hmfree(dw->tpagOffsetMap);
 
     // CODE
     safeFree(dw->code.entries);
