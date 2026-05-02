@@ -29,14 +29,14 @@ cmake --build build/wiiu
 
 This produces `Cinnamon.elf`, `Cinnamon.rpx`, and a `.wuhb` bundle in `build/wiiu`.
 
+## Showcase
+
+- **Snowdin Forest**
+
+<img src="/resources/readme/screenshots/pic1.jpg" height="128px"></img>
+ 
+- **Undyne the Undying:** https://www.youtube.com/watch?v=QqKhSn0SHL8
+
 ## Disclaimer
 
 Cinnamon has no association, endorsement, or any connection whatsoever with any of the software that it facilitates, and does not provide any of the software it can run by itself. In order to use Cinnamon, you will need to provide your own game files.
-
-Photos/Videos of Cinnamon running!
-
-Like the forest before snowdin!  
-<img src="/resources/readme/screenshots/pic1.jpg" height="128px"></img>  
-
-Undyne the Undying!!  
-https://www.youtube.com/watch?v=QqKhSn0SHL8
