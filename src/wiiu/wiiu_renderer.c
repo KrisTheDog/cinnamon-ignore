@@ -59,11 +59,11 @@ static void WiiURenderer_destroyRenderTarget(WiiURenderTarget* target);
 static bool WiiURenderer_initRenderTarget(WiiURenderTarget* target, uint32_t width, uint32_t height);
 static void WiiURenderer_ensureSceneTarget(WiiURenderer* renderer, uint32_t width, uint32_t height);
 static void WiiURenderer_computeIntegerBlitRect(uint32_t sourceWidth, uint32_t sourceHeight, uint32_t targetWidth, uint32_t targetHeight, float* left, float* top, float* right, float* bottom);
+static bool WiiURenderer_ensureVertexCapacity(WiiURenderer* renderer, uint32_t neededVertices);
+static bool WiiURenderer_mapVertexBuffer(WiiURenderer* renderer);
 
 static void* WiiURenderer_gpuAlloc(size_t alignment, size_t size) {
-    void* ptr = MEMAllocFromDefaultHeapEx((uint32_t) size, (int32_t) alignment);
-    requireMessage(ptr != NULL, "Wii U GPU allocation failed");
-    return ptr;
+    return MEMAllocFromDefaultHeapEx((uint32_t) size, (int32_t) alignment);
 }
 
 static void WiiURenderer_gpuFree(void* ptr) {
@@ -170,6 +170,10 @@ static bool WiiURenderer_initRenderTarget(WiiURenderTarget* target, uint32_t wid
     target->colorBuffer.surface.tileMode = GX2_TILE_MODE_DEFAULT;
     GX2CalcSurfaceSizeAndAlignment(&target->colorBuffer.surface);
     target->colorBuffer.surface.image = WiiURenderer_gpuAlloc(target->colorBuffer.surface.alignment, target->colorBuffer.surface.imageSize);
+    if (target->colorBuffer.surface.image == NULL) {
+        WiiURenderer_destroyRenderTarget(target);
+        return false;
+    }
     memset(target->colorBuffer.surface.image, 0, target->colorBuffer.surface.imageSize);
 
     target->colorBuffer.viewMip = 0;
@@ -207,7 +211,9 @@ static void WiiURenderer_ensureSceneTarget(WiiURenderer* renderer, uint32_t widt
     }
 
     WiiURenderer_destroyRenderTarget(&renderer->sceneTarget);
-    WiiURenderer_initRenderTarget(&renderer->sceneTarget, width, height);
+    if (!WiiURenderer_initRenderTarget(&renderer->sceneTarget, width, height)) {
+        WiiURenderer_bootLog("wiiu_renderer: scene target allocation failed");
+    }
 }
 
 static void WiiURenderer_computeIntegerBlitRect(
@@ -250,6 +256,10 @@ static bool WiiURenderer_initLinearTexture(GX2Texture* texture, uint32_t width, 
     texture->surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&texture->surface);
     texture->surface.image = WiiURenderer_gpuAlloc(texture->surface.alignment, texture->surface.imageSize);
+    if (texture->surface.image == NULL) {
+        memset(texture, 0, sizeof(*texture));
+        return false;
+    }
     memset(texture->surface.image, 0, texture->surface.imageSize);
     texture->viewFirstMip = 0;
     texture->viewNumMips = 1;
@@ -262,10 +272,14 @@ static bool WiiURenderer_initLinearTexture(GX2Texture* texture, uint32_t width, 
 
 static bool WiiURenderer_uploadTexturePage(WiiUTexturePage* page, const uint8_t* pixels, uint32_t width, uint32_t height) {
     WiiURenderer_destroyTexturePage(page);
+    if (pixels == NULL || width == 0 || height == 0) return false;
     if (!WiiURenderer_initLinearTexture(&page->texture, width, height)) return false;
 
     uint8_t* dst = (uint8_t*) page->texture.surface.image;
-    requireMessage(dst != NULL, "failed to access texture surface image");
+    if (dst == NULL) {
+        WiiURenderer_destroyTexturePage(page);
+        return false;
+    }
     memset(dst, 0, page->texture.surface.imageSize);
     uint32_t dstPitchBytes = page->texture.surface.pitch * 4u;
     for (uint32_t y = 0; y < height; ++y) {
@@ -281,7 +295,14 @@ static bool WiiURenderer_uploadTexturePage(WiiUTexturePage* page, const uint8_t*
 
 static void WiiURenderer_loadTexturePages(WiiURenderer* renderer, DataWin* dataWin) {
     renderer->texturePageCount = dataWin->txtr.count;
-    renderer->texturePages = safeCalloc(renderer->texturePageCount, sizeof(WiiUTexturePage));
+    if (renderer->texturePageCount > 0) {
+        renderer->texturePages = calloc(renderer->texturePageCount, sizeof(WiiUTexturePage));
+        if (renderer->texturePages == NULL) {
+            renderer->texturePageCount = 0;
+            WiiURenderer_bootLog("wiiu_renderer: texture page table allocation failed");
+            return;
+        }
+    }
 
     repeat(renderer->texturePageCount, i) {
         Texture* tex = &dataWin->txtr.textures[i];
@@ -310,8 +331,10 @@ static void WiiURenderer_loadTexturePages(WiiURenderer* renderer, DataWin* dataW
 
         if (pixels == NULL) continue;
 
-        WiiURenderer_uploadTexturePage(&renderer->texturePages[i], pixels,
-                                       (uint32_t) width, (uint32_t) height);
+        if (width > 0 && height > 0) {
+            WiiURenderer_uploadTexturePage(&renderer->texturePages[i], pixels,
+                                           (uint32_t) width, (uint32_t) height);
+        }
         stbi_image_free(pixels);
     }
 
@@ -352,9 +375,9 @@ static void WiiURenderer_destroyVertexBuffer(WiiURenderer* renderer) {
     renderer->batchVertexCapacity = 0;
 }
 
-static void WiiURenderer_ensureVertexCapacity(WiiURenderer* renderer, uint32_t neededVertices) {
+static bool WiiURenderer_ensureVertexCapacity(WiiURenderer* renderer, uint32_t neededVertices) {
     uint32_t needed = renderer->batchVertexCount + neededVertices;
-    if (needed <= renderer->batchVertexCapacity) return;
+    if (needed <= renderer->batchVertexCapacity) return true;
 
     uint32_t newCapacity = renderer->batchVertexCapacity == 0 ? WIIU_MAX_QUADS * WIIU_VERTICES_PER_QUAD : renderer->batchVertexCapacity;
     while (newCapacity < needed) {
@@ -369,10 +392,17 @@ static void WiiURenderer_ensureVertexCapacity(WiiURenderer* renderer, uint32_t n
         GX2R_RESOURCE_USAGE_FORCE_MEM2;
     newVertexBuffer.elemSize = sizeof(WiiUBatchVertex);
     newVertexBuffer.elemCount = newCapacity;
-    requireMessage(GX2RCreateBuffer(&newVertexBuffer), "failed to create GX2R vertex buffer");
+    if (!GX2RCreateBuffer(&newVertexBuffer)) {
+        WiiURenderer_bootLog("wiiu_renderer: failed to create GX2R vertex buffer");
+        return false;
+    }
 
     WiiUBatchVertex* newVertices = (WiiUBatchVertex*) GX2RLockBufferEx(&newVertexBuffer, 0);
-    requireMessage(newVertices != NULL, "failed to access GX2R vertex buffer");
+    if (newVertices == NULL) {
+        WiiURenderer_bootLog("wiiu_renderer: failed to lock new GX2R vertex buffer");
+        GX2RDestroyBufferEx(&newVertexBuffer, 0);
+        return false;
+    }
 
     if (renderer->batchVertices != NULL && renderer->batchVertexCount > 0) {
         memcpy(newVertices, renderer->batchVertices, (size_t) renderer->batchVertexCount * sizeof(WiiUBatchVertex));
@@ -382,13 +412,18 @@ static void WiiURenderer_ensureVertexCapacity(WiiURenderer* renderer, uint32_t n
     renderer->batchVertexBuffer = newVertexBuffer;
     renderer->batchVertices = newVertices;
     renderer->batchVertexCapacity = newCapacity;
+    return true;
 }
 
-static void WiiURenderer_mapVertexBuffer(WiiURenderer* renderer) {
+static bool WiiURenderer_mapVertexBuffer(WiiURenderer* renderer) {
     if (renderer->batchVertices == NULL && GX2RBufferExists(&renderer->batchVertexBuffer)) {
         renderer->batchVertices = (WiiUBatchVertex*) GX2RLockBufferEx(&renderer->batchVertexBuffer, 0);
-        requireMessage(renderer->batchVertices != NULL, "failed to lock GX2R vertex buffer");
+        if (renderer->batchVertices == NULL) {
+            WiiURenderer_bootLog("wiiu_renderer: failed to lock GX2R vertex buffer");
+            return false;
+        }
     }
+    return renderer->batchVertices != NULL;
 }
 
 static void WiiURenderer_releaseTextureBlob(DataWin* dataWin, uint32_t index) {
@@ -406,8 +441,13 @@ static void WiiURenderer_pushCommand(WiiURenderer* renderer, const WiiUQuadComma
         uint32_t newCapacity = renderer->commandCapacity == 0 ? 1024 : renderer->commandCapacity * 2;
         if (newCapacity > 8192) newCapacity = 8192;
         if (renderer->commandCount >= newCapacity) return; // drop rather than crash
+        WiiUQuadCommand* newCommands = realloc(renderer->commands, (size_t) newCapacity * sizeof(WiiUQuadCommand));
+        if (newCommands == NULL) {
+            WiiURenderer_bootLog("wiiu_renderer: command buffer growth failed");
+            return;
+        }
+        renderer->commands = newCommands;
         renderer->commandCapacity = newCapacity;
-        renderer->commands = safeRealloc(renderer->commands, (size_t) renderer->commandCapacity * sizeof(WiiUQuadCommand));
     }
     renderer->commands[renderer->commandCount++] = *command;
 }
@@ -531,8 +571,8 @@ static void WiiURenderer_renderLetterboxMasksToTarget(
     WiiURenderer_setCommonState(false);
     GX2SetViewport(0.0f, 0.0f, (float) targetWidth, (float) targetHeight, 0.0f, 1.0f);
     GX2SetScissor(0, 0, targetWidth, targetHeight);
-    WiiURenderer_ensureVertexCapacity(renderer, 12);
-    WiiURenderer_mapVertexBuffer(renderer);
+    if (!WiiURenderer_ensureVertexCapacity(renderer, 12)) return;
+    if (!WiiURenderer_mapVertexBuffer(renderer)) return;
     renderer->batchVertexCount = 0;
 
     #define WIIU_EMIT_MASK_QUAD(x0, y0, x1, y1) \
@@ -700,8 +740,8 @@ static void WiiURenderer_buildQuadVertices(
     uint32_t targetHeight,
     const WiiUPresentLayout* layout
 ) {
-    WiiURenderer_ensureVertexCapacity(renderer, WIIU_VERTICES_PER_QUAD);
-    WiiURenderer_mapVertexBuffer(renderer);
+    if (!WiiURenderer_ensureVertexCapacity(renderer, WIIU_VERTICES_PER_QUAD)) return;
+    if (!WiiURenderer_mapVertexBuffer(renderer)) return;
     WiiUVec2 c00 = WiiURenderer_gameToClip(renderer, command->p00, targetWidth, targetHeight, layout);
     WiiUVec2 c10 = WiiURenderer_gameToClip(renderer, command->p10, targetWidth, targetHeight, layout);
     WiiUVec2 c01 = WiiURenderer_gameToClip(renderer, command->p01, targetWidth, targetHeight, layout);
@@ -815,8 +855,8 @@ static void WiiURenderer_renderPresentTextureToTarget(
     GX2SetViewport(0.0f, 0.0f, (float) targetWidth, (float) targetHeight, 0.0f, 1.0f);
     GX2SetScissor(layout->xOffset, layout->yOffset, presentWidth, presentHeight);
 
-    WiiURenderer_ensureVertexCapacity(renderer, WIIU_VERTICES_PER_QUAD);
-    WiiURenderer_mapVertexBuffer(renderer);
+    if (!WiiURenderer_ensureVertexCapacity(renderer, WIIU_VERTICES_PER_QUAD)) return;
+    if (!WiiURenderer_mapVertexBuffer(renderer)) return;
     renderer->batchVertexCount = 0;
 
     WiiURenderer_emitClipVertex(renderer, x0, y1, 0.0f, 0.0f);
@@ -925,8 +965,11 @@ static void WiiURenderer_beginFrame(Renderer* base, int32_t gameW, int32_t gameH
     renderer->batchVertexCount = 0;
     renderer->queuedQuadCount = 0;
     if (renderer->commandCapacity > 2048 && renderer->commands != NULL) {
-        renderer->commandCapacity = 2048;
-        renderer->commands = safeRealloc(renderer->commands, (size_t) renderer->commandCapacity * sizeof(WiiUQuadCommand));
+        WiiUQuadCommand* resizedCommands = realloc(renderer->commands, (size_t) 2048 * sizeof(WiiUQuadCommand));
+        if (resizedCommands != NULL) {
+            renderer->commands = resizedCommands;
+            renderer->commandCapacity = 2048;
+        }
     }
 }
 
@@ -936,14 +979,14 @@ static void WiiURenderer_beginView(Renderer* base, int32_t viewX, int32_t viewY,
     WiiURenderer* renderer = (WiiURenderer*) base;
     renderer->viewX = viewX;
     renderer->viewY = viewY;
-    renderer->viewW = viewW;
-    renderer->viewH = viewH;
+    renderer->viewW = viewW != 0 ? viewW : 1;
+    renderer->viewH = viewH != 0 ? viewH : 1;
     renderer->portX = portX;
     renderer->portY = portY;
     renderer->portW = portW;
     renderer->portH = portH;
-    renderer->viewScaleX = (float) portW / (float) viewW;
-    renderer->viewScaleY = (float) portH / (float) viewH;
+    renderer->viewScaleX = (float) portW / (float) renderer->viewW;
+    renderer->viewScaleY = (float) portH / (float) renderer->viewH;
 }
 
 static void WiiURenderer_endView(Renderer* base) {

@@ -572,9 +572,16 @@ static DogSprite gDogSprite = { NULL, 0, false };
 
 static void dogSprite_load(void) {
     if (gDogSprite.loaded) return;
-    const char path[] = "/vol/content/resources/wiiu/loadingDog.png";
+    const char* paths[] = {
+        "/vol/content/loadingDog.png",
+        "/vol/content/resources/wiiu/loadingDog.png",
+    };
 
-    FILE* f = fopen(path, "rb");
+    FILE* f = NULL;
+    repeat(sizeof(paths) / sizeof(paths[0]), i) {
+        f = fopen(paths[i], "rb");
+        if (f != NULL) break;
+    }
     if (f == NULL) {
         return;
     }
@@ -1166,7 +1173,6 @@ shutdown:
         audio = NULL;
         bootLog("shutdown: after audio destroy");
     }
-
 
     if (loadingThreadStarted && !loadingThreadJoined) {
         bootLog("shutdown: before loading thread detach");

@@ -66,8 +66,9 @@ static bool WiiUAudio_shouldStreamSound(const Sound* sound) {
 
 static bool WiiUAudio_ensureStreamScratch(WiiUAudioSystem* wiiu, uint32_t sampleCount) {
     if (wiiu->streamScratchSamples < sampleCount) {
-        free(wiiu->streamScratch);
-        wiiu->streamScratch = safeMalloc((size_t) sampleCount * sizeof(float));
+        float* newScratch = realloc(wiiu->streamScratch, (size_t) sampleCount * sizeof(float));
+        if (newScratch == NULL) return false;
+        wiiu->streamScratch = newScratch;
         wiiu->streamScratchSamples = sampleCount;
     }
     return wiiu->streamScratch != NULL;
@@ -109,7 +110,12 @@ static bool WiiUAudio_tryOpenVorbisStream(WiiUAudioSystem* wiiu, const char* pat
     }
 
     uint32_t decodeFrames = 2048;
-    float* decodeBuffer = safeMalloc((size_t) decodeFrames * (size_t) info.channels * sizeof(float));
+    float* decodeBuffer = malloc((size_t) decodeFrames * (size_t) info.channels * sizeof(float));
+    if (decodeBuffer == NULL) {
+        SDL_FreeAudioStream(stream);
+        stb_vorbis_close(vorbis);
+        return false;
+    }
 
     slot->streaming = true;
     slot->streamEof = false;
@@ -197,7 +203,11 @@ static uint8_t* WiiUAudio_readFileBinary(const char* path, size_t* outSize) {
         return NULL;
     }
 
-    uint8_t* data = safeMalloc((size_t) size);
+    uint8_t* data = malloc((size_t) size);
+    if (data == NULL) {
+        fclose(file);
+        return NULL;
+    }
     size_t bytesRead = fread(data, 1, (size_t) size, file);
     fclose(file);
     if (bytesRead != (size_t) size) {
@@ -246,7 +256,10 @@ static bool WiiUAudio_convertPcmS16ToDevice(
 
     int srcBytes = (int) ((size_t) frameCount * srcChannels * sizeof(int16_t));
     cvt.len = srcBytes;
-    cvt.buf = safeMalloc((size_t) cvt.len * cvt.len_mult);
+    cvt.buf = malloc((size_t) cvt.len * cvt.len_mult);
+    if (cvt.buf == NULL) {
+        return false;
+    }
     memcpy(cvt.buf, pcm, (size_t) srcBytes);
 
     if (SDL_ConvertAudio(&cvt) < 0) {
@@ -254,7 +267,11 @@ static bool WiiUAudio_convertPcmS16ToDevice(
         return false;
     }
 
-    out->samples = safeMalloc((size_t) cvt.len_cvt);
+    out->samples = malloc((size_t) cvt.len_cvt);
+    if (out->samples == NULL) {
+        free(cvt.buf);
+        return false;
+    }
     memcpy(out->samples, cvt.buf, (size_t) cvt.len_cvt);
     free(cvt.buf);
 
@@ -325,7 +342,8 @@ static bool WiiUAudio_decodeWav(WiiUAudioSystem* wiiu, const uint8_t* encodedDat
         : sampleDataSize / ((uint32_t) channels * 2U);
     if (frameCount == 0) return false;
 
-    int16_t* interleaved = safeMalloc((size_t) frameCount * channels * sizeof(int16_t));
+    int16_t* interleaved = malloc((size_t) frameCount * channels * sizeof(int16_t));
+    if (interleaved == NULL) return false;
     if (bitsPerSample == 8) {
         repeat(frameCount, i) {
             repeat(channels, ch) {
@@ -359,8 +377,12 @@ static void WiiUAudio_callback(void* userdata, Uint8* stream, int len) {
     uint32_t sampleCount = (uint32_t) (len / (int) sizeof(float));
 
     if (wiiu->mixBufferSamples < sampleCount) {
-        free(wiiu->mixBuffer);
-        wiiu->mixBuffer = safeMalloc((size_t) sampleCount * sizeof(float));
+        float* newMixBuffer = realloc(wiiu->mixBuffer, (size_t) sampleCount * sizeof(float));
+        if (newMixBuffer == NULL) {
+            memset(stream, 0, (size_t) len);
+            return;
+        }
+        wiiu->mixBuffer = newMixBuffer;
         wiiu->mixBufferSamples = sampleCount;
     }
 
