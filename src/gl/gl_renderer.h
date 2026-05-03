@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common.h"
 #include "renderer.h"
 #include <glad/glad.h>
 
@@ -11,6 +12,10 @@ typedef struct {
     GLuint shaderProgram;
     GLint uProjection;
     GLint uTexture;
+    GLint uAlphaTestRef;
+
+    bool alphaTestEnable;
+    float alphaTestRef;
 
     GLuint vao, vbo, ebo;
     float* vertexData; // MAX_QUADS * VERTICES_PER_QUAD * FLOATS_PER_VERTEX floats
@@ -21,6 +26,7 @@ typedef struct {
     GLuint* glTextures;       // one GL texture per TXTR page
     int32_t* textureWidths;   // needed for UV normalization
     int32_t* textureHeights;
+    bool* textureLoaded;      // lazy loading: true once PNG decoded and uploaded
     uint32_t textureCount;
 
     GLuint whiteTexture; // 1x1 white pixel for drawing primitives (rectangles, lines, etc.)

@@ -52,7 +52,6 @@ typedef struct {
     DataWin* dataWin;
     VMContext* vm;
     WiiUFileSystem* fileSystem;
-    Runner* runner;
     bool completed;
     bool failed;
 } WiiULoadingState;
@@ -356,26 +355,18 @@ static int loadingWorkerThreadMain(int argc, const char** argv) {
     bootLog("stage: worker after WiiUFileSystem_create");
     setLoadingProgress(state, 0.86f);
 
-    Runner* runner = Runner_create(dataWin, vm, (FileSystem*) fileSystem);
-    bootLog("stage: worker after Runner_create");
-    setLoadingProgress(state, 0.90f);
-
     OSLockMutex(&state->mutex);
     state->dataWin = dataWin;
     state->vm = vm;
     state->fileSystem = fileSystem;
-    state->runner = runner;
     state->completed = true;
     OSUnlockMutex(&state->mutex);
     return 0;
 }
 
 static int32_t resolveMappedKey(const RunnerKeyboardState* keyboard, int32_t gmlKey) {
-    int32_t mappedKey = gmlKey;
-    if (gmlKey >= 0 && gmlKey < GML_KEY_COUNT) {
-        mappedKey = keyboard->keyMap[gmlKey];
-    }
-    return mappedKey;
+    (void) keyboard;
+    return gmlKey;
 }
 
 static void setDesiredKeyState(bool* desiredKeys, const RunnerKeyboardState* keyboard, int32_t gmlKey, bool isHeld) {
@@ -956,29 +947,29 @@ int main(int argc, char* argv[]) {
 
     if (loadingState.failed || loadingThreadResult != 0 ||
         loadingState.dataWin == NULL || loadingState.vm == NULL ||
-        loadingState.fileSystem == NULL || loadingState.runner == NULL) {
+        loadingState.fileSystem == NULL) {
         bootLog("stage: loading worker failed");
         goto shutdown;
     }
 
     dataWin = loadingState.dataWin;
     fileSystem = loadingState.fileSystem;
-    runner = loadingState.runner;
     loadingState.dataWin = NULL;
     loadingState.fileSystem = NULL;
-    loadingState.runner = NULL;
-    loadingState.vm = NULL; // ownership transferred to runner via Runner_create
+    VMContext* vm = loadingState.vm;
+    loadingState.vm = NULL;
 
     renderer = WiiURenderer_create();
     bootLog("stage: after WiiURenderer_create");
     renderer->vtable->init(renderer, dataWin);
     bootLog("stage: after renderer init");
-    runner->renderer = renderer;
 
     audio = WiiUAudioSystem_create();
     audio->base.vtable->init((AudioSystem*) audio, dataWin, (FileSystem*) fileSystem);
-    runner->audioSystem = (AudioSystem*) audio;
     bootLog("stage: after audio init");
+
+    runner = Runner_create(dataWin, vm, renderer, (FileSystem*) fileSystem, (AudioSystem*) audio);
+    bootLog("stage: after Runner_create");
 
     bootLog("stage: before Runner_initFirstRoom");
     Runner_initFirstRoom(runner);
@@ -1112,7 +1103,7 @@ int main(int argc, char* argv[]) {
                     (int32_t) lroundf((float) activeRoom->views[vi].portY * portScaleY),
                     (int32_t) lroundf((float) activeRoom->views[vi].portWidth * portScaleX),
                     (int32_t) lroundf((float) activeRoom->views[vi].portHeight * portScaleY),
-                    runner->viewAngles[vi]
+                    runner->views[vi].viewAngle
                 );
                 Runner_draw(runner);
                 renderer->vtable->endView(renderer);

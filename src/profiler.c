@@ -1,216 +1,177 @@
 #include "profiler.h"
 
-#if defined(CINNAMON_PROFILE)
-
-#include <stdbool.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
-#if defined(__3DS__)
-#include <3ds.h>
+#include "utils.h"
+#include "stb_ds.h"
+#include "string_builder.h"
+
+#if defined(PLATFORM_PS2)
+#include <timer.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #else
-#include <sys/time.h>
+#include <time.h>
 #endif
 
-typedef struct {
-    const char* name;
-    bool active;
-    double startMs;
-    double frameMs;
-    double windowTotalMs;
-    double windowMaxMs;
-    uint64_t windowCalls;
-} ProfileSectionState;
-
-typedef struct {
-    bool initialized;
-    uint32_t reportEveryFrames;
-    double spikeFrameMs;
-
-    uint64_t frameIndex;
-    double frameStartMs;
-    double frameDurationMs;
-    double windowFrameTotalMs;
-    double windowFrameMaxMs;
-    uint32_t windowFrameCount;
-
-    ProfileSectionState sections[CINNAMON_PROFILE_SECTION_COUNT];
-} ProfileState;
-
-static ProfileState gProfile;
-
-enum {
-    CINNAMON_PROFILE_SPIKE_LOG_EVERY_FRAMES = 10,
-};
-
-static double profilerNowMs(void) {
-#if defined(__3DS__)
-    return (double) osGetTime();
+static uint64_t nowNanos(void) {
+#if defined(PLATFORM_PS2)
+    // kBUSCLK is bus clock ticks per second (~147 MHz).
+    // Split to avoid u64 overflow in ticks * 1e9.
+    uint64_t t = (uint64_t) GetTimerSystemTime();
+    uint64_t clk = (uint64_t) kBUSCLK;
+    uint64_t sec = t / clk;
+    uint64_t rem = t % clk;
+    return sec * 1000000000ull + (rem * 1000000000ull) / clk;
+#elif defined(_WIN32)
+    static LARGE_INTEGER freq;
+    static bool freqInitialized = false;
+    if (!freqInitialized) {
+        QueryPerformanceFrequency(&freq);
+        freqInitialized = true;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    uint64_t t = (uint64_t) now.QuadPart;
+    uint64_t f = (uint64_t) freq.QuadPart;
+    uint64_t sec = t / f;
+    uint64_t rem = t % f;
+    return sec * 1000000000ull + (rem * 1000000000ull) / f;
 #else
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return ((double) tv.tv_sec * 1000.0) + ((double) tv.tv_usec / 1000.0);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
 #endif
 }
 
-static void resetFrameSections(void) {
-    for (int i = 0; i < CINNAMON_PROFILE_SECTION_COUNT; ++i) {
-        gProfile.sections[i].active = false;
-        gProfile.sections[i].startMs = 0.0;
-        gProfile.sections[i].frameMs = 0.0;
-    }
+Profiler* Profiler_create(void) {
+    Profiler* p = safeMalloc(sizeof(Profiler));
+    p->entries = nullptr;
+    p->frameDepth = 0;
+    p->instructionCount = 0;
+    return p;
 }
 
-static bool shouldEmitSpikeLog(uint64_t frameIndex) {
-    return (frameIndex % CINNAMON_PROFILE_SPIKE_LOG_EVERY_FRAMES) == 0;
+void Profiler_destroy(Profiler* p) {
+    if (p == nullptr) return;
+    shfree(p->entries);
+    free(p);
 }
 
-static void ensureInitialized(void) {
-    if (gProfile.initialized) return;
-
-    memset(&gProfile, 0, sizeof(gProfile));
-    gProfile.initialized = true;
-    gProfile.reportEveryFrames = (uint32_t) CINNAMON_PROFILE_REPORT_EVERY;
-    gProfile.spikeFrameMs = (double) CINNAMON_PROFILE_SPIKE_MS;
-
-    gProfile.sections[CINNAMON_PROFILE_INPUT].name = "input";
-    gProfile.sections[CINNAMON_PROFILE_STEP].name = "step";
-    gProfile.sections[CINNAMON_PROFILE_AUDIO].name = "audio";
-    gProfile.sections[CINNAMON_PROFILE_RENDER].name = "render";
-    gProfile.sections[CINNAMON_PROFILE_PRESENT].name = "present";
-    gProfile.sections[CINNAMON_PROFILE_THROTTLE].name = "throttle";
-
-    fprintf(stderr,
-            "Profiler: enabled (reportEvery=%u frames, spikeThreshold=%.2f ms)\n",
-            gProfile.reportEveryFrames,
-            gProfile.spikeFrameMs);
-}
-
-void CinnamonProfiler_init(uint32_t reportEveryFrames, double spikeFrameMs) {
-    ensureInitialized();
-
-    if (reportEveryFrames > 0) {
-        gProfile.reportEveryFrames = reportEveryFrames;
-    }
-    if (spikeFrameMs > 0.0) {
-        gProfile.spikeFrameMs = spikeFrameMs;
-    }
-}
-
-void CinnamonProfiler_beginFrame(uint64_t frameIndex) {
-    ensureInitialized();
-
-    gProfile.frameIndex = frameIndex;
-    gProfile.frameStartMs = profilerNowMs();
-    gProfile.frameDurationMs = 0.0;
-
-    resetFrameSections();
-}
-
-void CinnamonProfiler_beginSection(CinnamonProfileSection section) {
-    if (section < 0 || section >= CINNAMON_PROFILE_SECTION_COUNT) return;
-    if (gProfile.sections[section].active) return;
-
-    gProfile.sections[section].active = true;
-    gProfile.sections[section].startMs = profilerNowMs();
-}
-
-void CinnamonProfiler_endSection(CinnamonProfileSection section) {
-    if (section < 0 || section >= CINNAMON_PROFILE_SECTION_COUNT) return;
-    if (!gProfile.sections[section].active) return;
-
-    double nowMs = profilerNowMs();
-    double elapsedMs = nowMs - gProfile.sections[section].startMs;
-    if (elapsedMs < 0.0) elapsedMs = 0.0;
-
-    gProfile.sections[section].active = false;
-    gProfile.sections[section].frameMs += elapsedMs;
-}
-
-static void printSpikeIfNeeded(void) {
-    if (gProfile.frameDurationMs < gProfile.spikeFrameMs) return;
-    if (!shouldEmitSpikeLog(gProfile.frameIndex)) return;
-
-    fprintf(stderr,
-            "Profiler: frame=%llu spike=%.2fms",
-            (unsigned long long) gProfile.frameIndex,
-            gProfile.frameDurationMs);
-
-    for (int i = 0; i < CINNAMON_PROFILE_SECTION_COUNT; ++i) {
-        double ms = gProfile.sections[i].frameMs;
-        if (ms < 0.2) continue;
-        fprintf(stderr, " %s=%.2f", gProfile.sections[i].name, ms);
-    }
-
-    fputc('\n', stderr);
-}
-
-static void printWindowReportIfNeeded(void) {
-    if (gProfile.windowFrameCount == 0) return;
-    if (gProfile.windowFrameCount < gProfile.reportEveryFrames) return;
-
-    double avgFrame = gProfile.windowFrameTotalMs / (double) gProfile.windowFrameCount;
-    double fps = avgFrame > 0.0 ? 1000.0 / avgFrame : 0.0;
-
-    fprintf(stderr,
-            "Profiler: avg over %u frames -> frame=%.2fms (%.1f FPS), max=%.2fms",
-            gProfile.windowFrameCount,
-            avgFrame,
-            fps,
-            gProfile.windowFrameMaxMs);
-
-    for (int i = 0; i < CINNAMON_PROFILE_SECTION_COUNT; ++i) {
-        ProfileSectionState* section = &gProfile.sections[i];
-        double avgSection = section->windowTotalMs / (double) gProfile.windowFrameCount;
-        double pct = avgFrame > 0.0 ? (avgSection * 100.0 / avgFrame) : 0.0;
-        fprintf(stderr,
-                " | %s avg=%.2fms(%.0f%%) max=%.2fms",
-                section->name,
-                avgSection,
-                pct,
-                section->windowMaxMs);
-
-        section->windowTotalMs = 0.0;
-        section->windowMaxMs = 0.0;
-        section->windowCalls = 0;
-    }
-
-    fputc('\n', stderr);
-
-    gProfile.windowFrameTotalMs = 0.0;
-    gProfile.windowFrameMaxMs = 0.0;
-    gProfile.windowFrameCount = 0;
-}
-
-void CinnamonProfiler_endFrame(void) {
-    double frameEndMs = profilerNowMs();
-
-    for (int i = 0; i < CINNAMON_PROFILE_SECTION_COUNT; ++i) {
-        if (gProfile.sections[i].active) {
-            CinnamonProfiler_endSection((CinnamonProfileSection) i);
+void Profiler_setEnabled(Profiler** slot, bool enabled) {
+    if (enabled) {
+        if (*slot == nullptr) *slot = Profiler_create();
+    } else {
+        if (*slot != nullptr) {
+            Profiler_destroy(*slot);
+            *slot = nullptr;
         }
     }
-
-    gProfile.frameDurationMs = frameEndMs - gProfile.frameStartMs;
-    if (gProfile.frameDurationMs < 0.0) gProfile.frameDurationMs = 0.0;
-
-    gProfile.windowFrameTotalMs += gProfile.frameDurationMs;
-    if (gProfile.frameDurationMs > gProfile.windowFrameMaxMs) {
-        gProfile.windowFrameMaxMs = gProfile.frameDurationMs;
-    }
-    gProfile.windowFrameCount++;
-
-    for (int i = 0; i < CINNAMON_PROFILE_SECTION_COUNT; ++i) {
-        ProfileSectionState* section = &gProfile.sections[i];
-        section->windowTotalMs += section->frameMs;
-        if (section->frameMs > section->windowMaxMs) {
-            section->windowMaxMs = section->frameMs;
-        }
-        section->windowCalls++;
-    }
-
-    printSpikeIfNeeded();
-    printWindowReportIfNeeded();
 }
 
-#endif
+void Profiler_enter(Profiler* p, const char* name) {
+    if (p == nullptr) return;
+    if (p->frameDepth >= PROFILER_MAX_DEPTH) return;
+    ProfilerFrame* f = &p->frameStack[p->frameDepth];
+    f->startNanos = nowNanos();
+    f->childNanos = 0;
+    f->startOps = p->instructionCount;
+    f->childOps = 0;
+    f->name = name != nullptr ? name : "<unknown>";
+    p->frameDepth++;
+}
+
+void Profiler_exit(Profiler* p) {
+    if (p == nullptr) return;
+    if (0 >= p->frameDepth) return;
+    p->frameDepth--;
+    ProfilerFrame* f = &p->frameStack[p->frameDepth];
+    uint64_t elapsed = nowNanos() - f->startNanos;
+    uint64_t selfNanos = elapsed > f->childNanos ? elapsed - f->childNanos : 0;
+    uint64_t totalOps = p->instructionCount - f->startOps;
+    uint64_t selfOps = totalOps > f->childOps ? totalOps - f->childOps : 0;
+
+    ptrdiff_t i = shgeti(p->entries, f->name);
+    if (0 > i) {
+        ProfilerStats stats = { .nanos = selfNanos, .ops = selfOps };
+        shput(p->entries, f->name, stats);
+    } else {
+        p->entries[i].value.nanos += selfNanos;
+        p->entries[i].value.ops += selfOps;
+    }
+
+    if (p->frameDepth > 0) {
+        p->frameStack[p->frameDepth - 1].childNanos += elapsed;
+        p->frameStack[p->frameDepth - 1].childOps += totalOps;
+    }
+}
+
+static int compareEntriesDesc(const void* a, const void* b) {
+    uint64_t va = ((const ProfilerEntry*) a)->value.nanos;
+    uint64_t vb = ((const ProfilerEntry*) b)->value.nanos;
+    if (vb > va) return 1;
+    if (va > vb) return -1;
+    return 0;
+}
+
+// Sort entries into a caller-owned buffer. Returns entry count; 0 if nothing to report.
+// Also computes the grand total (across all entries, not just topN) in *outTotal.
+static size_t collectSorted(const Profiler* p, ProfilerEntry* outSorted, size_t outCap, ProfilerStats* outTotal) {
+    size_t count = shlen(p->entries);
+    if (count == 0) return 0;
+    if (count > outCap) count = outCap;
+    memcpy(outSorted, p->entries, count * sizeof(ProfilerEntry));
+    qsort(outSorted, count, sizeof(ProfilerEntry), compareEntriesDesc);
+
+    ProfilerStats total = { 0 };
+    size_t fullCount = shlen(p->entries);
+    repeat(fullCount, i) {
+        total.nanos += p->entries[i].value.nanos;
+        total.ops += p->entries[i].value.ops;
+    }
+    *outTotal = total;
+    return count;
+}
+
+void Profiler_reset(Profiler* p) {
+    if (p == nullptr) return;
+    shfree(p->entries);
+    p->entries = nullptr;
+}
+
+char* Profiler_createReport(const Profiler* p, int topN, int framesInWindow) {
+    if (p == nullptr) return nullptr;
+    size_t count = shlen(p->entries);
+    if (count == 0) return nullptr;
+    if (0 >= framesInWindow) framesInWindow = 1;
+
+    ProfilerEntry* sorted = (ProfilerEntry*) malloc(count * sizeof(ProfilerEntry));
+    if (sorted == nullptr) return nullptr;
+    ProfilerStats total = { 0 };
+    size_t sortedEntriesCount = collectSorted(p, sorted, count, &total);
+
+    size_t limit = sortedEntriesCount;
+    if (topN > 0 && (size_t) topN < limit)
+        limit = (size_t) topN;
+
+    StringBuilder stringBuilder = StringBuilder_create(64);
+
+    double frames = (double) framesInWindow;
+    double totalMs = total.nanos / 1000000.0;
+    double totalOpsPerFrame = (double) total.ops / frames;
+
+    StringBuilder_appendFormat(&stringBuilder, "GML Profiler (avg %d frames)\n", framesInWindow);
+    repeat(limit, i) {
+        double perFrameMs = ((double) sorted[i].value.nanos / (double) 1000000) / frames;
+        double opsPerFrame = (double) sorted[i].value.ops / frames;
+        double nsPerOp = sorted[i].value.ops > 0 ? (double) sorted[i].value.nanos / (double) sorted[i].value.ops : (double) 0;
+        StringBuilder_appendFormat(&stringBuilder, "%.2fms %.0f ops (%.0f ns/op) %s\n", perFrameMs, opsPerFrame, nsPerOp, sorted[i].key);
+    }
+    StringBuilder_appendFormat(&stringBuilder, "total %.2fms/frame, %.0f ops/frame (%zu scripts)", totalMs / frames, totalOpsPerFrame, sortedEntriesCount);
+    char* result = StringBuilder_toString(&stringBuilder);
+    StringBuilder_free(&stringBuilder);
+    free(sorted);
+    return result;
+}

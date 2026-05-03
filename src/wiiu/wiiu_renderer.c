@@ -306,28 +306,15 @@ static void WiiURenderer_loadTexturePages(WiiURenderer* renderer, DataWin* dataW
 
     repeat(renderer->texturePageCount, i) {
         Texture* tex = &dataWin->txtr.textures[i];
-        if (tex->blobSize == 0 || tex->blobOffset == 0) continue;
+        if (tex->blobSize == 0) continue;
         if (tex->blobSize > 50u * 1024u * 1024u) continue;
 
-        uint8_t* pngData = NULL;
-        bool ownBlob = false;
-        if (tex->loaded && tex->blobData != NULL) {
-            pngData = tex->blobData;
-        } else {
-            if (dataWin->file == NULL) continue;
-            if (fseek(dataWin->file, (long) tex->blobOffset, SEEK_SET) != 0) continue;
-            pngData = malloc(tex->blobSize);
-            if (pngData == NULL) continue;
-            size_t got = fread(pngData, 1, tex->blobSize, dataWin->file);
-            if (got != tex->blobSize) { free(pngData); continue; }
-            ownBlob = true;
-        }
+        uint8_t* pngData = tex->blobData;
+        if (pngData == NULL) continue;
 
         int width = 0, height = 0, channels = 0;
         uint8_t* pixels = stbi_load_from_memory(pngData, (int) tex->blobSize,
                                                  &width, &height, &channels, 4);
-        if (ownBlob) { free(pngData); pngData = NULL; }
-        else         { WiiURenderer_releaseTextureBlob(dataWin, i); }
 
         if (pixels == NULL) continue;
 
@@ -433,7 +420,6 @@ static void WiiURenderer_releaseTextureBlob(DataWin* dataWin, uint32_t index) {
         free(dataWin->txtr.textures[index].blobData);
         dataWin->txtr.textures[index].blobData = NULL;
     }
-    dataWin->txtr.textures[index].loaded = false;
 }
 
 static void WiiURenderer_pushCommand(WiiURenderer* renderer, const WiiUQuadCommand* command) {
@@ -993,6 +979,14 @@ static void WiiURenderer_endView(Renderer* base) {
     (void) base;
 }
 
+static void WiiURenderer_beginGUI(Renderer* base, int32_t guiW, int32_t guiH, int32_t portX, int32_t portY, int32_t portW, int32_t portH) {
+    WiiURenderer_beginView(base, 0, 0, guiW, guiH, portX, portY, portW, portH, 0.0f);
+}
+
+static void WiiURenderer_endGUI(Renderer* base) {
+    WiiURenderer_endView(base);
+}
+
 static void WiiURenderer_endFrame(Renderer* base) {
     WiiURenderer* renderer = (WiiURenderer*) base;
     GX2ColorBuffer* tvScan = WHBGfxGetTVColourBuffer();
@@ -1224,9 +1218,12 @@ static void WiiURenderer_drawSprite(Renderer* base, int32_t tpagIndex, float x, 
     );
 }
 
-static void WiiURenderer_drawSpritePart(Renderer* base, int32_t tpagIndex, int32_t srcOffX, int32_t srcOffY, int32_t srcW, int32_t srcH, float x, float y, float xscale, float yscale, uint32_t color, float alpha) {
+static void WiiURenderer_drawSpritePart(Renderer* base, int32_t tpagIndex, int32_t srcOffX, int32_t srcOffY, int32_t srcW, int32_t srcH, float x, float y, float xscale, float yscale, float angleDeg, float pivotX, float pivotY, uint32_t color, float alpha) {
     WiiURenderer* renderer = (WiiURenderer*) base;
     DataWin* dataWin = base->dataWin;
+    (void) angleDeg;
+    (void) pivotX;
+    (void) pivotY;
     if (tpagIndex < 0 || (uint32_t) tpagIndex >= dataWin->tpag.count) return;
 
     TexturePageItem* tpag = &dataWin->tpag.items[tpagIndex];
@@ -1362,7 +1359,7 @@ static void WiiURenderer_drawText(Renderer* base, const char* text, float x, flo
     if (fontIndex < 0 || (uint32_t) fontIndex >= dataWin->font.count) return;
 
     Font* font = &dataWin->font.fonts[fontIndex];
-    int32_t fontTpagIndex = DataWin_resolveTPAG(dataWin, font->textureOffset);
+    int32_t fontTpagIndex = font->tpagIndex;
     if (fontTpagIndex < 0 || (uint32_t) fontTpagIndex >= dataWin->tpag.count) return;
 
     TexturePageItem* fontTpag = &dataWin->tpag.items[fontTpagIndex];
@@ -1370,9 +1367,10 @@ static void WiiURenderer_drawText(Renderer* base, const char* text, float x, flo
     if (!renderer->texturePages[fontTpag->texturePageId].ready) return;
 
     GX2Texture* page = &renderer->texturePages[fontTpag->texturePageId].texture;
-    char* processed = TextUtils_preprocessGmlText(text);
-    int32_t textLen = (int32_t) strlen(processed);
-    int32_t lineCount = TextUtils_countLines(processed, textLen);
+    PreprocessedText processed = TextUtils_preprocessGmlText(text);
+    const char* processedText = processed.text;
+    int32_t textLen = (int32_t) strlen(processedText);
+    int32_t lineCount = TextUtils_countLines(processedText, textLen);
     float totalHeight = (float) lineCount * (float) font->emSize;
     float valignOffset = 0.0f;
     if (base->drawValign == 1) valignOffset = -totalHeight / 2.0f;
@@ -1388,10 +1386,10 @@ static void WiiURenderer_drawText(Renderer* base, const char* text, float x, flo
     int32_t lineStart = 0;
     repeat(lineCount, lineIdx) {
         int32_t lineEnd = lineStart;
-        while (lineEnd < textLen && !TextUtils_isNewlineChar(processed[lineEnd])) lineEnd++;
+        while (lineEnd < textLen && !TextUtils_isNewlineChar(processedText[lineEnd])) lineEnd++;
         int32_t lineLen = lineEnd - lineStart;
 
-        float lineWidth = TextUtils_measureLineWidth(font, processed + lineStart, lineLen);
+        float lineWidth = TextUtils_measureLineWidth(font, processedText + lineStart, lineLen);
         float halignOffset = 0.0f;
         if (base->drawHalign == 1) halignOffset = -lineWidth / 2.0f;
         else if (base->drawHalign == 2) halignOffset = -lineWidth;
@@ -1399,7 +1397,7 @@ static void WiiURenderer_drawText(Renderer* base, const char* text, float x, flo
         float cursorX = halignOffset;
         int32_t pos = 0;
         while (pos < lineLen) {
-            uint16_t ch = TextUtils_decodeUtf8(processed + lineStart, lineLen, &pos);
+            uint16_t ch = TextUtils_decodeUtf8(processedText + lineStart, lineLen, &pos);
             FontGlyph* glyph = TextUtils_findGlyph(font, ch);
             if (glyph == NULL) continue;
             if (glyph->sourceWidth == 0 || glyph->sourceHeight == 0) {
@@ -1434,24 +1432,20 @@ static void WiiURenderer_drawText(Renderer* base, const char* text, float x, flo
             cursorX += glyph->shift;
             if (pos < lineLen) {
                 int32_t savedPos = pos;
-                uint16_t nextCh = TextUtils_decodeUtf8(processed + lineStart, lineLen, &pos);
+                uint16_t nextCh = TextUtils_decodeUtf8(processedText + lineStart, lineLen, &pos);
                 pos = savedPos;
                 cursorX += TextUtils_getKerningOffset(glyph, nextCh);
             }
         }
 
         cursorY += (float) font->emSize;
-        lineStart = TextUtils_skipNewline(processed, lineEnd, textLen);
+        lineStart = TextUtils_skipNewline(processedText, lineEnd, textLen);
     }
 
-    free(processed);
+    PreprocessedText_free(processed);
 }
 
 static void WiiURenderer_flush(Renderer* base) {
-    (void) base;
-}
-
-static void WiiURenderer_onRoomEnd(Renderer* base) {
     (void) base;
 }
 
@@ -1481,6 +1475,8 @@ static RendererVtable WiiURendererVtable = {
     .endFrame = WiiURenderer_endFrame,
     .beginView = WiiURenderer_beginView,
     .endView = WiiURenderer_endView,
+    .beginGUI = WiiURenderer_beginGUI,
+    .endGUI = WiiURenderer_endGUI,
     .drawSprite = WiiURenderer_drawSprite,
     .drawSpritePart = WiiURenderer_drawSpritePart,
     .drawRectangle = WiiURenderer_drawRectangle,
@@ -1491,7 +1487,7 @@ static RendererVtable WiiURendererVtable = {
     .createSpriteFromSurface = WiiURenderer_createSpriteFromSurface,
     .deleteSprite = WiiURenderer_deleteSprite,
     .drawTile = NULL,
-    .onRoomEnd = WiiURenderer_onRoomEnd,
+    .drawTiled = NULL,
 };
 
 Renderer* WiiURenderer_create(void) {
