@@ -10,7 +10,7 @@
 ---
 
 > [!IMPORTANT]  
-> Cinnamon is not finished and will have bugs. 3DS is going through a rewrite so you cannot build at this time.
+> Cinnamon is not finished and will have bugs. 3DS is being rewritten so expect possible bugs or inablity to build. 
 
 Cinnamon aims to be a open source re-implementation of GameMaker 1.4's (gms2 soon) runner for the 3DS and Wii U. This opens up lots of opportunities for games like Pizza Tower, Forager, Undertale, and Deltarune to run on the 3DS and Wii U.
 
