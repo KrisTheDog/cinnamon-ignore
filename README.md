@@ -26,7 +26,29 @@ This is where Cinnamon, a fork of Butterscotch comes in!
 
 Cinnamon aims to be a open source re-implementation of GameMaker Studios runner **for the 3DS and Wii U.** This opens up lots of opportunities for games like Pizza Tower, Hyper Light Drifter, Undertale, and Deltarune to run on the 3DS and Wii U.
 
-Games like UNDERTALE have already been successfully ported to the Wii U and 3DS and are playable the whole way through. While only Bytecode version 16 is supported as of now, more bytecodes and features will be implemented in the future.
+
+## Game Compatibility
+
+Butterscotch's and Cinnamon's goal is to be able to have Undertale v1.08 (GameMaker: Studio 1.4.1804, Bytecode Version 16) fully playable. But we do want to support more GameMaker: Studio games in the future too!
+
+While our target is Undertale v1.08, that doesn't mean that other games CAN'T run in Cinnamon! Because Cinnamon itself is a runner and not a Undertale port/remake, you CAN run other GameMaker: Studio games with it and, as long as the game is compiled with GameMaker: Studio 1.4.1804 and they only use GML variables and functions that Cinnamon supports, it should work fine.
+
+Here are the Bytecode Versions that Cinnamon supports
+
+* Bytecode Version 16
+* Bytecode Version 17
+
+However, that doesn't mean that a game that uses a compatible version WILL run! The bytecode support is still a WIP, and Cinnamon may have quirks that the original GameMaker: Studio runner may not have.
+
+Of course, there are exceptions that break game compatibility altogether:
+
+* Games compiled with YYC, because they use native code instead of bytecode. 
+* Games compiled with the new [GMRT](https://github.com/YoYoGames/GMRT-Beta/tree/main), because they use native code instead of bytecode.
+
+## Supported Platforms
+* Nintendo 3DS
+* Nintendo Wii U
+* ...and maybe more in the future!
 
 ## Building For Wii U
 
@@ -54,3 +76,4 @@ This produces `Cinnamon.elf`, `Cinnamon.rpx`, and a `.wuhb` bundle in `build/wii
 ## Disclaimer
 
 Cinnamon has no association, endorsement, or any connection whatsoever with any of the software that it facilitates, and does not provide any of the software it can run by itself. In order to use Cinnamon, you will need to provide your own game files.
+
