@@ -76,13 +76,16 @@ This produces `Cinnamon.elf`, `Cinnamon.rpx`, and a `.wuhb` bundle in `build/wii
 
 ## Showcase
 
-### Wii U
+### Wii U (Real Hardware)
 
-- **Snowdin Forest**
+- **UNDERTALE (Bytecode 16)**
+<img width="160" height="120" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000057247.jpg" />
+<img width="160" height="120" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000057245.jpg" />
+<img width="160" height="120" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000057243.jpg" />
 
-<img src="/resources/readme/screenshots/pic1.jpg" height="128px"></img>
- 
-- **Undyne the Undying:** https://www.youtube.com/watch?v=QqKhSn0SHL8
+- **SURVEY_PROGRAM (Bytecode 16)**
+<img width="160" height="200" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000045789.jpg" />
+<img width="160" height="200" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000057255.jpg" />
 
 ## Disclaimer
 
