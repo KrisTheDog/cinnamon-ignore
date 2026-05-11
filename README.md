@@ -50,6 +50,17 @@ Of course, there are exceptions that break game compatibility altogether:
 * Nintendo Wii U
 * ...and maybe more in the future!
 
+## Project Sunshine
+* Project Sunshine is a project that aims to use Cinnamon to port a variety of games (such as UNDERTALE, DELTARUNE, and maybe more games in the future) to the Wii U, 3DS, and maybe more consoles like the GameCube in the future! You can get beta builds on our [Discord](https://discord.gg/AahyBCvVR2) aswell as news on the ports.
+### UNDERTALE: Wii U Edition
+* A released, full port of UNDERTALE on the Wii U. You can download this port on our releases page or on our Discord.
+### DELTARUNE: Wii U Edition
+* A full port of DELTARUNE to the Wii U. Still currently in development. Expect a Chapter 1 release date of before July.
+### UNDERTALE: 3DS Edition
+* A full port of UNDERTALE to the 3DS with 3DS exclusive features such as 3D and bottom screen features.
+### DELTARUNE: 3DS Edition
+* A full port of atleast Chapter One of DELTARUNE to the 3DS.
+
 ## Building For Wii U
 
 You must have a proper devkitPro Wii U enviroment set up and configured for your platform.
@@ -65,7 +76,7 @@ This produces `Cinnamon.elf`, `Cinnamon.rpx`, and a `.wuhb` bundle in `build/wii
 
 ## Showcase
 
-# Wii U
+### Wii U
 
 - **Snowdin Forest**
 
