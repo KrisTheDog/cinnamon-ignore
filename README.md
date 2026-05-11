@@ -36,7 +36,7 @@ While our target is Undertale v1.08, that doesn't mean that other games CAN'T ru
 Here are the Bytecode Versions that Cinnamon supports
 
 * Bytecode Version 16
-* Bytecode Version 17
+* Bytecode Version 17 (EXTREMELY EXPERIMENTAL)
 
 However, that doesn't mean that a game that uses a compatible version WILL run! The bytecode support is still a WIP, and Cinnamon may have quirks that the original GameMaker: Studio runner may not have.
 
