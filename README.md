@@ -10,9 +10,9 @@
 ---
 
 > [!IMPORTANT]  
-> Cinnamon is not finished and will have bugs. 3DS is being rewritten so expect possible bugs or inablity to build. 
+> Cinnamon is not finished and will have bugs. 
 
-Cinnamon aims to be a open source re-implementation of GameMaker 1.4's (gms2 soon) runner for the 3DS and Wii U. This opens up lots of opportunities for games like Pizza Tower, Forager, Undertale, and Deltarune to run on the 3DS and Wii U.
+Cinnamon aims to be a open source re-implementation of GameMaker Studios runner for the 3DS and Wii U. This opens up lots of opportunities for games like Pizza Tower, Hyper Light Drifter, Undertale, and Deltarune to run on the 3DS and Wii U.
 
 Games like UNDERTALE have already been successfully ported to the Wii U and 3DS and are playable the whole way through. While only Bytecode version 16 is supported as of now, more bytecodes and features will be implemented in the future.
 
@@ -30,6 +30,8 @@ cmake --build build/wiiu
 This produces `Cinnamon.elf`, `Cinnamon.rpx`, and a `.wuhb` bundle in `build/wiiu`.
 
 ## Showcase
+
+# Wii U
 
 - **Snowdin Forest**
 
