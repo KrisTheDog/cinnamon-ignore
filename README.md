@@ -12,7 +12,19 @@
 > [!IMPORTANT]  
 > Cinnamon is not finished and will have bugs. 
 
-Cinnamon aims to be a open source re-implementation of GameMaker Studios runner for the 3DS and Wii U. This opens up lots of opportunities for games like Pizza Tower, Hyper Light Drifter, Undertale, and Deltarune to run on the 3DS and Wii U.
+When you create a game in GameMaker: Studio and export it, GameMaker: Studio exports the game code as bytecode instead of native compiled code, and that bytecode is compatible with any other GameMaker: Studio runner (also known as YoYo runner), as long as they have matching GameMaker: Studio versions. This is similar to how Java applications work.
+
+This is how projects such as Droidtale can exist. We exploit that GameMaker: Studio games compile to bytecode, which means they can be ran on any platform that has an official runner for it!
+
+If GameMaker games use bytecode, what prevents us from creating our own runner? And if we can write our own runner, what prevents us from porting GameMaker: Studio games to other platforms?
+
+Thats where projects like [Butterscotch](https://github.com/MrPowerGamerBR/Butterscotch) come in! Butterscotch is an open source reimplementation of GameMaker: Studio's runner.
+
+If this already exists, then whats stopping people from porting Butterscotch to MORE consoles? Whats stopping *us* from porting a variety of GameMaker: Studio games to the 3DS and Wii U?
+
+This is where Cinnamon, a fork of Butterscotch comes in!
+
+Cinnamon aims to be a open source re-implementation of GameMaker Studios runner **for the 3DS and Wii U.** This opens up lots of opportunities for games like Pizza Tower, Hyper Light Drifter, Undertale, and Deltarune to run on the 3DS and Wii U.
 
 Games like UNDERTALE have already been successfully ported to the Wii U and 3DS and are playable the whole way through. While only Bytecode version 16 is supported as of now, more bytecodes and features will be implemented in the future.
 
