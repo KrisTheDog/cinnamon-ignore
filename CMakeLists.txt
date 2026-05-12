@@ -70,7 +70,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
     wut_create_wuhb(Cinnamon
         NAME "UNDERTALE"
         SHORTNAME "UNDERTALE"
-        AUTHOR "Toby Fox, Project Sunshine"
+        AUTHOR "The Sunshine Team, Toby Fox"
         DRCSPLASH resources/wiiu/meta/drc.png
         ICON resources/wiiu/meta/icon.png
         TVSPLASH resources/wiiu/meta/tv.png
