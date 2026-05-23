@@ -9,16 +9,16 @@
 #include "real_type.h"
 
 #define forEach(type, item, array, count) \
-    for (typeof(count) item##_i_ = 0; item##_i_ < (count); item##_i_++) \
+    for (size_t item##_i_ = 0; item##_i_ < (count); item##_i_++) \
     for (type* item = &(array)[item##_i_]; item; item = NULL)
 
 #define forEachIndexed(type, item, index, array, count) \
-    for (typeof(count) index = 0; index < (count); index++) \
+    for (size_t index = 0; index < (count); index++) \
     for (type* item = &(array)[index]; item; item = NULL)
 
 // The "typeof((typeof(n))0" is used to remove the "const" from the typeof
 
-#define repeat(n, it) for (typeof((typeof(n))0) it = 0; it < (n); it++)
+#define repeat(n, it) for (size_t it = 0; it < n; it++)
 
 #define require(condition) \
     do { \

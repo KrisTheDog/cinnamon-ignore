@@ -96,6 +96,7 @@ static AudioSystemVtable noopVtable = {
     .groupIsLoaded = noopGroupIsLoaded,
     .createStream = noopCreateStream,
     .destroyStream = noopDestroyStream,
+    .prewarmRoom = NULL,
 };
 
 NoopAudioSystem* NoopAudioSystem_create(void) {

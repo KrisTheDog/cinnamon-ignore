@@ -36,6 +36,7 @@ typedef struct {
     bool parseStrg;
     bool parseTxtr;
     bool parseAudo;
+    bool parseAudoHeadersOnly;
     // If true, precise masks will be skipped when the sprite does not have a precise state set
     bool skipLoadingPreciseMasksForNonPreciseSprites;
 
@@ -554,7 +555,7 @@ typedef struct {
     uint32_t color;
 } RoomTile;
 
-enum RoomLayerType : uint32_t
+enum RoomLayerType
 {
     RoomLayerType_Path = 0,
     RoomLayerType_Background = 1,
@@ -841,8 +842,15 @@ typedef struct DataWin {
     // Used by DataWin_loadRoomPayload to satisfy on-demand room payload reads.
     // nullptr when lazy loading is disabled. Closed by DataWin_free.
     FILE* lazyLoadFile;
-    char* lazyLoadFilePath;     // owned strdup of the original file path, for diagnostics
-    bool lazyLoadRooms;          // mirrors the parser option so Runner can branch without re-reading options
+    char* lazyLoadFilePath; // owned strdup of the original file path, for diagnostics
+    size_t fileSize; // cached size of the DataWin, captured at parse time for lazy-load bounds checks
+    bool lazyLoadRooms; // mirrors the parser option so Runner can branch without re-reading options
+
+    // Kept open when parseAudoHeadersOnly was set. Used by the audio system to read
+    // individual audio entry bytes on demand instead of loading everything upfront.
+    // Access must be serialized — call DataWin_readAudioEntryData for thread-safe reads.
+    // Closed by DataWin_free.
+    FILE* lazyAudioFile;
 } DataWin;
 
 DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options);
@@ -851,6 +859,10 @@ void DataWin_printDebugSummary(DataWin* dataWin);
 // Lazy room payload management. DataWin_loadRoomPayload is a no-op when the payload is already loaded.
 void DataWin_loadRoomPayload(DataWin* dw, int32_t roomIndex);
 void DataWin_freeRoomPayload(Room* room);
+// Reads audio entry data on demand when parseAudoHeadersOnly was used.
+// Returns a malloc'd buffer of entry->dataSize bytes that the caller must free,
+// or NULL on failure. Safe to call from any thread.
+uint8_t* DataWin_readAudioEntryData(DataWin* dw, const AudioEntry* entry);
 // Finds a reusable dynamic Sprite slot (textureCount == 0) at or above `startIndex`, or appends a new one.
 uint32_t DataWin_allocSpriteSlot(DataWin* dw, uint32_t startIndex);
 // Compares the detected effective GMS version (not the raw GEN8 version) against a lower bound.

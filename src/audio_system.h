@@ -10,6 +10,7 @@
 // ===[ AudioSystem Vtable ]===
 
 typedef struct AudioSystem AudioSystem;
+typedef struct Runner Runner;
 
 typedef struct {
     void (*init)(AudioSystem* audio, DataWin* dataWin, FileSystem* fileSystem);
@@ -38,6 +39,7 @@ typedef struct {
     bool (*groupIsLoaded)(AudioSystem* audio, int32_t groupIndex);
     int32_t (*createStream)(AudioSystem* audio, const char* filename);
     bool (*destroyStream)(AudioSystem* audio, int32_t streamIndex);
+    void (*prewarmRoom)(AudioSystem* audio, Runner* runner);
 } AudioSystemVtable;
 
 // ===[ AudioSystem Base Struct ]===

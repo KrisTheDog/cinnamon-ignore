@@ -12,11 +12,111 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdarg.h>
 
 #include "stb_ds.h"
 
 // Maximum number of local variables per code entry (stack-allocated arrays in VM_executeCode/VM_callCodeIndex)
 #define MAX_CODE_LOCALS 128
+
+__attribute__((weak)) void VMExec_platformBootLog(const char* message) {
+    (void) message;
+}
+
+__attribute__((weak)) bool VMExec_shouldTraceArrayOps(void) {
+    return false;
+}
+
+__attribute__((weak)) bool VMExec_shouldTraceCrashWindow(void) {
+    return false;
+}
+
+static void VMExec_traceCrashRValue(const char* prefix, const char* codeName, int32_t index, const RValue* val) {
+    if (!VMExec_shouldTraceCrashWindow() || val == nullptr) return;
+
+    const void* refPtr = nullptr;
+    switch (val->type) {
+        case RVALUE_STRING: refPtr = val->string; break;
+        case RVALUE_ARRAY:  refPtr = val->array; break;
+#if IS_BC17_OR_HIGHER_ENABLED
+        case RVALUE_METHOD: refPtr = val->method; break;
+#endif
+        case RVALUE_STRUCT: refPtr = val->structInst; break;
+        default: break;
+    }
+
+    char buffer[256];
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "%s code=%s idx=%d type=%d owns=%d gml=%d ref=%p i32=%d",
+        prefix,
+        codeName != nullptr ? codeName : "<null>",
+        index,
+        val->type,
+        val->ownsReference ? 1 : 0,
+#if IS_BC17_OR_HIGHER_ENABLED
+        val->gmlStackType,
+#else
+        0,
+#endif
+        refPtr,
+        val->int32
+    );
+    VMExec_platformBootLog(buffer);
+}
+
+static void VMExec_bootLog(const char* message) {
+    VMExec_platformBootLog(message);
+}
+
+static bool VMExec_shouldTraceBootstrapObject(VMContext* ctx, const char** outObjectName) {
+    if (ctx == NULL || ctx->currentInstance == NULL || ctx->dataWin == NULL) return false;
+    Instance* inst = (Instance*) ctx->currentInstance;
+    if (inst->objectIndex < 0 || (uint32_t) inst->objectIndex >= ctx->dataWin->objt.count) return false;
+    const char* objectName = ctx->dataWin->objt.objects[inst->objectIndex].name;
+    if (outObjectName != NULL) *outObjectName = objectName;
+    if (objectName == NULL) return false;
+    return strcmp(objectName, "obj_initializer2") == 0 || strcmp(objectName, "obj_time") == 0;
+}
+
+static void VMExec_traceBootstrapCall(VMContext* ctx, const char* fmt, ...) {
+    static uint32_t traceCount = 0;
+    static uint32_t suppressedCount = 0;
+    static char lastBuffer[256] = "";
+    const char* objectName = NULL;
+    if (!VMExec_shouldTraceBootstrapObject(ctx, &objectName)) return;
+    if (traceCount >= 500) return;
+
+    char detail[192];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(detail, sizeof(detail), fmt, args);
+    va_end(args);
+
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "vmcall: obj=%s code=%s %s", objectName, ctx->currentCodeName, detail);
+
+    // Suppress consecutive identical lines but count them
+    if (strcmp(lastBuffer, buffer) == 0) {
+        suppressedCount++;
+        return;
+    }
+
+    // Before logging a new unique line, flush any suppression summary
+    if (suppressedCount > 0) {
+        char suppressMsg[128];
+        snprintf(suppressMsg, sizeof(suppressMsg), "vmcall: (repeated %u times)", suppressedCount);
+        VMExec_bootLog(suppressMsg);
+        suppressedCount = 0;
+        traceCount++;
+        if (traceCount >= 500) return;
+    }
+
+    snprintf(lastBuffer, sizeof(lastBuffer), "%s", buffer);
+    VMExec_bootLog(buffer);
+    traceCount++;
+}
 
 // ===[ Stack Operations ]===
 
@@ -664,10 +764,14 @@ static RValue resolveVariableRead(VMContext* ctx, int32_t instanceType, uint32_t
         ptrdiff_t bidx = shgeti(ctx->builtinMap, (char*) varDef->name);
         if (bidx >= 0) {
             BuiltinFunc bf = ctx->builtinMap[bidx].value;
-            return (RValue){ .method = GMLMethod_createBuiltin(bf, -1), .type = RVALUE_METHOD, .ownsReference = true, .gmlStackType = GML_TYPE_VARIABLE };
+            RValue rv = { .type = RVALUE_METHOD, .ownsReference = true, .gmlStackType = GML_TYPE_VARIABLE };
+            rv.method = GMLMethod_createBuiltin(bf, -1);
+            return rv;
         }
         // Unresolved: return a method stub so CallV can log a single "unknown function" and return undefined instead of bailing out with a scary "unresolvable function reference" error.
-        return (RValue){ .method = GMLMethod_createUnresolved(varDef->name, -1), .type = RVALUE_METHOD, .ownsReference = true, .gmlStackType = GML_TYPE_VARIABLE };
+        RValue rv = { .type = RVALUE_METHOD, .ownsReference = true, .gmlStackType = GML_TYPE_VARIABLE };
+        rv.method = GMLMethod_createUnresolved(varDef->name, -1);
+        return rv;
     }
 #endif
 
@@ -830,6 +934,34 @@ static inline void writeIntoSlot(RValue* dest, RValue val) {
     } else {
         *dest = val;
     }
+}
+
+// Promote weak views returned from helpers/builtins into independent caller-owned values.
+// This mirrors the strengthening done on script returns in VM_callCodeIndex and prevents
+// container-backed temporaries (arrays, structs, methods, strings) from going stale while
+// the caller still has the value on its stack.
+static inline RValue strengthenReturnValue(RValue val) {
+    if (val.type == RVALUE_STRING && !val.ownsReference && val.string != nullptr) {
+        return RValue_makeOwnedString(safeStrdup(val.string));
+    }
+    if (val.type == RVALUE_ARRAY && !val.ownsReference && val.array != nullptr) {
+        GMLArray_incRef(val.array);
+        val.ownsReference = true;
+        return val;
+    }
+#if IS_BC17_OR_HIGHER_ENABLED
+    if (val.type == RVALUE_METHOD && !val.ownsReference && val.method != nullptr) {
+        GMLMethod_incRef(val.method);
+        val.ownsReference = true;
+        return val;
+    }
+#endif
+    if (val.type == RVALUE_STRUCT && !val.ownsReference && val.structInst != nullptr) {
+        Instance_structIncRef(val.structInst);
+        val.ownsReference = true;
+        return val;
+    }
+    return val;
 }
 
 // Force out-of-line so the OP_POP fast path in executeLoop doesn't inline this, because we already have an "optimized" version for common writes
@@ -1214,7 +1346,9 @@ static void handlePush(VMContext* ctx, uint32_t instr, const uint8_t* extraData,
                     RValue_free(topSlot);
                     GMLArray* sub = GMLArray_create(0);
                     sub->owner = top->owner;
-                    *topSlot = (RValue){ .array = sub, .type = RVALUE_ARRAY, .ownsReference = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+                    RValue rv = { .type = RVALUE_ARRAY, .ownsReference = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+                    rv.array = sub;
+                    *topSlot = rv;
                 }
                 // Push a weak ref to the sub-array — short-lived, consumed by the next BREAK op.
                 stackPush(ctx, RValue_makeArrayWeak(topSlot->array));
@@ -1487,12 +1621,37 @@ static void handleAddString(VMContext* ctx, RValue a, RValue b, uint8_t resultTy
         const char* sb = b.string != nullptr ? b.string : "";
         size_t lenA = strlen(sa);
         size_t lenB = strlen(sb);
-        char* result = safeMalloc(lenA + lenB + 1);
-        memcpy(result, sa, lenA);
-        memcpy(result + lenA, sb, lenB + 1);
-        RValue_free(&a);
-        RValue_free(&b);
-        stackPushTyped(ctx, RValue_makeOwnedString(result), resultType);
+        if (lenB == 0) {
+            if (a.ownsReference && a.string != nullptr) {
+                RValue_free(&b);
+                stackPushTyped(ctx, a, resultType);
+            } else if (lenA == 0 && b.ownsReference && b.string != nullptr) {
+                RValue_free(&a);
+                stackPushTyped(ctx, b, resultType);
+            } else {
+                char* result = safeMalloc(lenA + 1);
+                memcpy(result, sa, lenA + 1);
+                RValue_free(&a);
+                RValue_free(&b);
+                stackPushTyped(ctx, RValue_makeOwnedString(result), resultType);
+            }
+        } else if (lenA == 0 && b.ownsReference && b.string != nullptr) {
+            RValue_free(&a);
+            stackPushTyped(ctx, b, resultType);
+        } else if (a.ownsReference && a.string != nullptr) {
+            char* result = safeRealloc((void*) a.string, lenA + lenB + 1);
+            memcpy(result + lenA, sb, lenB + 1);
+            a.string = result;
+            RValue_free(&b);
+            stackPushTyped(ctx, a, resultType);
+        } else {
+            char* result = safeMalloc(lenA + lenB + 1);
+            memcpy(result, sa, lenA);
+            memcpy(result + lenA, sb, lenB + 1);
+            RValue_free(&a);
+            RValue_free(&b);
+            stackPushTyped(ctx, RValue_makeOwnedString(result), resultType);
+        }
     } else {
         // For anything else, we'll convert to numbers and then sum
 #ifndef NO_RVALUE_INT64
@@ -1955,6 +2114,7 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
     int32_t argCount = instr & 0xFFFF;
     uint32_t funcIndex = resolveFuncOperand(extraData);
     require(ctx->dataWin->func.functionCount > funcIndex);
+    const char* funcName = ctx->dataWin->func.functions[funcIndex].name;
 
     // Pop arguments from stack (args pushed right-to-left, so first arg is on top)
     // Use stack-allocated buffer for small arg counts (GMS 1.4 supports up to 16 arguments)
@@ -1968,7 +2128,6 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
     }
 
 #ifdef ENABLE_VM_TRACING
-    const char* funcName = ctx->dataWin->func.functions[funcIndex].name;
     bool functionIsBeingTraced = shgeti(ctx->functionCallsToBeTraced, "*") != -1 || shgeti(ctx->functionCallsToBeTraced, funcName) != -1 || shgeti(ctx->functionCallsToBeTraced, ctx->currentCodeName) != -1;
     char* functionArgumentList = nullptr;
     if (functionIsBeingTraced) {
@@ -1997,8 +2156,22 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
 
     // Fast path: cached builtin function pointer
     if (cache->builtin != nullptr) {
+        VMExec_traceBootstrapCall(ctx, "call builtin=%s argc=%d", funcName, argCount);
+        if (VMExec_shouldTraceCrashWindow()) {
+            char buffer[256];
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "vmbuiltin: code=%s func=%s argc=%d",
+                ctx->currentCodeName != nullptr ? ctx->currentCodeName : "<null>",
+                funcName != nullptr ? funcName : "<null>",
+                argCount
+            );
+            VMExec_bootLog(buffer);
+        }
         BuiltinFunc builtin = (BuiltinFunc) cache->builtin;
         RValue result = builtin(ctx, args, argCount);
+        result = strengthenReturnValue(result);
         // Free arguments
         if (args != nullptr) {
             repeat(argCount, i) {
@@ -2022,6 +2195,8 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
 
     // Fast path: cached script code index
     if (cache->scriptCodeIndex >= 0) {
+        const char* targetCodeName = ctx->dataWin->code.entries[cache->scriptCodeIndex].name;
+        VMExec_traceBootstrapCall(ctx, "call script=%s argc=%d target=%s", funcName, argCount, targetCodeName);
         RValue result = VM_callCodeIndex(ctx, cache->scriptCodeIndex, args, argCount);
 
 #ifdef ENABLE_VM_TRACING
@@ -2047,7 +2222,7 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
 
     // Slow path: unknown function (not cached as builtin or script)
 #ifdef ENABLE_VM_STUB_LOGS
-    const char* unknownFuncName = ctx->dataWin->func.functions[funcIndex].name;
+    const char* unknownFuncName = funcName;
 
     // Log once per (callingCode, funcName) pair
     const char* callerName = VM_getCallerName(ctx);
@@ -2061,9 +2236,28 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
     }
 #endif
 
+    VMExec_traceBootstrapCall(ctx, "call unresolved=%s argc=%d", funcName, argCount);
+
+    if (VMExec_shouldTraceCrashWindow()) {
+        fprintf(
+            stderr,
+            "vmcleanup: unresolved code=%s func=%s argc=%d\n",
+            ctx->currentCodeName != nullptr ? ctx->currentCodeName : "<null>",
+            funcName != nullptr ? funcName : "<null>",
+            argCount
+        );
+        fflush(stderr);
+        if (args != nullptr) {
+            repeat(argCount, i) {
+                VMExec_traceCrashRValue("vmcleanup: arg", ctx->currentCodeName, i, &args[i]);
+            }
+        }
+    }
+
     // Free arguments and push undefined
     if (args != nullptr) {
         repeat(argCount, i) {
+            VMExec_traceCrashRValue("vmcleanup: free", ctx->currentCodeName, i, &args[i]);
             RValue_free(&args[i]);
         }
         if (args != stackArgs) free(args);
@@ -2117,6 +2311,36 @@ static void handleCallV(VMContext* ctx, uint32_t instr) {
     }
 
     RValue result;
+    if (VMExec_shouldTraceCrashWindow()) {
+        fprintf(
+            stderr,
+            "vmcallv: code=%s argc=%d fnType=%d fnOwns=%d fnRef=%p codeIndex=%d builtin=%p unresolved=%s bound=%d instanceType=%d instanceI32=%d\n",
+            ctx->currentCodeName != nullptr ? ctx->currentCodeName : "<null>",
+            argCount,
+            function.type,
+            function.ownsReference ? 1 : 0,
+#if IS_BC17_OR_HIGHER_ENABLED
+            function.type == RVALUE_METHOD ? (void*) function.method : nullptr,
+#else
+            nullptr,
+#endif
+            codeIndex,
+            (void*) builtin,
+            unresolvedName != nullptr ? unresolvedName : "<null>",
+            boundInstance,
+            instance.type,
+            instance.int32
+        );
+        fflush(stderr);
+        VMExec_traceCrashRValue("vmcallv: function", ctx->currentCodeName, -1, &function);
+        VMExec_traceCrashRValue("vmcallv: instance", ctx->currentCodeName, -1, &instance);
+        if (args != nullptr) {
+            repeat(argCount, i) {
+                VMExec_traceCrashRValue("vmcallv: arg", ctx->currentCodeName, i, &args[i]);
+            }
+        }
+    }
+
     if (codeIndex >= 0 && ctx->dataWin->code.count > (uint32_t) codeIndex) {
         result = VM_callCodeIndex(ctx, codeIndex, args, argCount);
     } else if (builtin != nullptr) {
@@ -2561,12 +2785,53 @@ static void handleBreakPushAF(VMContext* ctx) {
     int32_t idx = stackPopInt32(ctx);
     RValue arrayRef = stackPop(ctx);
     RValue result;
+    if (VMExec_shouldTraceArrayOps()) {
+        char buffer[256];
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "vmarray: pushaf code=%s idx=%d type=%d arr=%p owns=%d stack=%d",
+            ctx->currentCodeName != nullptr ? ctx->currentCodeName : "<null>",
+            idx,
+            (int) arrayRef.type,
+            (void*) arrayRef.array,
+            arrayRef.ownsReference ? 1 : 0,
+            ctx->stack.top
+        );
+        VMExec_bootLog(buffer);
+    }
     RValue* cell = arrayRef.type == RVALUE_ARRAY ? GMLArray_slot(arrayRef.array, idx) : nullptr;
     if (cell != nullptr) {
         result = *cell;
         result.ownsReference = false; // weak view
+        if (VMExec_shouldTraceArrayOps()) {
+            char buffer[256];
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "vmarray: pushaf-hit code=%s idx=%d cell=%p cellType=%d",
+                ctx->currentCodeName != nullptr ? ctx->currentCodeName : "<null>",
+                idx,
+                (void*) cell,
+                (int) cell->type
+            );
+            VMExec_bootLog(buffer);
+        }
     } else {
         result = (RValue){ .type = RVALUE_UNDEFINED };
+        if (VMExec_shouldTraceArrayOps()) {
+            char buffer[256];
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "vmarray: pushaf-miss code=%s idx=%d type=%d arr=%p",
+                ctx->currentCodeName != nullptr ? ctx->currentCodeName : "<null>",
+                idx,
+                (int) arrayRef.type,
+                (void*) arrayRef.array
+            );
+            VMExec_bootLog(buffer);
+        }
     }
     stackPush(ctx, result);
     RValue_free(&arrayRef);
@@ -2580,8 +2845,38 @@ static void handleBreakPopAF(VMContext* ctx) {
     int32_t idx = stackPopInt32(ctx);
     RValue arrayRef = stackPop(ctx);
     RValue value = stackPop(ctx);
+    if (VMExec_shouldTraceCrashWindow()) {
+        char buffer[256];
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "vmarray: popaf code=%s idx=%d arrType=%d arrOwns=%d arr=%p",
+            ctx->currentCodeName != nullptr ? ctx->currentCodeName : "<null>",
+            idx,
+            (int) arrayRef.type,
+            arrayRef.ownsReference ? 1 : 0,
+            (void*) arrayRef.array
+        );
+        VMExec_bootLog(buffer);
+        VMExec_traceCrashRValue("vmarray: popaf-array", ctx->currentCodeName, idx, &arrayRef);
+        VMExec_traceCrashRValue("vmarray: popaf-value", ctx->currentCodeName, idx, &value);
+    }
     if (arrayRef.type == RVALUE_ARRAY && arrayRef.array != nullptr && idx >= 0) {
         GMLArray* arr = arrayRef.array;
+        if (VMExec_shouldTraceCrashWindow()) {
+            char buffer[256];
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "vmarray: popaf-live code=%s idx=%d refCount=%d owner=%p currentOwner=%p",
+                ctx->currentCodeName != nullptr ? ctx->currentCodeName : "<null>",
+                idx,
+                arr->refCount,
+                arr->owner,
+                ctx->currentArrayOwner
+            );
+            VMExec_bootLog(buffer);
+        }
         requireMessage(arr->refCount == 1 || arr->owner == ctx->currentArrayOwner, "BREAK_POPAF: Writing through shared/aliased array without prior CoW fork");
         GMLArray_growTo(arr, idx + 1);
         storeIntoArraySlot(GMLArray_slot(arr, idx), value);
@@ -2605,7 +2900,9 @@ static void handleBreakPushAC(VMContext* ctx, uint32_t instrAddr) {
         RValue_free(parentSlot);
         GMLArray* sub = GMLArray_create(0);
         sub->owner = parent->owner;
-        *parentSlot = (RValue){ .array = sub, .type = RVALUE_ARRAY, .ownsReference = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+        RValue rv = { .type = RVALUE_ARRAY, .ownsReference = true, RVALUE_INIT_GMLTYPE(GML_TYPE_VARIABLE) };
+        rv.array = sub;
+        *parentSlot = rv;
     }
     stackPush(ctx, RValue_makeArrayWeak(parentSlot->array));
     RValue_free(&arrayRef);
@@ -3388,6 +3685,11 @@ static uint32_t computeLocalsCount(VMContext* ctx, CodeEntry* code) {
     }
 }
 
+// Native script code override table
+void VM_registerCodeOverride(VMContext* ctx, const char* codeName, BuiltinFunc func) {
+    shput(ctx->codeOverrideMap, (char*) codeName, func);
+}
+
 RValue VM_executeCode(VMContext* ctx, int32_t codeIndex) {
     require(codeIndex >= 0 && ctx->dataWin->code.count > (uint32_t) codeIndex);
     CodeEntry* code = &ctx->dataWin->code.entries[codeIndex];
@@ -3397,11 +3699,23 @@ RValue VM_executeCode(VMContext* ctx, int32_t codeIndex) {
     ctx->codeEnd = code->length;
     ctx->currentCodeName = code->name;
     ctx->currentCodeIndex = codeIndex;
+    if (ctx->codeOverrideMap != nullptr && code->name != nullptr) {
+        ptrdiff_t overrideIdx = shgeti(ctx->codeOverrideMap, (char*) code->name);
+        if (overrideIdx >= 0) {
+            BuiltinFunc nativeFunc = ctx->codeOverrideMap[overrideIdx].value;
+            if (nativeFunc != nullptr) {
+                return nativeFunc(ctx, nullptr, 0);
+            }
+        }
+    }
 
     setCurrentCodeLocalsSlotMap(ctx);
 
     uint32_t localsCount = computeLocalsCount(ctx, code);
-    RValue localVars[MAX_CODE_LOCALS] = {0};
+    RValue localVars[MAX_CODE_LOCALS];
+    if (localsCount > 0) {
+        memset(localVars, 0, localsCount * sizeof(RValue));
+    }
     ctx->localVars = localVars;
     ctx->localVarCount = localsCount;
 
@@ -3467,14 +3781,20 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
     uint32_t localsCount = computeLocalsCount(ctx, code);
     // We use fixed-size arrays instead of VLAs because it seems that using multiple VLAs in a single function things get corrupted somehow?
     // So when you see this MAX_CODE_LOCALS and GML_MAX_ARGUMENTS, you can shake your fist in the air and say "damn you MIPS!!1"
-    RValue localVars[MAX_CODE_LOCALS] = {0};
+    RValue localVars[MAX_CODE_LOCALS];
+    if (localsCount > 0) {
+        memset(localVars, 0, localsCount * sizeof(RValue));
+    }
     ctx->localVars = localVars;
     ctx->localVarCount = localsCount;
 
     // Store arguments in scriptArgs (mirrors GMS 1.4's global argument stack).
     // Callee takes an INDEPENDENT reference for strings (strdup) and arrays (incRef) so
     // the caller's original args remain valid and owner-tracked by the caller.
-    RValue scriptArgs[GML_MAX_ARGUMENTS] = {0};
+    RValue scriptArgs[GML_MAX_ARGUMENTS];
+    if (argCount > 0) {
+        memset(scriptArgs, 0, (size_t) argCount * sizeof(RValue));
+    }
     ctx->scriptArgs = scriptArgs;
     ctx->scriptArgCount = argCount;
     if (argCount > 0 && args != nullptr) {
@@ -3513,20 +3833,7 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
 
     // Strengthen result BEFORE freeing callee locals/scriptArgs: if result is a weak view into callee state, the upcoming frees would leave a dangling pointer.
     // For owning results, the refCount/string buffer stays valid (the callee transferred one ownership slot to us).
-    if (result.type == RVALUE_STRING && !result.ownsReference && result.string != nullptr) {
-        result = RValue_makeOwnedString(safeStrdup(result.string));
-    } else if (result.type == RVALUE_ARRAY && !result.ownsReference && result.array != nullptr) {
-        GMLArray_incRef(result.array);
-        result.ownsReference = true;
-#if IS_BC17_OR_HIGHER_ENABLED
-    } else if (result.type == RVALUE_METHOD && !result.ownsReference && result.method != nullptr) {
-        GMLMethod_incRef(result.method);
-        result.ownsReference = true;
-#endif
-    } else if (result.type == RVALUE_STRUCT && !result.ownsReference && result.structInst != nullptr) {
-        Instance_structIncRef(result.structInst);
-        result.ownsReference = true;
-    }
+    result = strengthenReturnValue(result);
 
     // Restore caller frame
     CallFrame* saved = ctx->callStack;
@@ -4145,6 +4452,7 @@ void VM_free(VMContext* ctx) {
     shfree(ctx->codeIndexByName);
     shfree(ctx->globalVarNameMap);
     shfree(ctx->selfVarNameMap);
+    shfree(ctx->codeOverrideMap);
     repeat(shlen(ctx->codeLocalsMap), i) {
         free(ctx->codeLocalsMap[i].key);
     }

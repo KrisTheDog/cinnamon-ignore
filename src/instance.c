@@ -29,6 +29,9 @@ Instance* Instance_create(uint32_t instanceId, int32_t objectIndex, GMLReal x, G
     inst->outsideRoom = false;
     inst->spatialGridDirty = false;
     inst->spriteIndex = -1;
+    inst->cachedDrawSpriteIndex = -1;
+    inst->cachedDrawSubimg = INT32_MIN;
+    inst->cachedDrawTPAGIndex = -1;
     inst->imageSpeed = 1.0f;
     inst->imageIndex = 0.0f;
     inst->imageXscale = 1.0f;
@@ -96,6 +99,9 @@ void Instance_copyFields(Instance* source, Instance* destination) {
     destination->outsideRoom = source->outsideRoom;
     destination->maskIndex = source->maskIndex;
     destination->spriteIndex = source->spriteIndex;
+    destination->cachedDrawSpriteIndex = source->cachedDrawSpriteIndex;
+    destination->cachedDrawSubimg = source->cachedDrawSubimg;
+    destination->cachedDrawTPAGIndex = source->cachedDrawTPAGIndex;
     destination->imageSpeed = source->imageSpeed;
     destination->imageIndex = source->imageIndex;
     destination->imageXscale = source->imageXscale;

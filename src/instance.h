@@ -36,6 +36,9 @@ typedef struct Instance {
 
     // Built-in instance properties
     int32_t spriteIndex;
+    int32_t cachedDrawSpriteIndex;
+    int32_t cachedDrawSubimg;
+    int32_t cachedDrawTPAGIndex;
     float imageSpeed, imageIndex;
     float imageXscale, imageYscale, imageAngle, imageAlpha;
     uint32_t imageBlend;

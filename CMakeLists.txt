@@ -25,6 +25,10 @@ endif()
 # performance on low end hardware!
 option(ENABLE_BC16 "Enable support for Bytecode Version 16" ON)
 option(ENABLE_BC17 "Enable support for Bytecode Version 17" ON)
+if(PLATFORM STREQUAL "n3ds")
+    set(ENABLE_BC16 ON CACHE BOOL "Enable support for Bytecode Version 16" FORCE)
+    set(ENABLE_BC17 OFF CACHE BOOL "Enable support for Bytecode Version 17" FORCE)
+endif()
 if(NOT ENABLE_BC16 AND NOT ENABLE_BC17)
     message(FATAL_ERROR "You need to build Butterscotch with at least one bytecode version enabled!")
 endif()
@@ -33,6 +37,27 @@ if(ENABLE_BC16)
 endif()
 if(ENABLE_BC17)
     add_compile_definitions(ENABLE_BC17)
+endif()
+
+set(BUTTERSCOTCH_WIIU_ICON "${CMAKE_SOURCE_DIR}/resources/wiiu/meta/icon.png")
+set(BUTTERSCOTCH_WIIU_DRC_SPLASH "${CMAKE_SOURCE_DIR}/resources/wiiu/meta/drc.png")
+set(BUTTERSCOTCH_WIIU_TV_SPLASH "${CMAKE_SOURCE_DIR}/resources/wiiu/meta/tv.png")
+set(BUTTERSCOTCH_WIIU_NAME "UNDERTALE")
+set(BUTTERSCOTCH_WIIU_SHORTNAME "UNDERTALE")
+set(BUTTERSCOTCH_WIIU_APP_FOLDER "cinnamon")
+set(BUTTERSCOTCH_3DS_NAME "cinnamon")
+set(BUTTERSCOTCH_3DS_DESCRIPTION "cinnamon")
+set(BUTTERSCOTCH_3DS_AUTHOR "Project Sunshine")
+if(ENABLE_BC17 AND NOT ENABLE_BC16)
+    set(BUTTERSCOTCH_WIIU_ICON "${CMAKE_SOURCE_DIR}/resources/wiiu/meta/icon-deltarune.png")
+    set(BUTTERSCOTCH_WIIU_DRC_SPLASH "${CMAKE_SOURCE_DIR}/resources/wiiu/meta/drc-deltarune.png")
+    set(BUTTERSCOTCH_WIIU_TV_SPLASH "${CMAKE_SOURCE_DIR}/resources/wiiu/meta/tv-deltarune.png")
+    set(BUTTERSCOTCH_WIIU_NAME "DELTARUNE")
+    set(BUTTERSCOTCH_WIIU_SHORTNAME "DELTARUNE")
+endif()
+option(WIIU_USE_DELTARUNE_SD_PATH "Use /wiiu/apps/deltarune instead of /wiiu/apps/cinnamon on Wii U" OFF)
+if(WIIU_USE_DELTARUNE_SD_PATH)
+    set(BUTTERSCOTCH_WIIU_APP_FOLDER "deltarune")
 endif()
 
 file(GLOB SOURCES src/*.c)
@@ -53,8 +78,10 @@ target_include_directories(butterscotch PUBLIC vendor/stb/ds)
 
 if(PLATFORM STREQUAL "glfw")
     file(GLOB GL_SOURCES src/gl/*.c)
+    list(REMOVE_ITEM GL_SOURCES ${CMAKE_SOURCE_DIR}/src/gl/gl_renderer.c)
     target_sources(butterscotch PRIVATE ${GL_SOURCES})
     target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
 
     # Butterscotch VM/interpreter profiler
     option(ENABLE_VM_GML_PROFILER "Enable Butterscotch VM/interpreter profiler" ON)
@@ -147,28 +174,52 @@ if(PLATFORM STREQUAL "glfw")
             $<TARGET_FILE_DIR:butterscotch>/gamecontrollerdb.txt
     )
 elseif(PLATFORM STREQUAL "wiiu")
-    find_package(SDL2 CONFIG REQUIRED)
+    # find_package(SDL2 CONFIG REQUIRED)
+    target_sources(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl/image_decoder.c)
+    target_compile_definitions(butterscotch PRIVATE BUTTERSCOTCH_WIIU_APP_FOLDER="${BUTTERSCOTCH_WIIU_APP_FOLDER}")
+
+    if(DEFINED ENV{DEVKITPRO} AND NOT "$ENV{DEVKITPRO}" STREQUAL "")
+        file(TO_CMAKE_PATH "$ENV{DEVKITPRO}" DEVKITPRO_ROOT)
+    elseif(EXISTS "C:/devkitPro")
+        file(TO_CMAKE_PATH "C:/devkitPro" DEVKITPRO_ROOT)
+    else()
+        message(FATAL_ERROR "DEVKITPRO is not set and C:/devkitPro was not found.")
+    endif()
+
+    # data.win and bytecode blobs are serialized little-endian, but Wii U's PowerPC CPU is big-endian.
+    target_compile_definitions(butterscotch PRIVATE IS_BIG_ENDIAN)
 
     target_include_directories(butterscotch PRIVATE
         ${CMAKE_SOURCE_DIR}/vendor
         ${CMAKE_SOURCE_DIR}/vendor/stb/image
         ${CMAKE_SOURCE_DIR}/vendor/stb/vorbis
         ${CMAKE_SOURCE_DIR}/vendor/miniaudio
+        ${DEVKITPRO_ROOT}/wut/include
+        ${DEVKITPRO_ROOT}/portlibs/wiiu/include
+        ${DEVKITPRO_ROOT}/portlibs/ppc/include
     )
 
-    target_link_libraries(butterscotch PRIVATE SDL2::SDL2)
+    target_link_directories(butterscotch PRIVATE
+        ${DEVKITPRO_ROOT}/portlibs/wiiu/lib
+        ${DEVKITPRO_ROOT}/portlibs/ppc/lib
+    )
+    target_link_libraries(butterscotch PRIVATE bz2 SDL2)
 
     set_target_properties(butterscotch PROPERTIES OUTPUT_NAME undertale)
+
+    if(NOT COMMAND wut_create_rpx)
+        message(FATAL_ERROR "wut_create_rpx is unavailable. Configure with the devkitPro Wii U toolchain file.")
+    endif()
 
     wut_create_rpx(butterscotch)
 
     wut_create_wuhb(butterscotch
-        NAME "UNDERTALE"
-        SHORTNAME "UNDERTALE"
+        NAME ${BUTTERSCOTCH_WIIU_NAME}
+        SHORTNAME ${BUTTERSCOTCH_WIIU_SHORTNAME}
         AUTHOR "Toby Fox, Project Sunshine"
-        DRCSPLASH ${CMAKE_SOURCE_DIR}/resources/wiiu/meta/drc.png
-        ICON ${CMAKE_SOURCE_DIR}/resources/wiiu/meta/icon.png
-        TVSPLASH ${CMAKE_SOURCE_DIR}/resources/wiiu/meta/tv.png
+        DRCSPLASH ${BUTTERSCOTCH_WIIU_DRC_SPLASH}
+        ICON ${BUTTERSCOTCH_WIIU_ICON}
+        TVSPLASH ${BUTTERSCOTCH_WIIU_TV_SPLASH}
         CONTENT ${CMAKE_SOURCE_DIR}/resources/wiiu/content
     )
 elseif(PLATFORM STREQUAL "ps2")
@@ -356,6 +407,75 @@ elseif(PLATFORM STREQUAL "ps2")
                 ${CMAKE_SOURCE_DIR}/ps2dev-headers/newlib-include
                 ${CMAKE_SOURCE_DIR}/ps2dev-headers/gcc-include
         )
+    endif()
+elseif(PLATFORM STREQUAL "n3ds")
+    option(N3DS_ENABLE_LTO "Enable link-time optimization for the 3DS target" ON)
+    option(N3DS_ENABLE_FAST_MATH "Enable fast-math on the 3DS target" OFF)
+    option(N3DS_USE_FLOAT_REALS "Use float instead of double for GMLReal on the 3DS target" OFF)
+    option(N3DS_DISABLE_RVALUE_INT64 "Store oversized int64 values as reals/int32 on the 3DS target" OFF)
+    option(N3DS_ENABLE_PERF_LOGS "Enable periodic 3DS renderer perf logs" OFF)
+
+    if(DEFINED ENV{DEVKITPRO} AND NOT "$ENV{DEVKITPRO}" STREQUAL "")
+        file(TO_CMAKE_PATH "$ENV{DEVKITPRO}" DEVKITPRO_ROOT)
+    elseif(EXISTS "C:/devkitPro")
+        file(TO_CMAKE_PATH "C:/devkitPro" DEVKITPRO_ROOT)
+    else()
+        message(FATAL_ERROR "DEVKITPRO is not set and C:/devkitPro was not found.")
+    endif()
+
+    target_include_directories(butterscotch PRIVATE
+        ${DEVKITPRO_ROOT}/libctru/include
+        ${CMAKE_SOURCE_DIR}/vendor
+        ${CMAKE_SOURCE_DIR}/vendor/stb/ds
+    )
+
+    target_link_directories(butterscotch PRIVATE
+        ${DEVKITPRO_ROOT}/libctru/lib
+    )
+
+    target_compile_options(butterscotch PRIVATE
+        -fomit-frame-pointer
+        -ffunction-sections
+        -fdata-sections
+        $<$<CONFIG:Release>:-O3>
+        $<$<CONFIG:RelWithDebInfo>:-O3>
+        $<$<CONFIG:MinSizeRel>:-Os>
+    )
+    target_link_options(butterscotch PRIVATE -Wl,--gc-sections)
+
+    if(N3DS_ENABLE_LTO)
+        target_compile_options(butterscotch PRIVATE -flto)
+        target_link_options(butterscotch PRIVATE -flto)
+    endif()
+    if(N3DS_ENABLE_FAST_MATH)
+        target_compile_options(butterscotch PRIVATE -ffast-math)
+    endif()
+    if(N3DS_USE_FLOAT_REALS)
+        target_compile_definitions(butterscotch PRIVATE USE_FLOAT_REALS)
+    endif()
+    if(N3DS_DISABLE_RVALUE_INT64)
+        target_compile_definitions(butterscotch PRIVATE NO_RVALUE_INT64)
+    endif()
+    if(N3DS_ENABLE_PERF_LOGS)
+        target_compile_definitions(butterscotch PRIVATE N3DS_ENABLE_PERF_LOGS)
+    endif()
+
+    target_link_libraries(butterscotch PRIVATE citro2d citro3d ctru m)
+    set_target_properties(butterscotch PROPERTIES OUTPUT_NAME cinnamon)
+
+    set(N3DS_ROMFS_DIR "${CMAKE_SOURCE_DIR}/resources/3ds/romfs")
+    set(N3DS_SMDH_FILE "${CMAKE_CURRENT_BINARY_DIR}/cinnamon.default.smdh")
+    ctr_generate_smdh(
+        OUTPUT "${N3DS_SMDH_FILE}"
+        NAME "${BUTTERSCOTCH_3DS_NAME}"
+        DESCRIPTION "${BUTTERSCOTCH_3DS_DESCRIPTION}"
+        AUTHOR "${BUTTERSCOTCH_3DS_AUTHOR}"
+        ICON "${CMAKE_SOURCE_DIR}/resources/3ds/meta/icon.png"
+    )
+    if(EXISTS "${N3DS_ROMFS_DIR}")
+        ctr_create_3dsx(cinnamon TARGET butterscotch SMDH "${N3DS_SMDH_FILE}" ROMFS "${N3DS_ROMFS_DIR}")
+    else()
+        ctr_create_3dsx(cinnamon TARGET butterscotch SMDH "${N3DS_SMDH_FILE}")
     endif()
 else()
     message(FATAL_ERROR "Unknown platform! ${PLATFORM}")

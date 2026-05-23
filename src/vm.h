@@ -218,6 +218,11 @@ typedef struct VMContext {
     struct { char* key; int32_t value; }* globalVarNameMap;
     // varName -> varID hash map for self/instance-scoped variables (stb_ds).
     struct { char* key; int32_t value; }* selfVarNameMap;
+    // codeName -> BuiltinFunc: native overrides for specific GML code entries.
+    // When VM_executeCode finds the executing code's name in this map it calls
+    // the native function directly and skips the bytecode interpreter entirely.
+    // Registered via VM_registerCodeOverride. nullptr until first registration.
+    struct { char* key; BuiltinFunc value; }* codeOverrideMap;
     // "codeName\tfuncName" -> true, for deduplicating unknown function warnings
     StringBooleanEntry* loggedUnknownFuncs;
     // "codeName\tfuncName" -> true, for deduplicating stubbed function warnings
@@ -271,6 +276,7 @@ void VM_disassemble(VMContext* ctx, int32_t codeIndex);
 // Prints a sorted summary of opcode execution counts to stderr. Does nothing if the opcode profiler was never enabled.
 void VM_printOpcodeProfilerReport(const VMContext* ctx);
 #endif
+void VM_registerCodeOverride(VMContext* ctx, const char* codeName, BuiltinFunc func);
 void VM_registerBuiltin(VMContext* ctx, const char* name, BuiltinFunc func);
 BuiltinFunc VM_findBuiltin(VMContext* ctx, const char* name);
 RValue VM_createArray(VMContext* ctx);

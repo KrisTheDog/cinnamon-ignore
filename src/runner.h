@@ -13,6 +13,9 @@
 #include "runner_gamepad.h"
 #include "vm.h"
 
+// Platform-specific boot log function
+void Runner_platformBootLog(const char* message);
+
 // ===[ Event Type Constants ]===
 #define EVENT_CREATE     0
 #define EVENT_DESTROY    1
@@ -49,6 +52,7 @@
 #define OTHER_ANIMATION_END 7
 #define OTHER_END_OF_PATH   8
 #define OTHER_USER0         10
+#define OTHER_ASYNC_SOCIAL  70
 #define OTHER_ASYNC_SYSTEM  75
 
 #define MAX_VIEWS 8
@@ -122,7 +126,35 @@ typedef struct {
     bool visible;
     float offsetX;
     float offsetY;
+    float alpha;
 } TileLayerState;
+
+typedef struct {
+    uint32_t start;
+    uint32_t count;
+} TileLayerCacheRow;
+
+typedef struct {
+    uint32_t tileX;
+    uint32_t srcX;
+    uint32_t srcY;
+    int32_t tpagIndex;
+    int32_t n3dsTileEntryIndex;
+    bool mirror;
+    bool flip;
+} TileLayerCacheCell;
+
+typedef struct {
+    bool built;
+    int32_t backgroundIndex;
+    int32_t n3dsChunkCacheId;
+    uint32_t tileWidth;
+    uint32_t tileHeight;
+    uint32_t tilesX;
+    uint32_t tilesY;
+    TileLayerCacheRow* rows;
+    TileLayerCacheCell* cells;
+} TileLayerRenderCache;
 
 // Mutable background element on a dynamically-created layer (layer_background_create).
 // For parsed room layers, RoomLayerBackgroundData is used directly and this struct is unused.
@@ -290,6 +322,12 @@ typedef struct {
     RuntimeView views[MAX_VIEWS];
 } SavedRoomState;
 
+typedef struct {
+    Instance* instance;
+    int32_t codeId;
+    int32_t ownerObjectIndex;
+} N3DSResolvedDrawEvent;
+
 typedef struct Runner {
     DataWin* dataWin;
     VMContext* vmContext;
@@ -341,9 +379,16 @@ typedef struct Runner {
     bool (*windowHasFocus)(void* window);
     TileLayerMapEntry* tileLayerMap; // stb_ds hashmap: depth -> tile layer state
     RuntimeLayer* runtimeLayers; // stb_ds array, index-parallel to currentRoom->layers for parsed entries; dynamic entries appended
+    TileLayerRenderCache* tileLayerCaches; // array parallel to currentRoom->layers for parsed tile layers
+    uint32_t tileLayerCacheCount;
     uint32_t nextLayerId;        // counter for IDs of layers/elements created at runtime
     SavedRoomState* savedRoomStates; // array of size dataWin->room.count, for persistent room support
     int32_t viewCurrent; // index of the view currently being drawn (for view_current)
+    bool drawViewBoundsValid;
+    int32_t drawViewX;
+    int32_t drawViewY;
+    int32_t drawViewWidth;
+    int32_t drawViewHeight;
     struct { char* key; int value; }* disabledObjects; // stb_ds string hashmap, nullptr = no filtering
     struct { int key; Instance* value; }* instancesById;
     bool forceDrawDepth;
@@ -380,6 +425,7 @@ typedef struct Runner {
 
     // Legacy audio_play_music / audio_stop_music tracking
     int32_t lastMusicInstance;
+    int32_t* musicInstanceStack; // stb_ds array used to restore the previous legacy music track after nested play/stop flows
 
     // INI file state
     IniFile* currentIni;
@@ -404,9 +450,53 @@ typedef struct Runner {
     int32_t guiWidth;
     int32_t guiHeight;
 
+    // Per-frame draw breakdown for lightweight platform HUD diagnostics.
+    uint32_t frameDrawBackgrounds;
+    uint32_t frameDrawTiles;
+    uint32_t frameDrawInstances;
+    uint32_t frameDrawLayerElements;
+    double frameDrawBackgroundMs;
+    double frameDrawTilesMs;
+    double frameDrawInstancesMs;
+    double frameDrawLayerMs;
+    double frameDrawGuiMs;
+    double frameDrawGuiEventMs;
+    double frameDrawBattleReplayMs;
+    double frameStepPrepMs;
+    double frameStepEventMs;
+    double frameStepMotionMs;
+    double frameStepCollisionMs;
+    double frameStepFinalizeMs;
+    double frameStepTopObjectMs;
+    uint32_t frameStepTopObjectCalls;
+    int32_t frameStepTopObjectIndex;
+    double* frameStepObjectMsByObject;
+    uint32_t* frameStepObjectCallsByObject;
+    bool n3dsDrawBattleStateValid;
+    bool n3dsDrawBattleActive;
+    bool n3dsDrawDodgingBullets;
+    bool n3dsDrawHasTopEnemyDialogue;
+    bool n3dsBattleReplayListsValid;
+    bool n3dsTopScreenGUIListValid;
+    Instance** n3dsBattleFieldInstances;
+    Instance** n3dsBattleUIInstances;
+    Instance** n3dsTopScreenGUIInstances;
+    bool n3dsTopScreenGUIResponderListsValid[3];
+    N3DSResolvedDrawEvent* n3dsTopScreenGUIResponderEvents[3];
+
     // GMS legacy (pre 2022.1) collision behavior: AABB overlap treats touching edges as overlap.
     bool collisionCompatibilityMode;
 } Runner;
+
+typedef struct {
+    uint32_t liveInstances;
+    uint32_t liveStructInstances;
+    uint32_t dsMapSlots;
+    uint32_t dsMapLive;
+    uint32_t dsListSlots;
+    uint32_t dsListLive;
+    uint32_t dsListItems;
+} RunnerTelemetry;
 
 const char* Runner_getEventName(int32_t eventType, int32_t eventSubtype);
 void Runner_reset(Runner* runner);
@@ -418,6 +508,7 @@ void Runner_executeEventFromObject(Runner* runner, Instance* instance, int32_t s
 void Runner_executeEventForAll(Runner* runner, int32_t eventType, int32_t eventSubtype);
 void Runner_draw(Runner* runner);
 void Runner_drawGUI(Runner* runner);
+void Runner_resetFrameDrawStats(Runner* runner);
 void Runner_drawBackgrounds(Runner* runner, bool foreground);
 void Runner_computeViewDisplayScale(Runner* runner, int32_t gameW, int32_t gameH, float* outScaleX, float* outScaleY);
 void Runner_drawViews(Runner* runner, int32_t gameW, int32_t gameH, float displayScaleX, float displayScaleY, bool debugShowCollisionMasks);
@@ -453,4 +544,6 @@ RuntimeLayer* Runner_findRuntimeLayerById(Runner* runner, int32_t id);
 RoomLayer* Runner_findRoomLayerById(Runner* runner, int32_t id);
 RuntimeLayerElement* Runner_findLayerElementById(Runner* runner, int32_t elementId, RuntimeLayer** outLayer);
 uint32_t Runner_getNextLayerId(Runner* runner);
+void Runner_drawTileLayer(Runner* runner, uint32_t layerIndex, RoomLayerTilesData* data, float layerOffsetX, float layerOffsetY, float alpha);
 void Runner_freeRuntimeLayer(RuntimeLayer* runtimeLayer);
+RunnerTelemetry Runner_collectTelemetry(Runner* runner);

@@ -32,7 +32,7 @@ static inline float TextUtils_getKerningOffset(FontGlyph* glyph, uint16_t nextCh
 }
 
 // Decodes a single UTF-8 codepoint from str at *pos, advances *pos past the consumed bytes.
-// Returns the codepoint as uint16_t (sufficient for BMP glyphs). Returns 0xFFFD for invalid sequences.
+
 static inline uint16_t TextUtils_decodeUtf8(const char* str, int32_t len, int32_t* pos) {
     uint8_t b = (uint8_t) str[*pos];
     if (128 > b) {
@@ -60,10 +60,12 @@ static inline uint16_t TextUtils_decodeUtf8(const char* str, int32_t len, int32_
             return 0xFFFD; // Beyond BMP, return replacement character
         }
     }
-    // Invalid or truncated sequence
+
+
     (*pos)++;
-    return 0xFFFD;
+    return (uint16_t) b;
 }
+
 
 static inline int32_t TextUtils_utf8AdvanceCodepoints(const char* str, int32_t byteLen, int32_t codepointsToSkip) {
     int32_t pos = 0;
@@ -75,6 +77,15 @@ static inline int32_t TextUtils_utf8AdvanceCodepoints(const char* str, int32_t b
         codepointsToSkip--;
     }
     return pos;
+}
+
+
+static inline int32_t TextUtils_utf8ByteOffsetFromGmlIndex(const char* str, int32_t byteLen, int32_t gmlIndex) {
+    int32_t toSkip = gmlIndex - 1;
+    if (toSkip < 0) toSkip = 0;
+    int32_t offset = TextUtils_utf8AdvanceCodepoints(str, byteLen, toSkip);
+    if (offset > byteLen) offset = byteLen;
+    return offset;
 }
 
 static inline int32_t TextUtils_utf8CodepointCount(const char* str, int32_t byteLen) {
@@ -163,27 +174,128 @@ static inline void PreprocessedText_free(PreprocessedText pt) {
     if (pt.owning) free((char*) pt.text);
 }
 
+static inline bool TextUtils_isDeltaruneInlineTextCommand(char c) {
+    switch (c) {
+        case 'C': // color
+        case 'E': // expression/portrait
+        case 'F': // face/font textbox metadata
+        case 'M': // voice/sound metadata
+        case 'S': // speed/sound metadata
+        case 'T': // typer/textbox metadata
+        case 'V': // variable/textbox metadata
+        case 'W': // wait metadata
+        case 'X': // textbox metadata
+        case 'Y': // textbox metadata
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline bool TextUtils_isDeltaruneInlineTextCommandParam(char c) {
+    uint8_t b = (uint8_t) c;
+    return (b >= '0' && b <= '9') ||
+           (b >= 'A' && b <= 'Z') ||
+           (b >= 'a' && b <= 'z') ||
+           b >= 0x80;
+}
+
+static inline bool TextUtils_trySkipDeltaruneInlineTextCommand(const char* text, int32_t len, int32_t i, int32_t* outNext) {
+    if (text[i] != '\\' || i + 1 >= len) return false;
+
+    char command = text[i + 1];
+    if (!TextUtils_isDeltaruneInlineTextCommand(command)) return false;
+
+    int32_t next = i + 2;
+    if (next < len && TextUtils_isDeltaruneInlineTextCommandParam(text[next])) {
+        next++;
+    }
+
+    *outNext = next;
+    return true;
+}
+
+static inline bool TextUtils_trySkipDeltaruneLeakedTextboxPrefix(const char* text, int32_t len, int32_t i, int32_t* outNext) {
+    if (i != 0 || len < 3 || text[0] != 'E' || text[2] != '*') return false;
+    if (!TextUtils_isDeltaruneInlineTextCommandParam(text[1])) return false;
+
+    *outNext = 2;
+    return true;
+}
+
+static inline bool TextUtils_hasDeltaruneLeakedTextboxPrefix(const char* text, int32_t len) {
+    int32_t next = 0;
+    return TextUtils_trySkipDeltaruneLeakedTextboxPrefix(text, len, 0, &next);
+}
+
+static inline bool TextUtils_trySkipDeltaruneTextMarkup(const char* text, int32_t len, int32_t i, int32_t* outNext) {
+    if (TextUtils_trySkipDeltaruneInlineTextCommand(text, len, i, outNext)) return true;
+    if (TextUtils_trySkipDeltaruneLeakedTextboxPrefix(text, len, i, outNext)) return true;
+    return false;
+}
+
+static inline PreprocessedText TextUtils_preprocessGmlDrawText(const char* text, bool convertHashNewlines) {
+    int32_t len = (int32_t) strlen(text);
+    bool needsProcessing = false;
+
+    for (int32_t i = 0; i < len; i++) {
+        int32_t next = i;
+        if (TextUtils_trySkipDeltaruneTextMarkup(text, len, i, &next)) {
+            needsProcessing = true;
+            i = next - 1;
+            continue;
+        }
+
+        if (convertHashNewlines && text[i] == '#') {
+            needsProcessing = true;
+        }
+    }
+
+    if (!needsProcessing) {
+        return (PreprocessedText){ .text = text, .owning = false };
+    }
+
+    char* result = safeMalloc(len + 1);
+    int32_t out = 0;
+
+    for (int32_t i = 0; i < len; i++) {
+        int32_t next = i;
+        if (TextUtils_trySkipDeltaruneTextMarkup(text, len, i, &next)) {
+            i = next - 1;
+            continue;
+        }
+
+        if (convertHashNewlines && text[i] == '#') {
+            if (out > 0 && result[out - 1] == '\\') {
+                result[out - 1] = '#';
+            } else {
+                result[out++] = '\n';
+            }
+        } else {
+            result[out++] = text[i];
+        }
+    }
+
+    result[out] = '\0';
+    return (PreprocessedText){ .text = result, .owning = true };
+}
+
 // Preprocesses GML text: converts unescaped # to \n, and \# to literal #.
 // Uses a fused single-pass approach: scans for # and only allocates if one is found.
 static inline PreprocessedText TextUtils_preprocessGmlText(const char* text) {
     int32_t len = (int32_t) strlen(text);
-
-    // Scan until we find a #
     for (int32_t i = 0; len > i; i++) {
         if (text[i] == '#') {
-            // Found one - allocate and process from here
             char* result = safeMalloc(len + 1);
             memcpy(result, text, i);
             int32_t out = i;
 
-            // Check if the # is escaped (\#)
             if (out > 0 && result[out - 1] == '\\') {
                 result[out - 1] = '#';
             } else {
                 result[out++] = '\n';
             }
 
-            // Process the rest of the string
             for (int32_t j = i + 1; len > j; j++) {
                 if (text[j] == '#') {
                     if (out > 0 && result[out - 1] == '\\') {
@@ -206,9 +318,8 @@ static inline PreprocessedText TextUtils_preprocessGmlText(const char* text) {
 
 // Preprocess GML text ONLY if the runner is not GameMaker: Studio 2
 static inline PreprocessedText TextUtils_preprocessGmlTextIfNeeded(Runner* runner, const char* text) {
-    if (DataWin_isVersionAtLeast(runner->dataWin, 2, 0, 0, 0))
-        return (PreprocessedText){ .text = text, .owning = false };
-    return TextUtils_preprocessGmlText(text);
+    bool convertHashNewlines = !DataWin_isVersionAtLeast(runner->dataWin, 2, 0, 0, 0);
+    return TextUtils_preprocessGmlDrawText(text, convertHashNewlines);
 }
 
 // Returns true if c is \r or \n
@@ -236,7 +347,6 @@ static inline int32_t TextUtils_countLines(const char* text, int32_t len) {
     return count;
 }
 
-// Advances lineStart past the newline at lineEnd, treating \r\n and \n\r as single breaks
 static inline int32_t TextUtils_skipNewline(const char* text, int32_t lineEnd, int32_t textLen) {
     int32_t next = lineEnd + 1;
     if (textLen > next && TextUtils_isNewlineChar(text[next]) && text[lineEnd] != text[next]) {

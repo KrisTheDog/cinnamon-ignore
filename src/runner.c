@@ -12,9 +12,599 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#ifdef __3DS__
+#include <3ds.h>
+#include "n3ds/n3ds_platform_config.h"
+#endif
 
 #include "debug_overlay.h"
-#include "stb_ds.h"
+// #include "stb_ds.h"
+
+#ifdef __3DS__
+void N3DSRenderer_beginBottomScreenGUIEx(Renderer* renderer, int32_t guiW, int32_t guiH, float scaleX, float scaleY, float offsetX, float offsetY);
+void N3DSRenderer_beginBottomScreenGUI(Renderer* renderer, int32_t guiW, int32_t guiH);
+void N3DSRenderer_endBottomScreenGUI(Renderer* renderer);
+void N3DSRenderer_beginBottomScreenGUI2x(Renderer* renderer, int32_t guiW, int32_t guiH);
+void N3DSRenderer_endBottomScreenGUI2x(Renderer* renderer);
+void N3DSRenderer_beginTopScreenGUI(Renderer* renderer, int32_t guiW, int32_t guiH);
+void N3DSRenderer_endTopScreenGUI(Renderer* renderer);
+void N3DSRenderer_beginTopScreenGUI2x(Renderer* renderer, int32_t guiW, int32_t guiH);
+void N3DSRenderer_endTopScreenGUI2x(Renderer* renderer);
+bool N3DSRenderer_isTopScreenGUIActive(Renderer* renderer);
+void N3DSRenderer_setTopScreenBattleViewActive(Renderer* renderer, bool active);
+int32_t N3DSRenderer_findTileEntryIndex(Renderer* renderer, int32_t backgroundIndex, int32_t srcX, int32_t srcY, int32_t srcW, int32_t srcH);
+bool N3DSRenderer_drawCachedTileEntry(Renderer* renderer, int32_t tileEntryIndex, float drawX, float drawY, float xscale, float yscale, uint32_t color, float alpha);
+int32_t N3DSRenderer_createTileLayerChunkCache(Renderer* renderer, int32_t roomWidth, int32_t roomHeight, const TileLayerRenderCache* cache);
+bool N3DSRenderer_drawTileLayerChunkCache(Renderer* renderer, int32_t cacheId, float layerOffsetX, float layerOffsetY, float alpha);
+void N3DSRenderer_destroyTileLayerChunkCache(Renderer* renderer, int32_t cacheId);
+#endif
+
+#define RoomLayerType_Path 0
+#define RoomLayerType_Background 1
+#define RoomLayerType_Instances 2
+#define RoomLayerType_Assets 3
+#define RoomLayerType_Tiles 4
+#define RoomLayerType_Effect 6
+#define RoomLayerType_Path2 7
+
+static uint32_t gRunnerDrawTraceCount = 0;
+static int32_t gRunnerLastLoggedRoomIndex = INT32_MIN;
+static int32_t gRunnerLastLoggedPendingRoom = INT32_MIN;
+static int32_t gRunnerLastLoggedDrawableCount = INT32_MIN;
+static int32_t gRunnerLastLoggedInstanceCount = INT32_MIN;
+
+static double Runner_nowMs(void) {
+#ifdef __3DS__
+    return (double) svcGetSystemTick() * 1000.0 / (double) SYSCLOCK_ARM11;
+#else
+    return (double) clock() * 1000.0 / (double) CLOCKS_PER_SEC;
+#endif
+}
+
+#ifdef __3DS__
+static bool Runner_isOld3DSLike(void) {
+    static bool initialized = false;
+    static bool old3DSLike = true;
+    if (!initialized) {
+        bool isNew3DS = false;
+        if (R_SUCCEEDED(APT_CheckNew3DS(&isNew3DS))) {
+            old3DSLike = !isNew3DS;
+        } else {
+            old3DSLike = true;
+        }
+#if N3DS_FORCE_OLD3DS_MODE
+        old3DSLike = true;
+#endif
+        initialized = true;
+    }
+    return old3DSLike;
+}
+#endif
+
+static void Runner_logTiming(const char* phase, double startMs, double totalStartMs) {
+    double nowMs = Runner_nowMs();
+    fprintf(
+        stderr,
+        "Runner load: %-28s phase=%8.2f ms total=%8.2f ms\n",
+        phase != NULL ? phase : "<null>",
+        nowMs - startMs,
+        nowMs - totalStartMs
+    );
+}
+
+static int32_t findEventCodeIdAndOwner(Runner* runner, int32_t objectIndex, int32_t eventType, int32_t eventSubtype, int32_t* outOwnerObjectIndex);
+static void Runner_executeResolvedEvent(Runner* runner, Instance* instance, int32_t eventType, int32_t eventSubtype, int32_t codeId, int32_t ownerObjectIndex);
+
+#ifdef __3DS__
+//bottom screen battlefield offset factor
+static const float k3DSBottomBattleFieldScale = 2.0f;
+static const float k3DSBottomBattleFieldYOffset = -60.0f;
+static const float k3DSTopBattleEnemyInstanceYOffset = 112.0f;
+
+static bool Runner_stringContainsToken(const char* haystack, const char* needle) {
+    return haystack != NULL && needle != NULL && strstr(haystack, needle) != NULL;
+}
+
+static bool Runner_is3DSValidObjectIndex(Runner* runner, int32_t objectIndex);
+static bool Runner_objectMatches3DSNameInHierarchy(Runner* runner, int32_t objectIndex, const char* name);
+static bool Runner_is3DSLiveBattleBorderObject(Runner* runner, Instance* inst);
+static bool Runner_shouldHideOn3DSTopScreen(Runner* runner, Instance* inst);
+static bool Runner_is3DSBattleBackdropInstance(Runner* runner, Instance* inst);
+static bool Runner_shouldOffset3DSTopBattleInstance(Runner* runner, Instance* inst);
+static bool Runner_is3DSUndyneBattle(Runner* runner);
+
+static RValue Runner_get3DSGlobal(Runner* runner, const char* name) {
+    if (runner == NULL || runner->vmContext == NULL || name == NULL) return RValue_makeUndefined();
+
+    ptrdiff_t idx = shgeti(runner->vmContext->globalVarNameMap, (char*) name);
+    if (idx < 0) return RValue_makeUndefined();
+
+    int32_t varID = runner->vmContext->globalVarNameMap[idx].value;
+    if ((uint32_t) varID >= runner->vmContext->globalVarCount) return RValue_makeUndefined();
+
+    RValue value = runner->vmContext->globalVars[varID];
+    value.ownsReference = false;
+    return value;
+}
+
+static double Runner_get3DSGlobalReal(Runner* runner, const char* name) {
+    return (double) RValue_toReal(Runner_get3DSGlobal(runner, name));
+}
+
+static double Runner_get3DSGlobalArrayReal(Runner* runner, const char* name, int32_t index) {
+    RValue arr = Runner_get3DSGlobal(runner, name);
+    if (arr.type != RVALUE_ARRAY || arr.array == NULL) return 0.0;
+    if (index < 0 || index >= GMLArray_length1D(arr.array)) return 0.0;
+
+    RValue* slot = GMLArray_slot(arr.array, index);
+    if (slot == NULL) return 0.0;
+    return (double) RValue_toReal(*slot);
+}
+
+static double Runner_get3DSInstanceRealVar(Runner* runner, Instance* inst, const char* name) {
+    if (runner == NULL || runner->vmContext == NULL || inst == NULL || name == NULL) return 0.0;
+
+    ptrdiff_t slot = shgeti(runner->vmContext->selfVarNameMap, (char*) name);
+    if (slot < 0) return 0.0;
+
+    int32_t varID = runner->vmContext->selfVarNameMap[slot].value;
+    RValue value = Instance_getSelfVar(inst, varID);
+    return (double) RValue_toReal(value);
+}
+
+static bool Runner_is3DSDodgingBullets(Runner* runner) {
+    return Runner_get3DSGlobalReal(runner, "turntimer") > 0.0;
+}
+
+static void Runner_prepare3DSDrawBattleState(Runner* runner) {
+    if (runner == NULL || runner->n3dsDrawBattleStateValid) return;
+
+    runner->n3dsDrawHasTopEnemyDialogue = false;
+    bool hasLiveBattleBorder = false;
+    bool hasActiveBattleController = false;
+    if (runner->instances != NULL) {
+        int32_t instanceCount = (int32_t) arrlen(runner->instances);
+        repeat(instanceCount, i) {
+            Instance* inst = runner->instances[i];
+            if (inst == NULL || inst->destroyed || !inst->active) continue;
+            if (Runner_is3DSLiveBattleBorderObject(runner, inst)) {
+                if (inst->visible) hasLiveBattleBorder = true;
+            }
+            if (Runner_is3DSValidObjectIndex(runner, inst->objectIndex) &&
+                Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_battlecontroller") &&
+                ((int32_t) Runner_get3DSInstanceRealVar(runner, inst, "drawrect") == 1 ||
+                 (int32_t) Runner_get3DSInstanceRealVar(runner, inst, "drawbinfo") == 1)) {
+                hasActiveBattleController = true;
+            }
+        }
+    }
+
+    runner->n3dsDrawBattleActive = hasLiveBattleBorder && hasActiveBattleController;
+    runner->n3dsDrawDodgingBullets = runner->n3dsDrawBattleActive && (Runner_get3DSGlobalReal(runner, "turntimer") > 0.0);
+    runner->n3dsDrawBattleStateValid = true;
+}
+
+static bool Runner_is3DSLiveBattleBorderObject(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+    if (!Runner_is3DSValidObjectIndex(runner, inst->objectIndex)) return false;
+
+    return Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_uborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_dborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_lborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_rborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_blackborderer");
+}
+
+static bool Runner_is3DSBattleActive(Runner* runner) {
+    if (runner == NULL) return false;
+    if (runner->n3dsDrawBattleStateValid) return runner->n3dsDrawBattleActive;
+    Runner_prepare3DSDrawBattleState(runner);
+    return runner->n3dsDrawBattleActive;
+}
+
+static bool Runner_is3DSValidObjectIndex(Runner* runner, int32_t objectIndex) {
+    return runner != NULL &&
+        runner->dataWin != NULL &&
+        objectIndex >= 0 &&
+        (uint32_t) objectIndex < runner->dataWin->objt.count;
+}
+
+static const char* Runner_get3DSObjectName(Runner* runner, int32_t objectIndex) {
+    if (!Runner_is3DSValidObjectIndex(runner, objectIndex)) return NULL;
+    return runner->dataWin->objt.objects[objectIndex].name;
+}
+
+static bool Runner_objectMatches3DSNameInHierarchy(Runner* runner, int32_t objectIndex, const char* name) {
+    int32_t depth = 0;
+    while (Runner_is3DSValidObjectIndex(runner, objectIndex) && depth < 64) {
+        const char* objectName = Runner_get3DSObjectName(runner, objectIndex);
+        if (objectName != NULL && strcmp(objectName, name) == 0) return true;
+        objectIndex = runner->dataWin->objt.objects[objectIndex].parentId;
+        depth++;
+    }
+    return false;
+}
+
+static bool Runner_objectContains3DSTokenInHierarchy(Runner* runner, int32_t objectIndex, const char* token) {
+    int32_t depth = 0;
+    while (Runner_is3DSValidObjectIndex(runner, objectIndex) && depth < 64) {
+        const char* objectName = Runner_get3DSObjectName(runner, objectIndex);
+        if (Runner_stringContainsToken(objectName, token)) return true;
+        objectIndex = runner->dataWin->objt.objects[objectIndex].parentId;
+        depth++;
+    }
+    return false;
+}
+
+static bool Runner_is3DSInstanceInsideBattleField(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+
+    double left = Runner_get3DSGlobalArrayReal(runner, "idealborder", 0);
+    double right = Runner_get3DSGlobalArrayReal(runner, "idealborder", 1);
+    double top = Runner_get3DSGlobalArrayReal(runner, "idealborder", 2);
+    double bottom = Runner_get3DSGlobalArrayReal(runner, "idealborder", 3);
+    if (right <= left || bottom <= top) return false;
+
+    double marginX = 24.0;
+    double marginY = 24.0;
+    double x = inst->x;
+    double y = inst->y;
+    return x >= left - marginX && x <= right + marginX &&
+        y >= top - marginY && y <= bottom + marginY;
+}
+
+static bool Runner_shouldCull3DSBottomBattleFieldInstance(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+    return false;
+}
+
+static bool Runner_is3DSTopEnemyDialogueObjectIndex(Runner* runner, int32_t objectIndex) {
+    if (!Runner_is3DSValidObjectIndex(runner, objectIndex)) return false;
+
+    return Runner_objectContains3DSTokenInHierarchy(runner, objectIndex, "blcon") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_blconsm") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_blconwdflowey") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_blconwideslave");
+}
+
+static bool Runner_is3DSTopEnemyDialogueObject(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+    return Runner_is3DSTopEnemyDialogueObjectIndex(runner, inst->objectIndex);
+}
+
+static bool Runner_is3DSBattleWriterObjectIndex(Runner* runner, int32_t objectIndex) {
+    if (!Runner_is3DSValidObjectIndex(runner, objectIndex)) return false;
+
+    return Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_writer") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_writer_quiz") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_healwriter") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "OBJ_WRITER") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "OBJ_NOMSCWRITER");
+}
+
+static bool Runner_has3DSTopEnemyDialogue(Runner* runner, Drawable* drawables, int32_t drawableCount) {
+    if (runner == NULL || drawables == NULL || drawableCount <= 0) return false;
+
+    repeat(drawableCount, i) {
+        Drawable* d = &drawables[i];
+        if (d->type != DRAWABLE_INSTANCE) continue;
+
+        Instance* inst = d->instance;
+        if (inst == NULL || !inst->active || !inst->visible) continue;
+        if (Runner_is3DSTopEnemyDialogueObject(runner, inst)) return true;
+    }
+
+    return false;
+}
+
+static bool Runner_is3DSBattleBackdropInstance(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+
+    if (Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_battlebg") ||
+        Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "battlebg") ||
+        Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "gridfriend")) {
+        return true;
+    }
+
+    if (inst->spriteIndex < 0 || (uint32_t) inst->spriteIndex >= runner->dataWin->sprt.count) {
+        return false;
+    }
+
+    Sprite* sprite = &runner->dataWin->sprt.sprites[inst->spriteIndex];
+    const char* spriteName = sprite->name;
+    if (Runner_stringContainsToken(spriteName, "battlebg") ||
+        Runner_stringContainsToken(spriteName, "gridfriend")) {
+        return true;
+    }
+
+    // Treat room-sized battle backdrops as non-enemy scenery so the enemy-only
+    // top-screen offset doesn't drag the whole scene downward.
+    return sprite->width >= 320 || sprite->height >= 240;
+}
+
+static bool Runner_shouldOffset3DSTopBattleInstance(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+    Runner_prepare3DSDrawBattleState(runner);
+    if (!runner->n3dsDrawBattleActive) return false;
+    if (Runner_shouldHideOn3DSTopScreen(runner, inst)) return false;
+    if (Runner_is3DSBattleBackdropInstance(runner, inst)) return false;
+    if (Runner_is3DSTopEnemyDialogueObject(runner, inst)) return false;
+    if (Runner_is3DSBattleWriterObjectIndex(runner, inst->objectIndex)) return false;
+    return true;
+}
+
+static bool Runner_is3DSBattleUIObject(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+    if (!Runner_is3DSValidObjectIndex(runner, inst->objectIndex)) return false;
+    Runner_prepare3DSDrawBattleState(runner);
+    if (!runner->n3dsDrawBattleActive) return false;
+    if (Runner_is3DSTopEnemyDialogueObjectIndex(runner, inst->objectIndex)) return false;
+    if (runner->n3dsDrawHasTopEnemyDialogue && Runner_is3DSBattleWriterObjectIndex(runner, inst->objectIndex)) return false;
+
+    const char* objectName = Runner_get3DSObjectName(runner, inst->objectIndex);
+    if (objectName == NULL) return false;
+
+    if (
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_battlecontroller") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_blackborderer") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_uborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_dborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_lborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_rborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_fightbt") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_itembt") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_sparebt") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_talkbt") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_anybt") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_hpname") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_dbulletcontroller") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_sinefi") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_tensionbar") ||
+        Runner_is3DSBattleWriterObjectIndex(runner, inst->objectIndex)) {
+        return true;
+    }
+
+    if (Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "border") ||
+        Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "bullet") ||
+        Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "heart") ||
+        Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "soul")) {
+        return true;
+    }
+
+    if (inst->spriteIndex >= 0 && (uint32_t) inst->spriteIndex < runner->dataWin->sprt.count) {
+        const char* spriteName = runner->dataWin->sprt.sprites[inst->spriteIndex].name;
+        if (Runner_stringContainsToken(spriteName, "bullet") ||
+            Runner_stringContainsToken(spriteName, "heart") ||
+            Runner_stringContainsToken(spriteName, "soul")) {
+            return true;
+        }
+    }
+
+    if (runner->n3dsDrawDodgingBullets && Runner_is3DSInstanceInsideBattleField(runner, inst)) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool Runner_is3DSBattleFieldObject(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+    if (!Runner_is3DSValidObjectIndex(runner, inst->objectIndex)) return false;
+    Runner_prepare3DSDrawBattleState(runner);
+    if (!runner->n3dsDrawBattleActive) return false;
+    bool isDodgingBullets = runner->n3dsDrawDodgingBullets;
+
+    if ((isDodgingBullets &&
+            Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_battlecontroller")) ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_blackborderer") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_uborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_dborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_lborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_rborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_dbulletcontroller") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_sinefi")) {
+        return true;
+    }
+
+    if (Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "border") ||
+        Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "bullet") ||
+        (isDodgingBullets && (
+            Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "heart") ||
+            Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "soul")))) {
+        return true;
+    }
+
+    if (inst->spriteIndex >= 0 && (uint32_t) inst->spriteIndex < runner->dataWin->sprt.count) {
+        const char* spriteName = runner->dataWin->sprt.sprites[inst->spriteIndex].name;
+        if (Runner_stringContainsToken(spriteName, "bullet") ||
+            (isDodgingBullets && (
+                Runner_stringContainsToken(spriteName, "heart") ||
+                Runner_stringContainsToken(spriteName, "soul")))) {
+            return true;
+        }
+    }
+
+    if (isDodgingBullets && Runner_is3DSInstanceInsideBattleField(runner, inst)) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool Runner_is3DSUndyneBattle(Runner* runner) {
+    if (runner == NULL) return false;
+    Runner_prepare3DSDrawBattleState(runner);
+    if (!runner->n3dsDrawBattleActive) return false;
+    if (runner->instances == NULL) return false;
+
+    int32_t instanceCount = (int32_t) arrlen(runner->instances);
+    repeat(instanceCount, i) {
+        Instance* inst = runner->instances[i];
+        if (inst == NULL || inst->destroyed || !inst->active || !inst->visible) continue;
+        if (!Runner_is3DSValidObjectIndex(runner, inst->objectIndex)) continue;
+        if (Runner_is3DSBattleBackdropInstance(runner, inst)) continue;
+
+        if (Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "undyne")) {
+            return true;
+        }
+
+        if (inst->spriteIndex >= 0 && (uint32_t) inst->spriteIndex < runner->dataWin->sprt.count) {
+            const char* spriteName = runner->dataWin->sprt.sprites[inst->spriteIndex].name;
+            if (Runner_stringContainsToken(spriteName, "undyne")) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static void Runner_prepare3DSBattleReplayLists(Runner* runner, Drawable* drawables, int32_t drawableCount) {
+    if (runner == NULL || runner->n3dsBattleReplayListsValid) return;
+
+    arrsetlen(runner->n3dsBattleFieldInstances, 0);
+    arrsetlen(runner->n3dsBattleUIInstances, 0);
+    Runner_prepare3DSDrawBattleState(runner);
+    if (!runner->n3dsDrawBattleActive) {
+        runner->n3dsBattleReplayListsValid = true;
+        return;
+    }
+    bool hasTopEnemyDialogue = Runner_has3DSTopEnemyDialogue(runner, drawables, drawableCount);
+    runner->n3dsDrawHasTopEnemyDialogue = hasTopEnemyDialogue;
+
+    repeat(drawableCount, i) {
+        Drawable* d = &drawables[i];
+        if (d->type != DRAWABLE_INSTANCE) continue;
+
+        Instance* inst = d->instance;
+        if (inst == NULL || !inst->active || !inst->visible) continue;
+
+        bool isBattleFieldObject = Runner_is3DSBattleFieldObject(runner, inst);
+        bool isBattleUIObject = Runner_is3DSBattleUIObject(runner, inst);
+        if (isBattleFieldObject) arrput(runner->n3dsBattleFieldInstances, inst);
+        if (hasTopEnemyDialogue && Runner_is3DSBattleWriterObjectIndex(runner, inst->objectIndex)) {
+            isBattleUIObject = false;
+        }
+        if (isBattleUIObject && !isBattleFieldObject) arrput(runner->n3dsBattleUIInstances, inst);
+    }
+
+    runner->n3dsBattleReplayListsValid = true;
+}
+
+static int32_t Runner_get3DSGUIResponderCacheIndex(int32_t subtype) {
+    switch (subtype) {
+        case DRAW_GUI_BEGIN: return 0;
+        case DRAW_GUI: return 1;
+        case DRAW_GUI_END: return 2;
+        default: return -1;
+    }
+}
+
+static void Runner_prepare3DSTopScreenGUIInstanceList(Runner* runner, Drawable* drawables, int32_t drawableCount) {
+    if (runner == NULL || runner->n3dsTopScreenGUIListValid) return;
+
+    arrsetlen(runner->n3dsTopScreenGUIInstances, 0);
+    Runner_prepare3DSDrawBattleState(runner);
+    runner->n3dsDrawHasTopEnemyDialogue = Runner_has3DSTopEnemyDialogue(runner, drawables, drawableCount);
+
+    repeat(drawableCount, i) {
+        Drawable* d = &drawables[i];
+        if (d->type != DRAWABLE_INSTANCE) continue;
+
+        Instance* inst = d->instance;
+        if (inst == NULL || !inst->active || !inst->visible) continue;
+        if (runner->n3dsDrawBattleActive && Runner_shouldHideOn3DSTopScreen(runner, inst)) continue;
+        arrput(runner->n3dsTopScreenGUIInstances, inst);
+    }
+
+    runner->n3dsTopScreenGUIListValid = true;
+}
+
+static N3DSResolvedDrawEvent* Runner_prepare3DSTopScreenGUIResponderList(Runner* runner, Drawable* drawables, int32_t drawableCount, int32_t subtype, int32_t slot) {
+    int32_t cacheIndex = Runner_get3DSGUIResponderCacheIndex(subtype);
+    if (runner == NULL || cacheIndex < 0 || slot < 0) return nullptr;
+
+    if (!runner->n3dsTopScreenGUIResponderListsValid[cacheIndex]) {
+        Runner_prepare3DSTopScreenGUIInstanceList(runner, drawables, drawableCount);
+        bool hasTopEnemyDialogue = Runner_has3DSTopEnemyDialogue(runner, drawables, drawableCount);
+        arrsetlen(runner->n3dsTopScreenGUIResponderEvents[cacheIndex], 0);
+
+        int32_t instanceCount = (int32_t) arrlen(runner->n3dsTopScreenGUIInstances);
+        repeat(instanceCount, i) {
+            Instance* inst = runner->n3dsTopScreenGUIInstances[i];
+            if (inst == NULL || !inst->active || !inst->visible) continue;
+            if (runner->n3dsDrawBattleActive &&
+                !Runner_is3DSTopEnemyDialogueObject(runner, inst) &&
+                !(hasTopEnemyDialogue && Runner_is3DSBattleWriterObjectIndex(runner, inst->objectIndex))) {
+                continue;
+            }
+
+            int32_t ownerObjectIndex = -1;
+            int32_t codeId = ResolvedEventTable_lookup(&runner->eventTable, inst->objectIndex, slot, &ownerObjectIndex);
+            if (0 > codeId) continue;
+
+            N3DSResolvedDrawEvent resolvedEvent = {
+                .instance = inst,
+                .codeId = codeId,
+                .ownerObjectIndex = ownerObjectIndex,
+            };
+            arrput(runner->n3dsTopScreenGUIResponderEvents[cacheIndex], resolvedEvent);
+        }
+
+        runner->n3dsTopScreenGUIResponderListsValid[cacheIndex] = true;
+    }
+
+    return runner->n3dsTopScreenGUIResponderEvents[cacheIndex];
+}
+
+static void Runner_draw3DSBottomBattleUI(Runner* runner, Drawable* drawables, int32_t drawableCount, int32_t subtype, bool drawBattleFieldOnly, float scale, float yOffset) {
+    if (runner == NULL || runner->renderer == NULL) return;
+    int32_t slot = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_DRAW, subtype);
+    if (subtype != DRAW_NORMAL && slot < 0) return;
+    Runner_prepare3DSBattleReplayLists(runner, drawables, drawableCount);
+    if (!runner->n3dsDrawBattleActive) return;
+
+    Instance** instances = drawBattleFieldOnly ? runner->n3dsBattleFieldInstances : runner->n3dsBattleUIInstances;
+    int32_t instanceCount = (int32_t) arrlen(instances);
+    if (instanceCount <= 0) return;
+
+    int32_t guiW = runner->guiWidth > 0 ? runner->guiWidth : (int32_t) runner->dataWin->gen8.defaultWindowWidth;
+    int32_t guiH = runner->guiHeight > 0 ? runner->guiHeight : (int32_t) runner->dataWin->gen8.defaultWindowHeight;
+    if (guiW <= 0) guiW = 320;
+    if (guiH <= 0) guiH = 240;
+
+    if (scale == 1.0f && yOffset == 0.0f) {
+        N3DSRenderer_beginBottomScreenGUI(runner->renderer, guiW, guiH);
+    } else {
+        N3DSRenderer_beginBottomScreenGUIEx(runner->renderer, guiW, guiH, scale, scale, 0.0f, yOffset);
+    }
+    repeat(instanceCount, i) {
+        Instance* inst = instances[i];
+        if (inst == NULL || !inst->active || !inst->visible) continue;
+        if (drawBattleFieldOnly && subtype == DRAW_NORMAL && Runner_shouldCull3DSBottomBattleFieldInstance(runner, inst)) {
+            continue;
+        }
+        int32_t ownerObjectIndex = -1;
+        int32_t codeId = slot >= 0
+            ? ResolvedEventTable_lookup(&runner->eventTable, inst->objectIndex, slot, &ownerObjectIndex)
+            : -1;
+        if (codeId >= 0) {
+            Runner_executeResolvedEvent(runner, inst, EVENT_DRAW, subtype, codeId, ownerObjectIndex);
+        } else {
+            if (subtype == DRAW_NORMAL) {
+                Renderer_drawSelf(runner->renderer, inst);
+            }
+        }
+    }
+    N3DSRenderer_endBottomScreenGUI(runner->renderer);
+}
+
+static bool Runner_shouldHideOn3DSTopScreen(Runner* runner, Instance* inst) {
+    if (runner == NULL || runner->renderer == NULL || inst == NULL) return false;
+    return Runner_is3DSBattleUIObject(runner, inst);
+}
+#endif
 
 // ===[ Runtime Layer Teardown Helpers ]===
 void Runner_freeRuntimeLayer(RuntimeLayer* runtimeLayer) {
@@ -23,7 +613,7 @@ void Runner_freeRuntimeLayer(RuntimeLayer* runtimeLayer) {
         runtimeLayer->dynamicName = nullptr;
     }
     size_t elementCount = arrlenu(runtimeLayer->elements);
-    repeat(elementCount, i) {
+    for (size_t i = 0; i < elementCount; i++) {
         RuntimeLayerElement* el = &runtimeLayer->elements[i];
         if (el->backgroundElement != nullptr) {
             free(el->backgroundElement);
@@ -346,6 +936,7 @@ static bool eventUsesBC17PerObjectDispatch(int32_t eventType) {
 void Runner_executeEventForAll(Runner* runner, int32_t eventType, int32_t eventSubtype) {
     int32_t slot = EventSlotMap_lookup(&runner->eventSlotMap, eventType, eventSubtype);
     if (slot == -1) return;
+    bool profileStepNormal = (eventType == EVENT_STEP && eventSubtype == STEP_NORMAL);
 
     // We always snapshot the iteration list before dispatching so instances spawned during this phase do NOT fire the current event.
     Instance** scratch = runner->eventDispatchInstances;
@@ -363,17 +954,27 @@ void Runner_executeEventForAll(Runner* runner, int32_t eventType, int32_t eventS
             Instance** bucket = runner->instancesByExactObject[concreteObj];
             int32_t bucketCount = (int32_t) arrlen(bucket);
             if (bucketCount == 0) continue;
-            size_t base = arrlenu(scratch);
-            arrsetlen(scratch, base + (size_t) bucketCount);
-            memcpy(&scratch[base], bucket, (size_t) bucketCount * sizeof(Instance*));
-        }
-        runner->eventDispatchInstances = scratch; // arrsetlen may have realloced
 
-        int32_t snapshotCount = (int32_t) arrlen(scratch);
-        repeat(snapshotCount, i) {
-            Instance* inst = scratch[i];
-            if (!inst->active) continue;
-            Runner_executeEvent(runner, inst, eventType, eventSubtype);
+            int32_t ownerObjectIndex = -1;
+            int32_t codeId = ResolvedEventTable_lookup(table, concreteObj, slot, &ownerObjectIndex);
+            if (codeId < 0) continue;
+
+            int32_t snapshotBase = (int32_t) arrlen(runner->instanceSnapshots);
+            arrsetlen(runner->instanceSnapshots, snapshotBase + bucketCount);
+            memcpy(&runner->instanceSnapshots[snapshotBase], bucket, (size_t) bucketCount * sizeof(Instance*));
+
+            repeat(bucketCount, j) {
+                Instance* inst = runner->instanceSnapshots[snapshotBase + j];
+                if (!inst->active) continue;
+                double execStartMs = profileStepNormal ? Runner_nowMs() : 0.0;
+                Runner_executeResolvedEvent(runner, inst, eventType, eventSubtype, codeId, ownerObjectIndex);
+                if (profileStepNormal && inst->objectIndex >= 0 && (uint32_t) inst->objectIndex < runner->dataWin->objt.count) {
+                    runner->frameStepObjectMsByObject[inst->objectIndex] += Runner_nowMs() - execStartMs;
+                    runner->frameStepObjectCallsByObject[inst->objectIndex]++;
+                }
+            }
+
+            arrsetlen(runner->instanceSnapshots, snapshotBase);
         }
         return;
     }
@@ -391,7 +992,12 @@ void Runner_executeEventForAll(Runner* runner, int32_t eventType, int32_t eventS
         int32_t ownerObjectIndex = -1;
         int32_t codeId = ResolvedEventTable_lookup(&runner->eventTable, inst->objectIndex, slot, &ownerObjectIndex);
         if (0 > codeId) continue;
+        double execStartMs = profileStepNormal ? Runner_nowMs() : 0.0;
         Runner_executeResolvedEvent(runner, inst, eventType, eventSubtype, codeId, ownerObjectIndex);
+        if (profileStepNormal && inst->objectIndex >= 0 && (uint32_t) inst->objectIndex < runner->dataWin->objt.count) {
+            runner->frameStepObjectMsByObject[inst->objectIndex] += Runner_nowMs() - execStartMs;
+            runner->frameStepObjectCallsByObject[inst->objectIndex]++;
+        }
     }
 }
 
@@ -408,6 +1014,7 @@ void Runner_scrollBackgrounds(Runner* runner) {
 
 void Runner_drawBackgrounds(Runner* runner, bool foreground) {
     if (runner->renderer == nullptr) return;
+    double startMs = Runner_nowMs();
     DataWin* dataWin = runner->dataWin;
     float roomW = (float) runner->currentRoom->width;
     float roomH = (float) runner->currentRoom->height;
@@ -432,7 +1039,9 @@ void Runner_drawBackgrounds(Runner* runner, bool foreground) {
             // Single placement
             runner->renderer->vtable->drawSprite(runner->renderer, tpagIndex, bg->x, bg->y, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0xFFFFFF, bg->alpha);
         }
+        runner->frameDrawBackgrounds++;
     }
+    runner->frameDrawBackgroundMs += Runner_nowMs() - startMs;
 }
 
 // ===[ Draw ]===
@@ -463,6 +1072,34 @@ static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawabl
     int32_t slot = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_DRAW, subtype);
     if (slot == -1) return;
 
+#ifdef __3DS__
+    if ((subtype == DRAW_GUI_BEGIN || subtype == DRAW_GUI || subtype == DRAW_GUI_END) && runner != NULL) {
+        Runner_prepare3DSDrawBattleState(runner);
+        if (runner->n3dsDrawBattleActive) {
+            int32_t guiW = runner->guiWidth > 0 ? runner->guiWidth : (int32_t) runner->dataWin->gen8.defaultWindowWidth;
+            int32_t guiH = runner->guiHeight > 0 ? runner->guiHeight : (int32_t) runner->dataWin->gen8.defaultWindowHeight;
+            if (guiW <= 0) guiW = 320;
+            if (guiH <= 0) guiH = 240;
+            bool useTopEnemyDialogue2x = Runner_has3DSTopEnemyDialogue(runner, drawables, drawableCount);
+            runner->n3dsDrawHasTopEnemyDialogue = useTopEnemyDialogue2x;
+            if (useTopEnemyDialogue2x) N3DSRenderer_beginTopScreenGUI2x(runner->renderer, guiW, guiH);
+            else N3DSRenderer_beginTopScreenGUI(runner->renderer, guiW, guiH);
+
+            N3DSResolvedDrawEvent* responderEvents = Runner_prepare3DSTopScreenGUIResponderList(runner, drawables, drawableCount, subtype, slot);
+            int32_t responderCount = (int32_t) arrlen(responderEvents);
+            repeat(responderCount, i) {
+                N3DSResolvedDrawEvent* resolvedEvent = &responderEvents[i];
+                Instance* inst = resolvedEvent->instance;
+                if (inst == NULL || !inst->active || !inst->visible) continue;
+                Runner_executeResolvedEvent(runner, inst, EVENT_DRAW, subtype, resolvedEvent->codeId, resolvedEvent->ownerObjectIndex);
+            }
+            if (useTopEnemyDialogue2x) N3DSRenderer_endTopScreenGUI2x(runner->renderer);
+            else N3DSRenderer_endTopScreenGUI(runner->renderer);
+            return;
+        }
+    }
+#endif
+
     repeat(drawableCount, i) {
         Drawable* d = &drawables[i];
         if (d->type != DRAWABLE_INSTANCE)
@@ -471,6 +1108,12 @@ static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawabl
         Instance* inst = d->instance;
         if (!inst->active || !inst->visible)
             continue;
+#ifdef __3DS__
+        if ((subtype == DRAW_GUI_BEGIN || subtype == DRAW_GUI || subtype == DRAW_GUI_END) &&
+            Runner_shouldHideOn3DSTopScreen(runner, inst)) {
+            continue;
+        }
+#endif
 
         int32_t ownerObjectIndex = -1;
         int32_t codeId = ResolvedEventTable_lookup(&runner->eventTable, inst->objectIndex, slot, &ownerObjectIndex);
@@ -485,9 +1128,197 @@ static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawabl
 #define GMS2_TILE_FLIP_MASK   0x20000000 // bit 29 (vertical flip)
 #define GMS2_TILE_ROTATE_MASK 0x40000000 // bit 30 (90 CW)
 
-static void Runner_drawTileLayer(Runner* runner, RoomLayerTilesData* data, float layerOffsetX, float layerOffsetY) {
+static void Runner_getCurrentViewBounds(Runner* runner, float* outLeft, float* outTop, float* outRight, float* outBottom) {
+    Room* room = runner->currentRoom;
+    float left = 0.0f;
+    float top = 0.0f;
+    float right = room != nullptr ? (float) room->width : 0.0f;
+    float bottom = room != nullptr ? (float) room->height : 0.0f;
+
+    if (runner != NULL && runner->drawViewBoundsValid) {
+        left = (float) runner->drawViewX;
+        top = (float) runner->drawViewY;
+        right = left + (float) runner->drawViewWidth;
+        bottom = top + (float) runner->drawViewHeight;
+    } else if (room != nullptr && (room->flags & 1) != 0) {
+        int32_t viewIndex = runner->viewCurrent;
+        if (viewIndex >= 0 && viewIndex < MAX_VIEWS) {
+            RuntimeView* view = &runner->views[viewIndex];
+            if (view->enabled) {
+                left = (float) view->viewX;
+                top = (float) view->viewY;
+                right = left + (float) view->viewWidth;
+                bottom = top + (float) view->viewHeight;
+            }
+        }
+    }
+
+    *outLeft = left;
+    *outTop = top;
+    *outRight = right;
+    *outBottom = bottom;
+}
+
+static bool Runner_rectIntersectsCurrentView(Runner* runner, float x, float y, float w, float h) {
+    float viewLeft, viewTop, viewRight, viewBottom;
+    Runner_getCurrentViewBounds(runner, &viewLeft, &viewTop, &viewRight, &viewBottom);
+    return !(x + w <= viewLeft || y + h <= viewTop || x >= viewRight || y >= viewBottom);
+}
+
+static bool Runner_tileIntersectsCurrentView(Runner* runner, RoomTile* tile, float offsetX, float offsetY) {
+    float width = (float) tile->width * fabsf(tile->scaleX);
+    float height = (float) tile->height * fabsf(tile->scaleY);
+    if (width < 1.0f) width = (float) tile->width;
+    if (height < 1.0f) height = (float) tile->height;
+    return Runner_rectIntersectsCurrentView(runner, (float) tile->x + offsetX, (float) tile->y + offsetY, width, height);
+}
+
+static bool Runner_instanceIntersectsCurrentView(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+
+    InstanceBBox bbox = Collision_computeBBox(runner->dataWin, inst);
+    if (!bbox.valid) {
+        return true;
+    }
+
+    return Runner_rectIntersectsCurrentView(
+        runner,
+        (float) bbox.left,
+        (float) bbox.top,
+        (float) (bbox.right - bbox.left),
+        (float) (bbox.bottom - bbox.top)
+    );
+}
+
+static void Runner_freeTileLayerCaches(Runner* runner) {
+    if (runner == NULL || runner->tileLayerCaches == NULL) return;
+
+    repeat(runner->tileLayerCacheCount, i) {
+#ifdef __3DS__
+        if (runner->renderer != NULL && runner->tileLayerCaches[i].n3dsChunkCacheId >= 0) {
+            N3DSRenderer_destroyTileLayerChunkCache(runner->renderer, runner->tileLayerCaches[i].n3dsChunkCacheId);
+            runner->tileLayerCaches[i].n3dsChunkCacheId = -1;
+        }
+#endif
+        free(runner->tileLayerCaches[i].rows);
+        free(runner->tileLayerCaches[i].cells);
+        runner->tileLayerCaches[i].rows = NULL;
+        runner->tileLayerCaches[i].cells = NULL;
+        runner->tileLayerCaches[i].built = false;
+    }
+
+    free(runner->tileLayerCaches);
+    runner->tileLayerCaches = NULL;
+    runner->tileLayerCacheCount = 0;
+}
+
+static void Runner_buildTileLayerCaches(Runner* runner) {
+    if (runner == NULL || runner->currentRoom == NULL) return;
+
+    Runner_freeTileLayerCaches(runner);
+
+    Room* room = runner->currentRoom;
+    if (room->layerCount == 0) return;
+
+#ifdef __3DS__
+    if (runner->osType == OS_3DS && Runner_isOld3DSLike()) {
+        return;
+    }
+#endif
+
+    runner->tileLayerCaches = safeCalloc(room->layerCount, sizeof(TileLayerRenderCache));
+    runner->tileLayerCacheCount = room->layerCount;
+
+    repeat(room->layerCount, i) {
+        RoomLayer* layer = &room->layers[i];
+        if (layer->type != RoomLayerType_Tiles || layer->tilesData == NULL) continue;
+
+        RoomLayerTilesData* data = layer->tilesData;
+        TileLayerRenderCache* cache = &runner->tileLayerCaches[i];
+        cache->backgroundIndex = data->backgroundIndex;
+        cache->n3dsChunkCacheId = -1;
+        cache->tilesX = data->tilesX;
+        cache->tilesY = data->tilesY;
+
+        if (data->tileData == NULL || data->tilesX == 0 || data->tilesY == 0 || data->backgroundIndex < 0 ||
+            (uint32_t) data->backgroundIndex >= runner->dataWin->bgnd.count) {
+            continue;
+        }
+
+        Background* tileset = &runner->dataWin->bgnd.backgrounds[data->backgroundIndex];
+        if (tileset->gms2TileWidth == 0 || tileset->gms2TileHeight == 0 || tileset->gms2TileColumns == 0) {
+            continue;
+        }
+
+        cache->tileWidth = tileset->gms2TileWidth;
+        cache->tileHeight = tileset->gms2TileHeight;
+        cache->rows = safeCalloc(data->tilesY, sizeof(TileLayerCacheRow));
+
+        uint32_t borderX = tileset->gms2OutputBorderX;
+        uint32_t borderY = tileset->gms2OutputBorderY;
+        uint32_t columns = tileset->gms2TileColumns;
+        uint32_t totalNonEmpty = 0;
+        repeat(data->tilesY, ty) {
+            cache->rows[ty].start = totalNonEmpty;
+            repeat(data->tilesX, tx) {
+                uint32_t cell = data->tileData[ty * data->tilesX + tx];
+                uint32_t tileIndex = cell & GMS2_TILE_INDEX_MASK;
+                if (tileIndex == 0) continue;
+
+                uint32_t tileSlot = tileIndex - 1u;
+                uint32_t col = tileSlot % columns;
+                uint32_t row = tileSlot / columns;
+
+                TileLayerCacheCell cachedCell = {
+                    .tileX = tx,
+                    .srcX = col * (cache->tileWidth + 2 * borderX) + borderX,
+                    .srcY = row * (cache->tileHeight + 2 * borderY) + borderY,
+                    .tpagIndex = tileset->tpagIndex,
+                    .n3dsTileEntryIndex = -1,
+                    .mirror = (cell & GMS2_TILE_MIRROR_MASK) != 0,
+                    .flip = (cell & GMS2_TILE_FLIP_MASK) != 0,
+                };
+#ifdef __3DS__
+                if (runner->renderer != NULL) {
+                    cachedCell.n3dsTileEntryIndex = N3DSRenderer_findTileEntryIndex(
+                        runner->renderer,
+                        data->backgroundIndex,
+                        (int32_t) cachedCell.srcX,
+                        (int32_t) cachedCell.srcY,
+                        (int32_t) cache->tileWidth,
+                        (int32_t) cache->tileHeight
+                    );
+                }
+#endif
+                arrput(cache->cells, cachedCell);
+                totalNonEmpty++;
+            }
+            cache->rows[ty].count = totalNonEmpty - cache->rows[ty].start;
+        }
+
+        cache->built = true;
+    }
+}
+
+static uint32_t Runner_findFirstVisibleTileCell(const TileLayerCacheCell* cells, uint32_t count, uint32_t startX) {
+    uint32_t lo = 0;
+    uint32_t hi = count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        if (cells[mid].tileX < startX) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+void Runner_drawTileLayer(Runner* runner, uint32_t layerIndex, RoomLayerTilesData* data, float layerOffsetX, float layerOffsetY, float alpha) {
+    double startMs = Runner_nowMs();
     if (data == nullptr || data->tileData == nullptr) return;
     if (0 > data->backgroundIndex) return;
+    if (layerIndex >= runner->tileLayerCacheCount || runner->tileLayerCaches == NULL) return;
 
     DataWin* dw = runner->dataWin;
     if ((uint32_t) data->backgroundIndex >= dw->bgnd.count) return;
@@ -500,43 +1331,174 @@ static void Runner_drawTileLayer(Runner* runner, RoomLayerTilesData* data, float
 
     uint32_t tileW = tileset->gms2TileWidth;
     uint32_t tileH = tileset->gms2TileHeight;
+
+    static bool rotateWarned = false;
+    TileLayerRenderCache* cache = NULL;
+    bool useCachedPath = layerIndex < runner->tileLayerCacheCount &&
+        runner->tileLayerCaches != NULL;
+    if (useCachedPath) {
+        cache = &runner->tileLayerCaches[layerIndex];
+        useCachedPath = cache->built && cache->cells != NULL && cache->rows != NULL;
+    }
+
+#ifdef __3DS__
+    if (useCachedPath && runner->renderer != NULL && runner->osType == OS_3DS) {
+        if (cache->n3dsChunkCacheId < 0 && runner->currentRoom != NULL) {
+            cache->n3dsChunkCacheId = N3DSRenderer_createTileLayerChunkCache(
+                runner->renderer,
+                runner->currentRoom->width,
+                runner->currentRoom->height,
+                cache
+            );
+        }
+        if (cache->n3dsChunkCacheId >= 0 &&
+            N3DSRenderer_drawTileLayerChunkCache(runner->renderer, cache->n3dsChunkCacheId, layerOffsetX, layerOffsetY, alpha)) {
+            runner->frameDrawTilesMs += Runner_nowMs() - startMs;
+            return;
+        }
+    }
+#endif
+
+    float viewLeft, viewTop, viewRight, viewBottom;
+    Runner_getCurrentViewBounds(runner, &viewLeft, &viewTop, &viewRight, &viewBottom);
+    int32_t startX = (int32_t) floorf((viewLeft - layerOffsetX) / (float) tileW);
+    int32_t startY = (int32_t) floorf((viewTop - layerOffsetY) / (float) tileH);
+    int32_t endX = (int32_t) ceilf((viewRight - layerOffsetX) / (float) tileW);
+    int32_t endY = (int32_t) ceilf((viewBottom - layerOffsetY) / (float) tileH);
+    if (startX < 0) startX = 0;
+    if (startY < 0) startY = 0;
+    if (endX > (int32_t) data->tilesX) endX = (int32_t) data->tilesX;
+    if (endY > (int32_t) data->tilesY) endY = (int32_t) data->tilesY;
+    if (startX >= endX || startY >= endY) return;
+
     uint32_t borderX = tileset->gms2OutputBorderX;
     uint32_t borderY = tileset->gms2OutputBorderY;
     uint32_t columns = tileset->gms2TileColumns;
 
-    static bool rotateWarned = false;
+    for (int32_t ty = startY; ty < endY; ty++) {
+        if (useCachedPath) {
+            TileLayerCacheRow* rowCache = &cache->rows[ty];
+            if (rowCache->count == 0) continue;
 
-    repeat(data->tilesY, ty) {
-        repeat(data->tilesX, tx) {
+            const TileLayerCacheCell* rowCells = &cache->cells[rowCache->start];
+            uint32_t startCell = Runner_findFirstVisibleTileCell(rowCells, rowCache->count, (uint32_t) startX);
+            for (uint32_t ci = startCell; ci < rowCache->count; ci++) {
+                const TileLayerCacheCell* cachedCell = &rowCells[ci];
+                if ((int32_t) cachedCell->tileX >= endX) break;
+
+                uint32_t cell = data->tileData[ty * data->tilesX + cachedCell->tileX];
+                bool rotate = (cell & GMS2_TILE_ROTATE_MASK) != 0;
+
+                if (rotate && !rotateWarned) {
+                    fprintf(stderr, "Runner: WARNING: GMS2 tile layer has rotated tiles; rotation not yet implemented, drawing unrotated\n");
+                    rotateWarned = true;
+                }
+
+                float xscale = cachedCell->mirror ? -1.0f : 1.0f;
+                float yscale = cachedCell->flip ? -1.0f : 1.0f;
+
+                float dstX = (float) (cachedCell->tileX * tileW) + layerOffsetX + (cachedCell->mirror ? (float) tileW : 0.0f);
+                float dstY = (float) (ty * tileH) + layerOffsetY + (cachedCell->flip ? (float) tileH : 0.0f);
+                float tileAlpha = alpha;
+                if (tileAlpha < 0.0f) tileAlpha = 0.0f;
+                if (tileAlpha > 1.0f) tileAlpha = 1.0f;
+                uint32_t alphaByte = (uint32_t) lroundf(tileAlpha * 255.0f);
+#ifdef __3DS__
+                if (runner->renderer != NULL && cachedCell->n3dsTileEntryIndex >= 0) {
+                    if (N3DSRenderer_drawCachedTileEntry(
+                            runner->renderer,
+                            cachedCell->n3dsTileEntryIndex,
+                            dstX,
+                            dstY,
+                            xscale,
+                            yscale,
+                            0x00FFFFFFu,
+                            tileAlpha
+                        )) {
+                        runner->frameDrawTiles++;
+                        continue;
+                    }
+                }
+#endif
+                RoomTile tile = {
+                    .x = (int32_t) lroundf(dstX),
+                    .y = (int32_t) lroundf(dstY),
+                    .useSpriteDefinition = false,
+                    .backgroundDefinition = data->backgroundIndex,
+                    .sourceX = (int32_t) cachedCell->srcX,
+                    .sourceY = (int32_t) cachedCell->srcY,
+                    .width = tileW,
+                    .height = tileH,
+                    .tileDepth = 0,
+                    .instanceID = 0,
+                    .scaleX = xscale,
+                    .scaleY = yscale,
+                    .color = (alphaByte << 24) | 0x00FFFFFFu,
+                };
+                Renderer_drawTile(runner->renderer, &tile, 0.0f, 0.0f);
+                runner->frameDrawTiles++;
+            }
+            continue;
+        }
+
+        for (int32_t tx = startX; tx < endX; tx++) {
             uint32_t cell = data->tileData[ty * data->tilesX + tx];
             uint32_t tileIndex = cell & GMS2_TILE_INDEX_MASK;
-            if (tileIndex == 0) continue; // 0 = empty
+            if (tileIndex == 0) continue;
 
-            uint32_t col = tileIndex % columns;
-            uint32_t row = tileIndex / columns;
-            int32_t srcX = (int32_t) (col * (tileW + 2 * borderX) + borderX);
-            int32_t srcY = (int32_t) (row * (tileH + 2 * borderY) + borderY);
-
-            bool mirror = (cell & GMS2_TILE_MIRROR_MASK) != 0;
-            bool flip = (cell & GMS2_TILE_FLIP_MASK) != 0;
             bool rotate = (cell & GMS2_TILE_ROTATE_MASK) != 0;
-
             if (rotate && !rotateWarned) {
                 fprintf(stderr, "Runner: WARNING: GMS2 tile layer has rotated tiles; rotation not yet implemented, drawing unrotated\n");
                 rotateWarned = true;
             }
 
-            float xscale = mirror ? -1.0f : 1.0f;
-            float yscale = flip ? -1.0f : 1.0f;
+            uint32_t tileSlot = tileIndex - 1u;
+            uint32_t col = tileSlot % columns;
+            uint32_t row = tileSlot / columns;
+            float xscale = (cell & GMS2_TILE_MIRROR_MASK) != 0 ? -1.0f : 1.0f;
+            float yscale = (cell & GMS2_TILE_FLIP_MASK) != 0 ? -1.0f : 1.0f;
+            float dstX = (float) (tx * (int32_t) tileW) + layerOffsetX + (xscale < 0.0f ? (float) tileW : 0.0f);
+            float dstY = (float) (ty * (int32_t) tileH) + layerOffsetY + (yscale < 0.0f ? (float) tileH : 0.0f);
+            float tileAlpha = alpha;
+            if (tileAlpha < 0.0f) tileAlpha = 0.0f;
+            if (tileAlpha > 1.0f) tileAlpha = 1.0f;
+            uint32_t alphaByte = (uint32_t) lroundf(tileAlpha * 255.0f);
 
-            // With negative scale the quad grows in the opposite direction, so shift the
-            // destination by one tile to keep the origin at the top-left of the cell.
-            float dstX = (float) (tx * tileW) + layerOffsetX + (mirror ? (float) tileW : 0.0f);
-            float dstY = (float) (ty * tileH) + layerOffsetY + (flip ? (float) tileH : 0.0f);
-
-            runner->renderer->vtable->drawSpritePart(runner->renderer, tpagIndex, srcX, srcY, (int32_t) tileW, (int32_t) tileH, dstX, dstY, xscale, yscale, 0.0f, 0.0f, 0.0f, 0xFFFFFF, 1.0f);
+            RoomTile tile = {
+                .x = (int32_t) lroundf(dstX),
+                .y = (int32_t) lroundf(dstY),
+                .useSpriteDefinition = false,
+                .backgroundDefinition = data->backgroundIndex,
+                .sourceX = (int32_t) (col * (tileW + 2 * borderX) + borderX),
+                .sourceY = (int32_t) (row * (tileH + 2 * borderY) + borderY),
+                .width = tileW,
+                .height = tileH,
+                .tileDepth = 0,
+                .instanceID = 0,
+                .scaleX = xscale,
+                .scaleY = yscale,
+                .color = (alphaByte << 24) | 0x00FFFFFFu,
+            };
+            Renderer_drawTile(runner->renderer, &tile, 0.0f, 0.0f);
+            runner->frameDrawTiles++;
         }
     }
+    runner->frameDrawTilesMs += Runner_nowMs() - startMs;
+}
+
+void Runner_resetFrameDrawStats(Runner* runner) {
+    if (runner == NULL) return;
+    runner->frameDrawBackgrounds = 0;
+    runner->frameDrawTiles = 0;
+    runner->frameDrawInstances = 0;
+    runner->frameDrawLayerElements = 0;
+    runner->frameDrawBackgroundMs = 0.0;
+    runner->frameDrawTilesMs = 0.0;
+    runner->frameDrawInstancesMs = 0.0;
+    runner->frameDrawLayerMs = 0.0;
+    runner->frameDrawGuiMs = 0.0;
+    runner->frameDrawGuiEventMs = 0.0;
+    runner->frameDrawBattleReplayMs = 0.0;
 }
 
 // Returns true if "drawables" is already in compareDrawableDepth order. Used by the sort-dirty path to skip qsort when small depth perturbations didn't actually cross any neighbor.
@@ -575,21 +1537,24 @@ static void rebuildDrawableCacheIfDirty(Runner* runner) {
         int32_t instanceCount = (int32_t) arrlen(runner->instances);
         repeat(instanceCount, i) {
             Instance* inst = runner->instances[i];
-            Drawable d = { .type = DRAWABLE_INSTANCE, .depth = inst->depth, .instance = inst };
+            Drawable d = { .type = DRAWABLE_INSTANCE, .depth = inst->depth };
+            d.instance = inst;
             arrput(runner->cachedDrawables, d);
         }
 
         if (!DataWin_isVersionAtLeast(runner->dataWin, 2, 0, 0, 0)) {
             repeat(room->tileCount, i) {
                 RoomTile* tile = &room->tiles[i];
-                Drawable d = { .type = DRAWABLE_TILE, .depth = tile->tileDepth, .tileIndex = (int32_t) i };
+                Drawable d = { .type = DRAWABLE_TILE, .depth = tile->tileDepth };
+                d.tileIndex = (int32_t) i;
                 arrput(runner->cachedDrawables, d);
             }
         } else {
             size_t runtimeLayersCount = arrlenu(runner->runtimeLayers);
             repeat(runtimeLayersCount, i) {
                 RuntimeLayer* runtimeLayer = &runner->runtimeLayers[i];
-                Drawable d = { .type = DRAWABLE_LAYER, .depth = runtimeLayer->depth, .runtimeLayer = runtimeLayer };
+                Drawable d = { .type = DRAWABLE_LAYER, .depth = runtimeLayer->depth };
+                d.runtimeLayer = runtimeLayer;
                 arrput(runner->cachedDrawables, d);
             }
         }
@@ -619,20 +1584,93 @@ void Runner_draw(Runner* runner) {
     rebuildDrawableCacheIfDirty(runner);
     int32_t drawableCount = (int32_t) arrlen(runner->cachedDrawables);
     Drawable* drawables = runner->cachedDrawables;
+    int32_t instanceCount = (int32_t) arrlen(runner->instances);
+
+    bool traceDraw = false;
+
+    if (traceDraw) {
+        char buffer[320];
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "runner: draw room=%s idx=%d pendingRoom=%d instances=%d drawables=%d bgColor=%06X drawBg=%d",
+            room != nullptr && room->name != nullptr ? room->name : "<null>",
+            runner->currentRoomIndex,
+            runner->pendingRoom,
+            instanceCount,
+            drawableCount,
+            runner->backgroundColor & 0xFFFFFFu,
+            runner->drawBackgroundColor ? 1 : 0
+        );
+        Runner_platformBootLog(buffer);
+
+        if (drawableCount == 0) {
+            Runner_platformBootLog("runner: no drawables in current room");
+        }
+
+        gRunnerLastLoggedRoomIndex = runner->currentRoomIndex;
+        gRunnerLastLoggedPendingRoom = runner->pendingRoom;
+        gRunnerLastLoggedDrawableCount = drawableCount;
+        gRunnerLastLoggedInstanceCount = instanceCount;
+        gRunnerDrawTraceCount++;
+
+        int32_t traceInstanceCount = instanceCount;
+        if (traceInstanceCount > 4) traceInstanceCount = 4;
+        // repeat(traceInstanceCount, ti) {
+        //     Instance* inst = runner->instances[ti];
+        //     if (inst == nullptr) continue;
+        //     char instBuffer[256];
+        //     const char* objectName =
+        //         (inst->objectIndex >= 0 && (uint32_t) inst->objectIndex < runner->dataWin->objt.count &&
+        //          runner->dataWin->objt.objects[inst->objectIndex].name != nullptr)
+        //         ? runner->dataWin->objt.objects[inst->objectIndex].name
+        //         : "<null>";
+        //     snprintf(
+        //         instBuffer,
+        //         sizeof(instBuffer),
+        //         "runner: inst[%d] id=%u obj=%s sprite=%d visible=%d active=%d depth=%d x=%.1f y=%.1f alarm0=%d alarm1=%d",
+        //         ti,
+        //         inst->instanceId,
+        //         objectName,
+        //         inst->spriteIndex,
+        //         inst->visible ? 1 : 0,
+        //         inst->active ? 1 : 0,
+        //         inst->depth,
+        //         inst->x,
+        //         inst->y,
+        //         inst->alarm[0],
+        //         inst->alarm[1]
+        //     );
+        //     Runner_bootLog(instBuffer);
+        // }
+    }
 
     // Draw non-foreground backgrounds (behind everything)
     if (!DataWin_isVersionAtLeast(runner->dataWin, 2, 0, 0, 0))
         Runner_drawBackgrounds(runner, false);
 
-    // Fire draw subtypes in correct GameMaker order. fireDrawSubtype walks the cache and filters inline.
+// Fire draw subtypes in correct GameMaker order. fireDrawSubtype walks the cache and filters inline.
     fireDrawSubtype(runner, drawables, drawableCount, DRAW_PRE);
     fireDrawSubtype(runner, drawables, drawableCount, DRAW_BEGIN);
+
+#ifdef __3DS__
+    Runner_prepare3DSDrawBattleState(runner);
+    bool n3dsBattleActiveForDraw = runner->n3dsDrawBattleActive;
+    int32_t n3dsTopScreenDrawInstanceCursor = 0;
+    int32_t n3dsTopScreenDrawInstanceCount = 0;
+    if (n3dsBattleActiveForDraw) {
+        Runner_prepare3DSTopScreenGUIInstanceList(runner, drawables, drawableCount);
+        n3dsTopScreenDrawInstanceCount = (int32_t) arrlen(runner->n3dsTopScreenGUIInstances);
+    }
+#endif
+    int32_t drawNormalSlot = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_DRAW, DRAW_NORMAL);
 
     // Draw interleaved tiles and instances
     repeat(drawableCount, i) {
         Drawable* d = &drawables[i];
         if (d->type == DRAWABLE_TILE) {
             if (runner->renderer != nullptr) {
+                double drawStartMs = Runner_nowMs();
                 RoomTile* tile = &room->tiles[d->tileIndex];
                 // Skip tiles whose layer was hidden via tile_layer_hide(). Filtered here (not in the cache) so toggling layer visibility doesn't invalidate.
                 ptrdiff_t layerIdx = hmgeti(runner->tileLayerMap, tile->tileDepth);
@@ -642,6 +1680,7 @@ void Runner_draw(Runner* runner) {
                     offsetX = runner->tileLayerMap[layerIdx].value.offsetX;
                     offsetY = runner->tileLayerMap[layerIdx].value.offsetY;
                 }
+                if (!Runner_tileIntersectsCurrentView(runner, tile, offsetX, offsetY)) continue;
 
 #ifdef ENABLE_VM_TRACING
                 // Trace tile drawing if requested
@@ -670,20 +1709,53 @@ void Runner_draw(Runner* runner) {
 #endif
 
                 Renderer_drawTile(runner->renderer, tile, offsetX, offsetY);
+                runner->frameDrawTiles++;
+                runner->frameDrawTilesMs += Runner_nowMs() - drawStartMs;
             }
         } else if (d->type == DRAWABLE_INSTANCE) {
+            double drawStartMs = Runner_nowMs();
             Instance* inst = d->instance;
             // Filter inactive/invisible instances at draw time so the cache doesn't need invalidation when those flags toggle.
             if (!inst->active || !inst->visible) continue;
+#ifdef __3DS__
+            if (n3dsBattleActiveForDraw) {
+                if (n3dsTopScreenDrawInstanceCursor >= n3dsTopScreenDrawInstanceCount ||
+                    runner->n3dsTopScreenGUIInstances[n3dsTopScreenDrawInstanceCursor] != inst) {
+                    continue;
+                }
+                n3dsTopScreenDrawInstanceCursor++;
+            }
+#endif
             int32_t ownerObjectIndex = -1;
-            int32_t codeId = findEventCodeIdAndOwner(runner, inst->objectIndex, EVENT_DRAW, DRAW_NORMAL, &ownerObjectIndex);
+            int32_t codeId = drawNormalSlot >= 0
+                ? ResolvedEventTable_lookup(&runner->eventTable, inst->objectIndex, drawNormalSlot, &ownerObjectIndex)
+                : -1;
+            if (codeId < 0 && !Runner_instanceIntersectsCurrentView(runner, inst)) continue;
+            bool offsetTopBattleEnemy = false;
+            double savedY = 0.0;
+#ifdef __3DS__
+            if (runner->osType == OS_3DS && n3dsBattleActiveForDraw &&
+                Runner_shouldOffset3DSTopBattleInstance(runner, inst)) {
+                offsetTopBattleEnemy = true;
+                savedY = inst->y;
+                inst->y += k3DSTopBattleEnemyInstanceYOffset;
+            }
+#endif
             if (codeId >= 0) {
                 Runner_executeResolvedEvent(runner, inst, EVENT_DRAW, DRAW_NORMAL, codeId, ownerObjectIndex);
             } else if (runner->renderer != nullptr) {
                 Renderer_drawSelf(runner->renderer, inst);
             }
+#ifdef __3DS__
+            if (offsetTopBattleEnemy) {
+                inst->y = savedY;
+            }
+#endif
+            runner->frameDrawInstances++;
+            runner->frameDrawInstancesMs += Runner_nowMs() - drawStartMs;
         } else if (d->type == DRAWABLE_LAYER)
         {
+            double layerStartMs = Runner_nowMs();
             RuntimeLayer* runtimeLayer = d->runtimeLayer;
             if (runtimeLayer == nullptr || !runtimeLayer->visible) continue;
             float layerOffsetX = runtimeLayer->xOffset;
@@ -707,6 +1779,7 @@ void Runner_draw(Runner* runner) {
                         if (0 > tpagIndex) continue;
                         if (bg->stretch) {
                             TexturePageItem* tpag = &dataWin->tpag.items[tpagIndex];
+                            if (tpag->boundingWidth == 0 || tpag->boundingHeight == 0) continue;
                             float xscale = roomW / (float) tpag->boundingWidth;
                             float yscale = roomH / (float) tpag->boundingHeight;
                             runner->renderer->vtable->drawSprite(runner->renderer, tpagIndex, 0.0f, 0.0f, 0.0f, 0.0f, xscale, yscale, 0.0f, bg->blend, bg->alpha);
@@ -715,14 +1788,37 @@ void Runner_draw(Runner* runner) {
                         } else {
                             runner->renderer->vtable->drawSprite(runner->renderer, tpagIndex, layerOffsetX + bg->xOffset, layerOffsetY + bg->yOffset, 0.0f, 0.0f, bg->xScale, bg->yScale, 0.0f, bg->blend, bg->alpha);
                         }
+                        runner->frameDrawLayerElements++;
                     }
                 }
+                runner->frameDrawLayerMs += Runner_nowMs() - layerStartMs;
                 continue;
             }
 
             // Parsed layer: look up the RoomLayer by ID and render its data-driven content.
             RoomLayer* parsedLayer = Runner_findRoomLayerById(runner, (int32_t) runtimeLayer->id);
             if (parsedLayer == nullptr) continue;
+            if (traceDraw) {
+                // char layerBuffer[256];
+                // uint32_t runtimeElementCount = (uint32_t) arrlenu(runtimeLayer->elements);
+                // uint32_t assetsSpriteCount = (parsedLayer->assetsData != nullptr) ? parsedLayer->assetsData->spriteCount : 0u;
+                // uint32_t assetsTileCount = (parsedLayer->assetsData != nullptr) ? parsedLayer->assetsData->legacyTileCount : 0u;
+                // uint32_t layerInstanceCount = (parsedLayer->instancesData != nullptr) ? parsedLayer->instancesData->instanceCount : 0u;
+                // snprintf(
+                //     layerBuffer,
+                //     sizeof(layerBuffer),
+                //     "runner: layer id=%u type=%u depth=%d visible=%d runtimeEls=%u assetsSprites=%u assetsTiles=%u layerInstances=%u",
+                //     parsedLayer->id,
+                //     parsedLayer->type,
+                //     parsedLayer->depth,
+                //     parsedLayer->visible ? 1 : 0,
+                //     runtimeElementCount,
+                //     assetsSpriteCount,
+                //     assetsTileCount,
+                //     layerInstanceCount
+                // );
+                // Runner_bootLog(layerBuffer);
+            }
             if (parsedLayer->type == RoomLayerType_Assets) {
                 RoomLayerAssetsData* data = parsedLayer->assetsData;
                 repeat(data->legacyTileCount, j) {
@@ -736,6 +1832,7 @@ void Runner_draw(Runner* runner) {
                             offsetX = runner->tileLayerMap[layerIdx].value.offsetX;
                             offsetY = runner->tileLayerMap[layerIdx].value.offsetY;
                         }
+                        if (!Runner_tileIntersectsCurrentView(runner, tile, offsetX, offsetY)) continue;
 
 #ifdef ENABLE_VM_TRACING
                         // Trace tile drawing if requested
@@ -764,6 +1861,9 @@ void Runner_draw(Runner* runner) {
 #endif
 
                         Renderer_drawTile(runner->renderer, tile, offsetX, offsetY);
+                        runner->frameDrawTiles++;
+                        runner->frameDrawTilesMs += Runner_nowMs() - layerStartMs;
+                        layerStartMs = Runner_nowMs();
                     }
                 }
 
@@ -780,6 +1880,7 @@ void Runner_draw(Runner* runner) {
                         spr->x, spr->y, spr->scaleX,
                         spr->scaleY, spr->rotation, spr->color,
                         1.0);
+                    runner->frameDrawLayerElements++;
                 }
             } else if(parsedLayer->type == RoomLayerType_Background) {
                 if (runner->renderer == nullptr) return;
@@ -794,6 +1895,7 @@ void Runner_draw(Runner* runner) {
                         if (data->stretch) {
                             // Stretch to fill room dimensions
                             TexturePageItem* tpag = &dataWin->tpag.items[tpagIndex];
+                            if (tpag->boundingWidth == 0 || tpag->boundingHeight == 0) continue;
                             float xscale = roomW / (float) tpag->boundingWidth;
                             float yscale = roomH / (float) tpag->boundingHeight;
                             runner->renderer->vtable->drawSprite(runner->renderer, tpagIndex, 0.0f, 0.0f, 0.0f, 0.0f, xscale, yscale, 0.0f, 0xFFFFFF, 1.0);
@@ -803,13 +1905,21 @@ void Runner_draw(Runner* runner) {
                             // Single placement
                             runner->renderer->vtable->drawSprite(runner->renderer, tpagIndex, layerOffsetX, layerOffsetY, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0xFFFFFF, 1.0);
                         }
+                        runner->frameDrawBackgroundMs += Runner_nowMs() - layerStartMs;
+                        layerStartMs = Runner_nowMs();
             } else if(parsedLayer->type == RoomLayerType_Instances) {
                 // Instance depth is assigned from layers during room init (initRoom).
                 // Nothing to do here - instances are drawn from the DRAWABLE_INSTANCE path.
             } else if(parsedLayer->type == RoomLayerType_Tiles) {
                 if (runner->renderer == nullptr) continue;
-                Runner_drawTileLayer(runner, parsedLayer->tilesData, layerOffsetX, layerOffsetY);
+                float tileAlpha = 1.0f;
+                ptrdiff_t tileLayerIdx = hmgeti(runner->tileLayerMap, parsedLayer->depth);
+                if (tileLayerIdx >= 0) {
+                    tileAlpha = runner->tileLayerMap[tileLayerIdx].value.alpha;
+                }
+                Runner_drawTileLayer(runner, (uint32_t) i, parsedLayer->tilesData, layerOffsetX, layerOffsetY, tileAlpha);
             }
+            runner->frameDrawLayerMs += Runner_nowMs() - layerStartMs;
         }
     }
 
@@ -819,16 +1929,86 @@ void Runner_draw(Runner* runner) {
     Runner_drawBackgrounds(runner, true);
 
     fireDrawSubtype(runner, drawables, drawableCount, DRAW_POST);
+#ifdef __3DS__
+    if (runner->renderer != NULL) {
+        if (Runner_is3DSBattleActive(runner)) {
+        bool isDodgingBullets = Runner_is3DSDodgingBullets(runner);
+        bool isUndyneBattle = Runner_is3DSUndyneBattle(runner);
+        float battleFieldScale = isDodgingBullets ? (isUndyneBattle ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
+        float battleFieldYOffset = isDodgingBullets ? k3DSBottomBattleFieldYOffset : 0.0f;
+        Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_NORMAL, true, battleFieldScale, battleFieldYOffset);
+        Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_NORMAL, false, 1.0f, 0.0f);
+        }
+    }
+#endif
+    if (traceDraw) {
+        gRunnerDrawTraceCount++;
+    }
+#ifdef __3DS__
+    runner->n3dsTopScreenGUIListValid = false;
+    repeat(3, i) runner->n3dsTopScreenGUIResponderListsValid[i] = false;
+#endif
 }
 
 void Runner_drawGUI(Runner* runner) {
     rebuildDrawableCacheIfDirty(runner);
     Drawable* drawables = runner->cachedDrawables;
     int32_t drawableCount = (int32_t) arrlen(drawables);
+    double phaseStartMs = Runner_nowMs();
 
     fireDrawSubtype(runner, drawables, drawableCount, DRAW_GUI_BEGIN);
+    runner->frameDrawGuiEventMs += Runner_nowMs() - phaseStartMs;
+#ifdef __3DS__
+    if (runner->renderer != NULL) {
+        Runner_prepare3DSDrawBattleState(runner);
+        if (runner->n3dsDrawBattleActive) {
+        double battleReplayStartMs = Runner_nowMs();
+        bool isDodgingBullets = runner->n3dsDrawDodgingBullets;
+        bool isUndyneBattle = Runner_is3DSUndyneBattle(runner);
+        float battleFieldScale = isDodgingBullets ? (isUndyneBattle ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
+        float battleFieldYOffset = isDodgingBullets ? k3DSBottomBattleFieldYOffset : 0.0f;
+        Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI_BEGIN, true, battleFieldScale, battleFieldYOffset);
+        Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI_BEGIN, false, 1.0f, 0.0f);
+        runner->frameDrawBattleReplayMs += Runner_nowMs() - battleReplayStartMs;
+        }
+    }
+#endif
+    phaseStartMs = Runner_nowMs();
     fireDrawSubtype(runner, drawables, drawableCount, DRAW_GUI);
+    runner->frameDrawGuiEventMs += Runner_nowMs() - phaseStartMs;
+#ifdef __3DS__
+    if (runner->renderer != NULL) {
+        Runner_prepare3DSDrawBattleState(runner);
+        if (runner->n3dsDrawBattleActive) {
+        double battleReplayStartMs = Runner_nowMs();
+        bool isDodgingBullets = runner->n3dsDrawDodgingBullets;
+        bool isUndyneBattle = Runner_is3DSUndyneBattle(runner);
+        float battleFieldScale = isDodgingBullets ? (isUndyneBattle ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
+        float battleFieldYOffset = isDodgingBullets ? k3DSBottomBattleFieldYOffset : 0.0f;
+        Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI, true, battleFieldScale, battleFieldYOffset);
+        Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI, false, 1.0f, 0.0f);
+        runner->frameDrawBattleReplayMs += Runner_nowMs() - battleReplayStartMs;
+        }
+    }
+#endif
+    phaseStartMs = Runner_nowMs();
     fireDrawSubtype(runner, drawables, drawableCount, DRAW_GUI_END);
+    runner->frameDrawGuiEventMs += Runner_nowMs() - phaseStartMs;
+#ifdef __3DS__
+    if (runner->renderer != NULL) {
+        Runner_prepare3DSDrawBattleState(runner);
+        if (runner->n3dsDrawBattleActive) {
+        double battleReplayStartMs = Runner_nowMs();
+        bool isDodgingBullets = runner->n3dsDrawDodgingBullets;
+        bool isUndyneBattle = Runner_is3DSUndyneBattle(runner);
+        float battleFieldScale = isDodgingBullets ? (isUndyneBattle ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
+        float battleFieldYOffset = isDodgingBullets ? k3DSBottomBattleFieldYOffset : 0.0f;
+        Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI_END, true, battleFieldScale, battleFieldYOffset);
+        Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI_END, false, 1.0f, 0.0f);
+        runner->frameDrawBattleReplayMs += Runner_nowMs() - battleReplayStartMs;
+        }
+    }
+#endif
 }
 
 void Runner_computeViewDisplayScale(Runner* runner, int32_t gameW, int32_t gameH, float* outScaleX, float* outScaleY) {
@@ -862,6 +2042,12 @@ void Runner_drawViews(Runner* runner, int32_t gameW, int32_t gameH, float displa
     Room* activeRoom = runner->currentRoom;
     bool anyViewRendered = false;
 
+    runner->drawViewBoundsValid = false;
+    runner->n3dsDrawBattleStateValid = false;
+    runner->n3dsBattleReplayListsValid = false;
+    runner->n3dsTopScreenGUIListValid = false;
+    repeat(3, i) runner->n3dsTopScreenGUIResponderListsValid[i] = false;
+
     bool viewsEnabled = (activeRoom->flags & 1) != 0;
 
     if (viewsEnabled) {
@@ -879,7 +2065,18 @@ void Runner_drawViews(Runner* runner, int32_t gameW, int32_t gameH, float displa
             int32_t portH = (int32_t) ((float) view->portHeight * displayScaleY + 0.5f);
             float viewAngle = view->viewAngle;
 
+#ifdef __3DS__
+            Runner_prepare3DSDrawBattleState(runner);
+            bool topBattleViewActive = Runner_is3DSBattleActive(runner);
+            N3DSRenderer_setTopScreenBattleViewActive(renderer, topBattleViewActive);
+#endif
+
             runner->viewCurrent = (int32_t) vi;
+            runner->drawViewBoundsValid = true;
+            runner->drawViewX = viewX;
+            runner->drawViewY = viewY;
+            runner->drawViewWidth = viewW;
+            runner->drawViewHeight = viewH;
             renderer->vtable->beginView(renderer, viewX, viewY, viewW, viewH, portX, portY, portW, portH, viewAngle);
 
             Runner_draw(runner);
@@ -887,11 +2084,16 @@ void Runner_drawViews(Runner* runner, int32_t gameW, int32_t gameH, float displa
             if (debugShowCollisionMasks) DebugOverlay_drawCollisionMasks(runner);
 
             renderer->vtable->endView(renderer);
+#ifdef __3DS__
+            N3DSRenderer_setTopScreenBattleViewActive(renderer, false);
+#endif
 
             int32_t guiW = runner->guiWidth > 0 ? runner->guiWidth : portW;
             int32_t guiH = runner->guiHeight > 0 ? runner->guiHeight : portH;
             renderer->vtable->beginGUI(renderer, guiW, guiH, portX, portY, portW, portH);
+            double guiStartMs = Runner_nowMs();
             Runner_drawGUI(runner);
+            runner->frameDrawGuiMs += Runner_nowMs() - guiStartMs;
             renderer->vtable->endGUI(renderer);
 
             anyViewRendered = true;
@@ -901,21 +2103,45 @@ void Runner_drawViews(Runner* runner, int32_t gameW, int32_t gameH, float displa
     if (!anyViewRendered) {
         // No views enabled: render with default full-screen view
         runner->viewCurrent = 0;
-        renderer->vtable->beginView(renderer, 0, 0, gameW, gameH, 0, 0, gameW, gameH, 0.0f);
+        runner->drawViewBoundsValid = true;
+        runner->drawViewX = 0;
+        runner->drawViewY = 0;
+        runner->drawViewWidth = gameW;
+        runner->drawViewHeight = gameH;
+        int32_t portX = 0;
+        int32_t portY = 0;
+        int32_t portW = gameW;
+        int32_t portH = gameH;
+#ifdef __3DS__
+        Runner_prepare3DSDrawBattleState(runner);
+        bool topBattleViewActive = Runner_is3DSBattleActive(runner);
+        N3DSRenderer_setTopScreenBattleViewActive(renderer, topBattleViewActive);
+#endif
+        renderer->vtable->beginView(renderer, 0, 0, gameW, gameH, portX, portY, portW, portH, 0.0f);
         Runner_draw(runner);
 
         if (debugShowCollisionMasks) DebugOverlay_drawCollisionMasks(runner);
 
         renderer->vtable->endView(renderer);
+#ifdef __3DS__
+        N3DSRenderer_setTopScreenBattleViewActive(renderer, false);
+#endif
 
-        int32_t guiW = runner->guiWidth > 0 ? runner->guiWidth : gameW;
-        int32_t guiH = runner->guiHeight > 0 ? runner->guiHeight : gameH;
-        renderer->vtable->beginGUI(renderer, guiW, guiH, 0, 0, gameW, gameH);
+        int32_t guiW = runner->guiWidth > 0 ? runner->guiWidth : portW;
+        int32_t guiH = runner->guiHeight > 0 ? runner->guiHeight : portH;
+        renderer->vtable->beginGUI(renderer, guiW, guiH, portX, portY, portW, portH);
+        double guiStartMs = Runner_nowMs();
         Runner_drawGUI(runner);
+        runner->frameDrawGuiMs += Runner_nowMs() - guiStartMs;
         renderer->vtable->endGUI(renderer);
     }
 
     // Reset view_current to 0 so non-Draw events (Step, Alarm, Create) see view_current = 0
+    runner->drawViewBoundsValid = false;
+    runner->n3dsDrawBattleStateValid = false;
+    runner->n3dsBattleReplayListsValid = false;
+    runner->n3dsTopScreenGUIListValid = false;
+    repeat(3, i) runner->n3dsTopScreenGUIResponderListsValid[i] = false;
     runner->viewCurrent = 0;
 }
 
@@ -1028,13 +2254,17 @@ static void copyRoomViewToRuntimeView(RoomView* roomView, RuntimeView* runtimeVi
 static void initRoom(Runner* runner, int32_t roomIndex) {
     DataWin* dataWin = runner->dataWin;
     require(roomIndex >= 0 && dataWin->room.count > (uint32_t) roomIndex);
+    double roomStartMs = Runner_nowMs();
+    double phaseStartMs = roomStartMs;
 
     Room* room = &dataWin->room.rooms[roomIndex];
+    fprintf(stderr, "Runner: Initializing room: %s (index %d)\n", room->name, roomIndex);
 
     // Lazy-room load: if the payload wasn't loaded, read it from the data.win file now before anything touches the room's game objects/tiles/layers.
     if (!room->payloadLoaded) {
         DataWin_loadRoomPayload(dataWin, roomIndex);
     }
+    Runner_logTiming("room payload load", phaseStartMs, roomStartMs);
 
     SavedRoomState* savedState = &runner->savedRoomStates[roomIndex];
 
@@ -1042,6 +2272,7 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
     runner->currentRoomIndex = roomIndex;
     // Tile set, runtime layers, and instance list all change when entering a room.
     runner->drawableListStructureDirty = true;
+    Runner_buildTileLayerCaches(runner);
     // It could be the first time we are initializing the grid
     if (runner->spatialGrid != nullptr)
         SpatialGrid_free(runner->spatialGrid);
@@ -1091,6 +2322,17 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
 
         // No Create events, no preCreateCode, no creationCode, no room creation code
         fprintf(stderr, "Runner: Room restored (persistent): %s (room %d) with %d instances\n", room->name, roomIndex, (int) arrlen(runner->instances));
+        phaseStartMs = Runner_nowMs();
+        if (runner->renderer != nullptr && runner->renderer->vtable->prewarmRoom != nullptr) {
+            runner->renderer->vtable->prewarmRoom(runner->renderer, runner);
+        }
+        Runner_logTiming("renderer prewarm (restore)", phaseStartMs, roomStartMs);
+        phaseStartMs = Runner_nowMs();
+        if (runner->audioSystem != nullptr && runner->audioSystem->vtable->prewarmRoom != nullptr) {
+            runner->audioSystem->vtable->prewarmRoom(runner->audioSystem, runner);
+        }
+        Runner_logTiming("audio prewarm (restore)", phaseStartMs, roomStartMs);
+        Runner_logTiming("initRoom persistent total", roomStartMs, roomStartMs);
         return;
     }
 
@@ -1186,6 +2428,7 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
     // (e.g. obj_mainchara reading obj_markerA.x), the target already exists.
 
     // Pass 1: Create all instances without firing events
+    phaseStartMs = Runner_nowMs();
     repeat(room->gameObjectCount, i) {
         RoomGameObject* roomObj = &room->gameObjects[i];
 
@@ -1200,9 +2443,11 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
         inst->imageSpeed = roomObj->imageSpeed;
         inst->imageIndex = (float) roomObj->imageIndex;
     }
+    Runner_logTiming("instance create pass1", phaseStartMs, roomStartMs);
 
     // In GMS2, instances get their depth from their room layer, not the object definition.
     // This must happen before firing Create events so scripts like scr_depth() read the layer depth.
+    phaseStartMs = Runner_nowMs();
     if (DataWin_isVersionAtLeast(runner->dataWin, 2, 0, 0, 0)) {
         repeat(room->layerCount, li) {
             RoomLayer* layer = &room->layers[li];
@@ -1217,12 +2462,14 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
             }
         }
     }
+    Runner_logTiming("layer/depth setup", phaseStartMs, roomStartMs);
 
     // Append persistent instances carried over from the previous room at the tail, so forward event iteration processes the new room's own instances first and the travelers last.
     // We NEED to do this here BEFORE firing the room object's events, to avoid code that relies on persistent instances failing (example: if a object uses instance_number to get the number of instances in the room).
     returnPersistentInstances(runner, carriedPersistent);
 
     // Pass 2: Fire events for newly created instances (in room definition order)
+    phaseStartMs = Runner_nowMs();
     repeat(room->gameObjectCount, i) {
         RoomGameObject* roomObj = &room->gameObjects[i];
 
@@ -1239,8 +2486,10 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
         Runner_executeEvent(runner, inst, EVENT_CREATE, 0);
         executeCode(runner, inst, roomObj->creationCode);
     }
+    Runner_logTiming("instance create pass2", phaseStartMs, roomStartMs);
 
     // Run room creation code
+    phaseStartMs = Runner_nowMs();
     if (room->creationCodeId >= 0 && dataWin->code.count > (uint32_t) room->creationCodeId) {
         // Room creation code runs in global context, the native runner creates a fake/dummy instance for the "self"
         Instance* dummy = Instance_create(0, -1, 0, 0);
@@ -1250,11 +2499,23 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
         runner->vmContext->currentInstance = nullptr;
         Instance_free(dummy);
     }
+    Runner_logTiming("room creation code", phaseStartMs, roomStartMs);
 
     // Mark this room as initialized for persistent room support
     savedState->initialized = true;
 
     fprintf(stderr, "Runner: Room loaded: %s (room %d) with %d instances\n", room->name, roomIndex, (int) arrlen(runner->instances));
+    phaseStartMs = Runner_nowMs();
+    if (runner->renderer != nullptr && runner->renderer->vtable->prewarmRoom != nullptr) {
+        runner->renderer->vtable->prewarmRoom(runner->renderer, runner);
+    }
+    Runner_logTiming("renderer prewarm", phaseStartMs, roomStartMs);
+    phaseStartMs = Runner_nowMs();
+    if (runner->audioSystem != nullptr && runner->audioSystem->vtable->prewarmRoom != nullptr) {
+        runner->audioSystem->vtable->prewarmRoom(runner->audioSystem, runner);
+    }
+    Runner_logTiming("audio prewarm", phaseStartMs, roomStartMs);
+    Runner_logTiming("initRoom total", roomStartMs, roomStartMs);
 }
 
 // Cleans up the runner state, used when freeing the Runner or when restarting the Runner
@@ -1306,6 +2567,7 @@ static void cleanupState(Runner* runner) {
     runner->instancesById = nullptr;
     hmfree(runner->tileLayerMap);
     runner->tileLayerMap = nullptr;
+    Runner_freeTileLayerCaches(runner);
     freeRuntimeLayersArray(&runner->runtimeLayers);
     shfree(runner->disabledObjects);
     runner->disabledObjects = nullptr;
@@ -1341,6 +2603,9 @@ static void cleanupState(Runner* runner) {
     }
     arrfree(runner->mpGridPool);
     runner->mpGridPool = nullptr;
+
+    arrfree(runner->musicInstanceStack);
+    runner->musicInstanceStack = nullptr;
 
     // Free INI state
     if (runner->currentIni != nullptr) {
@@ -1411,6 +2676,7 @@ void Runner_reset(Runner* runner) {
     runner->mpPotAhead = 3.0;
     runner->mpPotOnSpot = true;
     runner->lastMusicInstance = -1;
+    arrsetlen(runner->musicInstanceStack, 0);
 
     arrsetlen(runner->cachedDrawables, 0);
     runner->drawableListStructureDirty = true;
@@ -1467,6 +2733,11 @@ Runner* Runner_create(DataWin* dataWin, VMContext* vm, Renderer* renderer, FileS
     runner->osType = OS_WINDOWS;
     runner->keyboard = RunnerKeyboard_create();
     runner->gamepads = RunnerGamepad_create();
+    runner->frameStepTopObjectIndex = -1;
+    if (dataWin->objt.count > 0) {
+        runner->frameStepObjectMsByObject = safeCalloc(dataWin->objt.count, sizeof(double));
+        runner->frameStepObjectCallsByObject = safeCalloc(dataWin->objt.count, sizeof(uint32_t));
+    }
 
     // Collision compatibility mode is "enabled" for all pre-GM 2022.1 games AND for any post-GM 2022.1 games that have the bit 27 set
     runner->collisionCompatibilityMode = (dataWin->detectedFormat.major == 1) || (((dataWin->optn.info >> 27) & 1) != 0);
@@ -1670,8 +2941,11 @@ void Runner_cleanupDestroyedInstances(Runner* runner) {
 void Runner_initFirstRoom(Runner* runner) {
     DataWin* dataWin = runner->dataWin;
     require(dataWin->gen8.roomOrderCount > 0);
+    double initStartMs = Runner_nowMs();
+    double phaseStartMs = initStartMs;
 
     int32_t firstRoomIndex = dataWin->gen8.roomOrder[0];
+    fprintf(stderr, "Runner: First room index: %d, room count: %u\n", firstRoomIndex, dataWin->room.count);
 
     // Run global init scripts with the global scope instance as "self"
     // In GMS 2.3+ (BC17), GLOB scripts store function declarations on "self" via Pop.v.v
@@ -1685,16 +2959,58 @@ void Runner_initFirstRoom(Runner* runner) {
         }
     }
     runner->vmContext->currentInstance = nullptr;
+    Runner_logTiming("global init scripts", phaseStartMs, initStartMs);
 
     // Initialize the first room
+    phaseStartMs = Runner_nowMs();
     initRoom(runner, firstRoomIndex);
+    Runner_logTiming("initRoom(first)", phaseStartMs, initStartMs);
 
     // Fire Game Start for all instances
+    phaseStartMs = Runner_nowMs();
     Runner_executeEventForAll(runner, EVENT_OTHER, OTHER_GAME_START);
     runner->gameStartFired = true;
+    Runner_logTiming("game start events", phaseStartMs, initStartMs);
 
     // Fire Room Start for all instances
+    phaseStartMs = Runner_nowMs();
     Runner_executeEventForAll(runner, EVENT_OTHER, OTHER_ROOM_START);
+    Runner_logTiming("room start events", phaseStartMs, initStartMs);
+
+    // Handle room_goto (or game_restart) called during Create/GameStart/RoomStart events.
+    // This is common in GMS2 games that use an initializer object to jump to the real first room.
+    // We process room transitions here so the main loop always starts in the correct room,
+    // without running a wasted step on the initializer room first.
+    if (runner->pendingRoom == ROOM_RESTARTGAME) {
+        Runner_logTiming("init pending restart", initStartMs, initStartMs);
+        Runner_reset(runner);
+        Runner_initFirstRoom(runner);
+        return;
+    }
+    if (runner->pendingRoom >= 0) {
+        int32_t newRoomIndex = runner->pendingRoom;
+        runner->pendingRoom = -1;
+        require(dataWin->room.count > (uint32_t) newRoomIndex);
+        fprintf(stderr, "Runner: room_goto called during init, transitioning: %s (room %d) -> %s (room %d)\n",
+            runner->currentRoom->name, runner->currentRoomIndex,
+            dataWin->room.rooms[newRoomIndex].name, newRoomIndex);
+
+        // Fire Room End on the init room's instances before leaving
+        Runner_executeEventForAll(runner, EVENT_OTHER, OTHER_ROOM_END);
+
+        if (runner->dataWin->lazyLoadRooms && runner->currentRoom != nullptr &&
+            !runner->currentRoom->eagerlyLoaded && newRoomIndex != runner->currentRoomIndex) {
+            DataWin_freeRoomPayload(runner->currentRoom);
+        }
+
+        phaseStartMs = Runner_nowMs();
+        initRoom(runner, newRoomIndex);
+        Runner_logTiming("initRoom(pending)", phaseStartMs, initStartMs);
+        phaseStartMs = Runner_nowMs();
+        Runner_executeEventForAll(runner, EVENT_OTHER, OTHER_ROOM_START);
+        Runner_logTiming("room start pending", phaseStartMs, initStartMs);
+    }
+    Runner_logTiming("Runner_initFirstRoom total", initStartMs, initStartMs);
 }
 
 // ===[ Collision Event Dispatch ]===
@@ -2141,6 +3457,20 @@ void Runner_step(Runner* runner) {
     // The snapshot arena is stack-like and every push must be matched with a pop within the same frame. Assert that invariant at the top of each step: a non-zero length here means some site below pushed without popping, and we want a loud failure with the offending length so we can find it instead of silently leaking until the next frame.
     requireMessageFormatted(arrlen(runner->instanceSnapshots) == 0, "instanceSnapshots arena was not fully popped at end of previous frame (length=%td)", arrlen(runner->instanceSnapshots));
 
+    runner->frameStepPrepMs = 0.0;
+    runner->frameStepEventMs = 0.0;
+    runner->frameStepMotionMs = 0.0;
+    runner->frameStepCollisionMs = 0.0;
+    runner->frameStepFinalizeMs = 0.0;
+    runner->frameStepTopObjectMs = 0.0;
+    runner->frameStepTopObjectCalls = 0;
+    runner->frameStepTopObjectIndex = -1;
+    if (runner->frameStepObjectMsByObject != NULL && runner->frameStepObjectCallsByObject != NULL) {
+        memset(runner->frameStepObjectMsByObject, 0, (size_t) runner->dataWin->objt.count * sizeof(double));
+        memset(runner->frameStepObjectCallsByObject, 0, (size_t) runner->dataWin->objt.count * sizeof(uint32_t));
+    }
+    double phaseStartMs = Runner_nowMs();
+
     // Check for gamepad connect/disconnect and fire Async System event
     for (int i = 0; MAX_GAMEPADS > i; i++) {
         GamepadSlot* slot = &runner->gamepads->slots[i];
@@ -2219,8 +3549,10 @@ void Runner_step(Runner* runner) {
         rl->xOffset += rl->hSpeed;
         rl->yOffset += rl->vSpeed;
     }
+    runner->frameStepPrepMs += Runner_nowMs() - phaseStartMs;
 
     // Execute Begin Step for all instances
+    phaseStartMs = Runner_nowMs();
     Runner_executeEventForAll(runner, EVENT_STEP, STEP_BEGIN);
 
     // Dispatch keyboard events
@@ -2299,8 +3631,10 @@ void Runner_step(Runner* runner) {
 
     // Execute Normal Step for all instances
     Runner_executeEventForAll(runner, EVENT_STEP, STEP_NORMAL);
+    runner->frameStepEventMs += Runner_nowMs() - phaseStartMs;
 
     // Apply motion: friction, gravity, then x += hspeed, y += vspeed
+    phaseStartMs = Runner_nowMs();
     int32_t motionCount = (int32_t) arrlen(runner->instances);
     int32_t endOfPathSlot = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_OTHER, OTHER_END_OF_PATH);
     repeat(motionCount, mi) {
@@ -2340,14 +3674,18 @@ void Runner_step(Runner* runner) {
             SpatialGrid_markInstanceAsDirty(runner->spatialGrid, inst);
         }
     }
+    runner->frameStepMotionMs += Runner_nowMs() - phaseStartMs;
 
     // Dispatch outside room events
+    phaseStartMs = Runner_nowMs();
     dispatchOutsideRoomEvents(runner);
 
     // Dispatch collision events
     dispatchCollisionEvents(runner);
+    runner->frameStepCollisionMs += Runner_nowMs() - phaseStartMs;
 
     // Execute End Step for all instances
+    phaseStartMs = Runner_nowMs();
     Runner_executeEventForAll(runner, EVENT_STEP, STEP_END);
 
     // Update view following
@@ -2363,6 +3701,7 @@ void Runner_step(Runner* runner) {
         Runner_reset(runner);
         Runner_initFirstRoom(runner);
         runner->frameCount++;
+        runner->frameStepFinalizeMs += Runner_nowMs() - phaseStartMs;
         return;
     }
 
@@ -2401,6 +3740,18 @@ void Runner_step(Runner* runner) {
 
     Runner_cleanupDestroyedInstances(runner);
     Runner_sweepDeadStructs(runner);
+    runner->frameStepFinalizeMs += Runner_nowMs() - phaseStartMs;
+
+    if (runner->frameStepObjectMsByObject != NULL && runner->frameStepObjectCallsByObject != NULL) {
+        repeat(runner->dataWin->objt.count, i) {
+            double objectMs = runner->frameStepObjectMsByObject[i];
+            if (objectMs > runner->frameStepTopObjectMs) {
+                runner->frameStepTopObjectMs = objectMs;
+                runner->frameStepTopObjectCalls = runner->frameStepObjectCallsByObject[i];
+                runner->frameStepTopObjectIndex = (int32_t) i;
+            }
+        }
+    }
 
     runner->frameCount++;
 }
@@ -2576,6 +3927,28 @@ static void writeRValueJson(JsonWriter* w, RValue val) {
             break;
         }
     }
+}
+
+RunnerTelemetry Runner_collectTelemetry(Runner* runner) {
+    RunnerTelemetry telemetry = {0};
+    if (runner == NULL) return telemetry;
+
+    telemetry.liveInstances = (uint32_t) arrlen(runner->instances);
+    telemetry.liveStructInstances = (uint32_t) arrlen(runner->structInstances);
+
+    telemetry.dsMapSlots = (uint32_t) arrlen(runner->dsMapPool);
+    repeat((int32_t) arrlen(runner->dsMapPool), i) {
+        if (runner->dsMapPool[i] != NULL) telemetry.dsMapLive++;
+    }
+
+    telemetry.dsListSlots = (uint32_t) arrlen(runner->dsListPool);
+    repeat((int32_t) arrlen(runner->dsListPool), i) {
+        DsList* list = &runner->dsListPool[i];
+        if (!list->freed) telemetry.dsListLive++;
+        telemetry.dsListItems += (uint32_t) arrlen(list->items);
+    }
+
+    return telemetry;
 }
 
 char* Runner_dumpStateJson(Runner* runner) {
@@ -2788,6 +4161,21 @@ void Runner_free(Runner* runner) {
     runner->instanceSnapshots = nullptr;
     arrfree(runner->eventDispatchInstances);
     runner->eventDispatchInstances = nullptr;
+    arrfree(runner->n3dsBattleFieldInstances);
+    runner->n3dsBattleFieldInstances = nullptr;
+    arrfree(runner->n3dsBattleUIInstances);
+    runner->n3dsBattleUIInstances = nullptr;
+    arrfree(runner->n3dsTopScreenGUIInstances);
+    runner->n3dsTopScreenGUIInstances = nullptr;
+    repeat(3, i) {
+        arrfree(runner->n3dsTopScreenGUIResponderEvents[i]);
+        runner->n3dsTopScreenGUIResponderEvents[i] = nullptr;
+        runner->n3dsTopScreenGUIResponderListsValid[i] = false;
+    }
+    free(runner->frameStepObjectMsByObject);
+    runner->frameStepObjectMsByObject = nullptr;
+    free(runner->frameStepObjectCallsByObject);
+    runner->frameStepObjectCallsByObject = nullptr;
     ResolvedEventTable_free(&runner->eventTable);
     EventSlotMap_destroy(&runner->eventSlotMap);
     shfree(runner->assetsByName);

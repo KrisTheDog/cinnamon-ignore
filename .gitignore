@@ -3,3 +3,8 @@ build_ps2/
 .gitignore
 .cache
 
+.vscode/tasks.json
+resources/3ds/romfs/audio/
+resources/3ds/romfs/borders/
+resources/3ds/romfs/gfx/
+resources/3ds/romfs/*.bcwav
