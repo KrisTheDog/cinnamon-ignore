@@ -1449,8 +1449,9 @@ static void WiiURenderer_flush(Renderer* base) {
     (void) base;
 }
 
-static int32_t WiiURenderer_createSpriteFromSurface(Renderer* base, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, bool smooth, int32_t xorig, int32_t yorig) {
+static int32_t WiiURenderer_createSpriteFromSurface(Renderer* base, int32_t surfaceID, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, bool smooth, int32_t xorig, int32_t yorig) {
     (void) removeback;
+    (void) surfaceID;
     (void) x;
     (void) y;
     (void) w;

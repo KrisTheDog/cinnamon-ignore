@@ -26,6 +26,9 @@
 #include "file_system.h"
 
 #ifdef __3DS__
+#include <3ds.h>
+#include <3ds/services/mcuhwc.h>
+
 void N3DSRenderer_beginBottomScreenGUI(Renderer* renderer, int32_t guiW, int32_t guiH);
 void N3DSRenderer_endBottomScreenGUI(Renderer* renderer);
 void N3DSRenderer_beginTopScreenGUI(Renderer* renderer, int32_t guiW, int32_t guiH);
@@ -33,12 +36,55 @@ void N3DSRenderer_endTopScreenGUI(Renderer* renderer);
 void N3DSRenderer_beginTopScreenGUI2x(Renderer* renderer, int32_t guiW, int32_t guiH);
 void N3DSRenderer_endTopScreenGUI2x(Renderer* renderer);
 bool N3DSRenderer_isTopScreenGUIActive(Renderer* renderer);
+static void N3DS_setAsrielRainbowInfoLed(Runner* runner);
 #endif
 
 #define MAX_BACKGROUNDS 8
 
 static RValue builtinN3DSRenderTopScreen(VMContext* ctx, RValue* args, int32_t argCount);
 static bool battleDraw_is3DSBattleActive(VMContext* ctx, Runner* runner);
+
+#ifdef __3DS__
+static Result g_n3dsAsrielLedInitRc = 0;
+static Result g_n3dsAsrielLedSetRc = 0;
+static bool g_n3dsAsrielLedTriggered = false;
+static int32_t g_n3dsAsrielLedRoomIndex = -1;
+static bool g_n3dsDisableBottomScreenOverrides = true;
+
+void N3DS_getAsrielLedDebugState(int32_t* outInitRc, int32_t* outSetRc, bool* outTriggered, int32_t* outRoomIndex) {
+    if (outInitRc != NULL) *outInitRc = (int32_t) g_n3dsAsrielLedInitRc;
+    if (outSetRc != NULL) *outSetRc = (int32_t) g_n3dsAsrielLedSetRc;
+    if (outTriggered != NULL) *outTriggered = g_n3dsAsrielLedTriggered;
+    if (outRoomIndex != NULL) *outRoomIndex = g_n3dsAsrielLedRoomIndex;
+}
+
+void N3DS_tryTriggerAsrielLed(Runner* runner) {
+    if (runner == NULL || runner->osType != OS_3DS) return;
+    if (runner->instancesByObject == NULL) return;
+
+    int32_t afinalBodyObject = shget(runner->assetsByName, "obj_afinal_body");
+    if (afinalBodyObject < 0 || (uint32_t) afinalBodyObject >= runner->dataWin->objt.count) return;
+
+    Instance** bucket = runner->instancesByObject[afinalBodyObject];
+    int32_t instanceCount = (int32_t) arrlen(bucket);
+    repeat(instanceCount, i) {
+        Instance* inst = bucket[i];
+        if (inst == NULL || !inst->active || !inst->visible) continue;
+        N3DS_setAsrielRainbowInfoLed(runner);
+        return;
+    }
+}
+#else
+void N3DS_getAsrielLedDebugState(int32_t* outInitRc, int32_t* outSetRc, bool* outTriggered, int32_t* outRoomIndex) {
+    if (outInitRc != NULL) *outInitRc = 0;
+    if (outSetRc != NULL) *outSetRc = 0;
+    if (outTriggered != NULL) *outTriggered = false;
+    if (outRoomIndex != NULL) *outRoomIndex = -1;
+}
+
+void N3DS_tryTriggerAsrielLed(MAYBE_UNUSED Runner* runner) {
+}
+#endif
 
 static int32_t Color_lerp(int32_t col1, int32_t col2, float amount) {
     if (amount < 0.0f) amount = 0.0f;
@@ -2638,6 +2684,10 @@ static RValue builtinN3DSRenderBottomScreen(VMContext* ctx, RValue* args, int32_
         return builtinScriptExecute(ctx, args, argCount);
     }
 
+    if (g_n3dsDisableBottomScreenOverrides) {
+        return RValue_makeUndefined();
+    }
+
     if (!battleDraw_is3DSBattleActive(ctx, runner)) {
         return RValue_makeUndefined();
     }
@@ -3148,6 +3198,124 @@ static RValue builtinBlackBordererDraw(VMContext* ctx, MAYBE_UNUSED RValue* args
     return RValue_makeUndefined();
 }
 
+// Native replacement for gml_Object_obj_lastruins_bg_Step_0.
+static RValue builtinLastruinsBgStep(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = (Runner*) ctx->runner;
+    if (runner == NULL) return RValue_makeUndefined();
+
+    static const float speeds[] = { 0.1f, 0.3f, 0.5f, 0.6f, 1.0f, 1.5f, 2.0f };
+    const int32_t layerCount = (int32_t) (sizeof(speeds) / sizeof(speeds[0]));
+
+    for (int32_t i = 0; i < layerCount && i < MAX_BACKGROUNDS; ++i) {
+        runner->backgrounds[i].x += speeds[i];
+    }
+
+    return RValue_makeUndefined();
+}
+
+#ifdef __3DS__
+static void N3DS_setAsrielRainbowInfoLed(Runner* runner) {
+    if (runner == NULL || runner->osType != OS_3DS) return;
+    static bool sMcuHwcInitialized = false;
+    static const Room* sActiveRoom = NULL;
+
+    if (runner->currentRoom == NULL) {
+        sActiveRoom = NULL;
+        g_n3dsAsrielLedTriggered = false;
+        g_n3dsAsrielLedRoomIndex = -1;
+        return;
+    }
+    g_n3dsAsrielLedRoomIndex = runner->currentRoomIndex;
+    if (sActiveRoom == runner->currentRoom) return;
+
+    static const uint8_t rainbowStops[7][3] = {
+        { 255,   0,   0 },
+        { 255, 255,   0 },
+        {   0, 255,   0 },
+        {   0, 255, 255 },
+        {   0,   0, 255 },
+        { 255,   0, 255 },
+        { 255,   0,   0 },
+    };
+
+    InfoLedPattern pattern;
+    memset(&pattern, 0, sizeof(pattern));
+    pattern.delay = 25;
+    pattern.smoothing = 25;
+    pattern.loopDelay = 0;
+    pattern.blinkSpeed = 0;
+
+    for (int32_t i = 0; i < 32; ++i) {
+        float hue = ((float) i / 32.0f) * 6.0f;
+        int32_t segment = (int32_t) floorf(hue);
+        float t = hue - (float) segment;
+        if (segment < 0) segment = 0;
+        if (segment > 5) {
+            segment = 5;
+            t = 1.0f;
+        }
+
+        pattern.redPattern[i] = (uint8_t) roundf(
+            (float) rainbowStops[segment][0]
+            + ((float) rainbowStops[segment + 1][0] - (float) rainbowStops[segment][0]) * t
+        );
+        pattern.greenPattern[i] = (uint8_t) roundf(
+            (float) rainbowStops[segment][1]
+            + ((float) rainbowStops[segment + 1][1] - (float) rainbowStops[segment][1]) * t
+        );
+        pattern.bluePattern[i] = (uint8_t) roundf(
+            (float) rainbowStops[segment][2]
+            + ((float) rainbowStops[segment + 1][2] - (float) rainbowStops[segment][2]) * t
+        );
+    }
+
+    if (!sMcuHwcInitialized) {
+        Result initRc = mcuHwcInit();
+        g_n3dsAsrielLedInitRc = initRc;
+        if (!R_SUCCEEDED(initRc)) {
+            g_n3dsAsrielLedTriggered = true;
+            g_n3dsAsrielLedRoomIndex = runner->currentRoomIndex;
+            return;
+        }
+        sMcuHwcInitialized = true;
+    } else {
+        g_n3dsAsrielLedInitRc = 0;
+    }
+
+    Result setRc = MCUHWC_SetInfoLedPattern(&pattern);
+    g_n3dsAsrielLedSetRc = setRc;
+    g_n3dsAsrielLedTriggered = true;
+    g_n3dsAsrielLedRoomIndex = runner->currentRoomIndex;
+    if (R_SUCCEEDED(setRc)) {
+        sActiveRoom = runner->currentRoom;
+    }
+}
+#endif
+
+// Native replacement for gml_Object_obj_backgrounder_lastruins_Other_10.
+static RValue builtinBackgrounderLastruinsOther10(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = (Runner*) ctx->runner;
+    if (runner == NULL || runner->currentRoom == NULL) return RValue_makeUndefined();
+
+    static const float scrollSpeeds[] = { 0.1f, 0.3f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f };
+    const int32_t layerCount = (int32_t) (sizeof(scrollSpeeds) / sizeof(scrollSpeeds[0]));
+    const float maxViewX = (float) (runner->currentRoom->width - 320);
+    float viewX = (float) runner->views[0].viewX;
+
+    if (viewX > maxViewX) viewX = maxViewX;
+
+    for (int32_t i = 0; i < layerCount && i < MAX_BACKGROUNDS; ++i) {
+        if (viewX >= 0.0f) {
+            runner->backgrounds[i].x = floorf(viewX - (viewX * scrollSpeeds[i]));
+        }
+        if (viewX >= maxViewX) {
+            runner->backgrounds[i].x = floorf(maxViewX - (maxViewX * scrollSpeeds[i]));
+        }
+    }
+
+    return RValue_makeUndefined();
+}
+
 // ===[ n3ds_render_battle_scene ]===
 static RValue builtinN3DSRenderBattleScene(VMContext* ctx, RValue* args, int32_t argCount) {
     if (argCount < 2) return RValue_makeUndefined();
@@ -3187,6 +3355,10 @@ static RValue builtinN3DSRenderBattleScene(VMContext* ctx, RValue* args, int32_t
         return result;
     }
     if (!battleDraw_is3DSBattleActive(ctx, runner)) {
+        if (callArgs != localBuf) free(callArgs);
+        return RValue_makeUndefined();
+    }
+    if (g_n3dsDisableBottomScreenOverrides) {
         if (callArgs != localBuf) free(callArgs);
         return RValue_makeUndefined();
     }
@@ -6187,6 +6359,18 @@ static RValue builtin_drawSpritePartExt(VMContext* ctx, RValue* args, MAYBE_UNUS
         subimg = (int32_t) ((Instance*) ctx->currentInstance)->imageIndex;
     }
 
+#ifdef __3DS__
+    if (runner->osType == OS_3DS) {
+        int32_t asrielBgSprite = shget(runner->assetsByName, "spr_asrielbg");
+        int32_t afinalBodyObject = shget(runner->assetsByName, "obj_afinal_body");
+        bool isAfinalBodyDraw = ctx->currentInstance != nullptr &&
+            ((Instance*) ctx->currentInstance)->objectIndex == afinalBodyObject;
+        if (spriteIndex == asrielBgSprite || isAfinalBodyDraw) {
+            N3DS_setAsrielRainbowInfoLed(runner);
+        }
+    }
+#endif
+
     Renderer_drawSpritePartExt(runner->renderer, spriteIndex, subimg, left, top, width, height, x, y, xscale, yscale, 0.0f, 0.0f, 0.0f, color, alpha);
     return RValue_makeUndefined();
 }
@@ -8851,8 +9035,9 @@ static RValue builtinDrawTilemap(VMContext* ctx, RValue* args, MAYBE_UNUSED int3
         if (runtimeLayer != nullptr) {
             TileLayerState* layer = getOrCreateTileLayer(runner, runtimeLayer->depth);
             alpha = layer->alpha;
+            uint32_t layerIndex = (uint32_t) (runtimeLayer - runner->runtimeLayers);
+            Runner_drawTileLayer(runner, layerIndex, foundLayer->tilesData, x, y, alpha);
         }
-        Runner_drawTileLayer(runner, foundLayer->tilesData, x, y, alpha);
     }
 
     return RValue_makeUndefined();
@@ -9981,6 +10166,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     // Intercept entire GML event bodies without patching data.win.
     VM_registerCodeOverride(ctx, "gml_Object_obj_battlecontroller_Draw_0", builtinBattleControllerDraw);
     VM_registerCodeOverride(ctx, "gml_Object_obj_blackborderer_Draw_0", builtinBlackBordererDraw);
+    VM_registerCodeOverride(ctx, "gml_Object_obj_lastruins_bg_Step_0", builtinLastruinsBgStep);
+    VM_registerCodeOverride(ctx, "gml_Object_obj_backgrounder_lastruins_Other_10", builtinBackgrounderLastruinsOther10);
 #if IS_BC17_OR_HIGHER_ENABLED
     VM_registerBuiltin(ctx, "method", builtinMethod);
 #endif

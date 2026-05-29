@@ -8,7 +8,7 @@ BasicInfo:
   #RootPath                : $(APP_ROMFS)
 
 TitleInfo:
-  Category                : Base
+  Category                : Application
   UniqueId                : $(APP_UNIQUE_ID)
 
 Option:

@@ -68,20 +68,58 @@ You must have a proper devkitPro Wii U enviroment set up and configured for your
 Configure with the Wii U CMake wrapper and then build:
 
 ```bash
-powerpc-eabi-cmake -S . -B build/wiiu
+powerpc-eabi-cmake -S . -B build/wiiu -DPLATFORM=wiiu -DCMAKE_BUILD_TYPE=Release
 cmake --build build/wiiu
 ```
 
 This produces `Cinnamon.elf`, `Cinnamon.rpx`, and a `.wuhb` bundle in `build/wiiu`.
 
+You can also configure Wii U builds with the toolchain file directly:
+
+```bash
+cmake -S . -B build/wiiu -DPLATFORM=wiiu \
+  -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/WiiU.cmake" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/wiiu
+```
+
+On Windows, build from PowerShell with:
+
+```powershell
+.\build-windows-wiiu.ps1
+```
+
 ## Building for 3DS
 
 You must have a proper devkitPro 3DS environment set up and configured for your platform.
 
-Configure and build it with CMake:
+
+Configure and build it with the devkitPro 3DS toolchain:
 
 ```bash
-cmake -S . -B build/n3ds -DPLATFORM=n3ds -DCMAKE_BUILD_TYPE=Release
+arm-none-eabi-cmake -S . -B build/n3ds -DPLATFORM=n3ds -DCMAKE_BUILD_TYPE=Release
+cmake --build build/n3ds
+```
+
+On Windows, build from PowerShell with:
+
+```powershell
+.\build-windows-n3ds.ps1
+```
+
+
+You can also use the repository Makefile on Linux or from an MSYS2/devkitPro shell on Windows:
+
+```bash
+make 3ds
+```
+
+If you prefer plain CMake, pass the toolchain file explicitly:
+
+```bash
+cmake -S . -B build/n3ds -DPLATFORM=n3ds \
+  -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
+  -DCMAKE_BUILD_TYPE=Release
 cmake --build build/n3ds
 ```
 
@@ -103,8 +141,24 @@ cmake --build build/n3ds-preprocess
 The preprocessor uses:
 
 * `tex3ds` from devkitPro for texture conversion
-* `ffmpeg` for decoding source audio
-* `cwavtool` for producing `.bcwav` files
+* a built-in BCWAV encoder for audio output
+* built-in `stb_vorbis` decoding for Ogg Vorbis audio before encoding
+
+On Linux:
+
+* Ensure `tex3ds` is available (usually `/opt/devkitpro/tools/bin/tex3ds`).
+* Run the built binary directly:
+
+```bash
+build/n3ds-preprocess/n3ds-preprocess /path/to/data.win resources/3ds/romfs
+```
+
+If your tools are not in default locations, pass explicit paths:
+
+```bash
+build/n3ds-preprocess/n3ds-preprocess /path/to/data.win resources/3ds/romfs \
+  --tex3ds /opt/devkitpro/tools/bin/tex3ds
+```
 
 On Windows, running `n3ds-preprocess.exe` with no arguments starts an interactive setup that tries to find Undertale automatically and then writes to your SD card layout.
 
@@ -134,9 +188,13 @@ build/n3ds-preprocess/n3ds-preprocess /path/to/data.win /path/to/SD/3ds/cinnamon
 The preprocessor writes:
 
 * `gfx/atlas.bin` and converted texture pages to `gfx/`
-* fallback sprite, background, and font textures under `gfx/`
-* converted sound effects to `audio/`
+* `gfx/direct_assets.bin`, containing packed direct sprite/background/font `.t3x` data with seek metadata
+* packed sound effects directly in `audio/sound_bank.bin` (no per-SFX `.bcwav` output)
 * streamed music `.bcwav` files at the output root
+
+At runtime, direct textures are loaded from `gfx/direct_assets.bin` when present, with loose-file fallback for overrides/custom files.
+Generated direct sprite/background/font `.t3x` files are removed after packing to keep output size down.
+To reduce SD wear, the preprocessor stages intermediate/unfinalized files in a local temp folder next to the preprocessor executable, then syncs only finalized/changed outputs to your selected destination.
 
 ## Showcase
 

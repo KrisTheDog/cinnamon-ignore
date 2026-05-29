@@ -174,6 +174,8 @@ if(PLATFORM STREQUAL "glfw")
             $<TARGET_FILE_DIR:butterscotch>/gamecontrollerdb.txt
     )
 elseif(PLATFORM STREQUAL "wiiu")
+    add_compile_definitions(USE_FLOAT_REALS)
+    add_compile_definitions(NO_RVALUE_INT64)
     # find_package(SDL2 CONFIG REQUIRED)
     target_sources(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl/image_decoder.c)
     target_compile_definitions(butterscotch PRIVATE BUTTERSCOTCH_WIIU_APP_FOLDER="${BUTTERSCOTCH_WIIU_APP_FOLDER}")
@@ -188,6 +190,14 @@ elseif(PLATFORM STREQUAL "wiiu")
 
     # data.win and bytecode blobs are serialized little-endian, but Wii U's PowerPC CPU is big-endian.
     target_compile_definitions(butterscotch PRIVATE IS_BIG_ENDIAN)
+
+    target_compile_options(butterscotch PRIVATE
+        -O3
+        -ffunction-sections -fdata-sections
+        -fsingle-precision-constant
+        -fomit-frame-pointer
+        -ffast-math
+    )
 
     target_include_directories(butterscotch PRIVATE
         ${CMAKE_SOURCE_DIR}/vendor
@@ -222,6 +232,7 @@ elseif(PLATFORM STREQUAL "wiiu")
         TVSPLASH ${BUTTERSCOTCH_WIIU_TV_SPLASH}
         CONTENT ${CMAKE_SOURCE_DIR}/resources/wiiu/content
     )
+
 elseif(PLATFORM STREQUAL "ps2")
     # The PS2 EE has a single-precision FPU only, so double is software-emulated
     add_compile_definitions(USE_FLOAT_REALS)

@@ -557,6 +557,25 @@ static const char* instanceTypeName(int32_t instanceType) {
     }
 }
 
+// BC16 array accesses sometimes arrive with a stack-supplied scope value that does not
+// match the instruction's fixed target scope. When that happens on fixed-scope globals
+// like global.msg[0] += "...", trusting the stacked value can redirect the read/write
+// into an arbitrary object bucket and crash on 3DS. Prefer the instruction scope for
+// fixed BC16 scopes and leave BC17's dynamic-stack semantics untouched.
+static int32_t normalizeFixedArrayScope(MAYBE_UNUSED VMContext* ctx, int32_t originalInstanceType, int32_t resolvedInstanceType, bool hasStackScope) {
+    if (!hasStackScope || IS_BC17_OR_HIGHER(ctx)) return resolvedInstanceType;
+
+    switch (originalInstanceType) {
+        case INSTANCE_GLOBAL:
+        case INSTANCE_LOCAL:
+        case INSTANCE_SELF:
+        case INSTANCE_OTHER:
+            return originalInstanceType;
+        default:
+            return resolvedInstanceType;
+    }
+}
+
 // Returns the object name for an instance, or "<global_scope>" for the global scope dummy instance
 static const char* instanceObjectName(VMContext* ctx, Instance* inst) {
     if (0 > inst->objectIndex) return "<global_scope>";
@@ -667,6 +686,7 @@ static RValue resolveVariableRead(VMContext* ctx, int32_t instanceType, uint32_t
     int32_t originalInstanceType = instanceType;
     if (access.hasInstanceType) {
         instanceType = access.instanceType;
+        instanceType = normalizeFixedArrayScope(ctx, originalInstanceType, instanceType, true);
     }
 
     // BC17+: Push.v/Pop.v with instrInstanceType == -9 (STACKTOP) and VARTYPE_NORMAL means
@@ -1015,6 +1035,7 @@ static void resolveVariableWrite(VMContext* ctx, int32_t instanceType, uint32_t 
     int32_t originalInstanceType = instanceType;
     if (access.hasInstanceType) {
         instanceType = access.instanceType;
+        instanceType = normalizeFixedArrayScope(ctx, originalInstanceType, instanceType, true);
     }
 
     // BC17+: Pop.v with instrInstanceType == -9 (STACKTOP) and VARTYPE_NORMAL means
@@ -1462,6 +1483,8 @@ static void handlePop(VMContext* ctx, uint32_t instr, uint8_t type1, uint8_t typ
                 instanceType = resolveInstanceStackTop(ctx);
             }
 
+            instanceType = normalizeFixedArrayScope(ctx, originalInstanceType, instanceType, true);
+
             val = stackPop(ctx);
         } else {
             // Compound assignment (Pop.i.v, etc.): stack bottom-to-top = [(realInstance,) instanceType, arrayIndex, value]
@@ -1474,6 +1497,8 @@ static void handlePop(VMContext* ctx, uint32_t instr, uint8_t type1, uint8_t typ
             if (IS_BC17_OR_HIGHER(ctx) && instanceType == INSTANCE_STACKTOP) {
                 instanceType = resolveInstanceStackTop(ctx);
             }
+
+            instanceType = normalizeFixedArrayScope(ctx, originalInstanceType, instanceType, true);
         }
     } else if (varType == VARTYPE_STACKTOP && type1 == GML_TYPE_VARIABLE) {
         // Simple assignment (Pop.v.v) with STACKTOP: stack bottom-to-top = [value, instanceType]

@@ -32,6 +32,7 @@ void N3DSRenderer_endTopScreenGUI(Renderer* renderer);
 void N3DSRenderer_beginTopScreenGUI2x(Renderer* renderer, int32_t guiW, int32_t guiH);
 void N3DSRenderer_endTopScreenGUI2x(Renderer* renderer);
 bool N3DSRenderer_isTopScreenGUIActive(Renderer* renderer);
+bool N3DSRenderer_isTopScreenBattleViewActive(Renderer* renderer);
 void N3DSRenderer_setTopScreenBattleViewActive(Renderer* renderer, bool active);
 int32_t N3DSRenderer_findTileEntryIndex(Renderer* renderer, int32_t backgroundIndex, int32_t srcX, int32_t srcY, int32_t srcW, int32_t srcH);
 bool N3DSRenderer_drawCachedTileEntry(Renderer* renderer, int32_t tileEntryIndex, float drawX, float drawY, float xscale, float yscale, uint32_t color, float alpha);
@@ -108,10 +109,13 @@ static bool Runner_stringContainsToken(const char* haystack, const char* needle)
 
 static bool Runner_is3DSValidObjectIndex(Runner* runner, int32_t objectIndex);
 static bool Runner_objectMatches3DSNameInHierarchy(Runner* runner, int32_t objectIndex, const char* name);
+static bool Runner_objectContains3DSTokenInHierarchy(Runner* runner, int32_t objectIndex, const char* needle);
 static bool Runner_is3DSLiveBattleBorderObject(Runner* runner, Instance* inst);
 static bool Runner_shouldHideOn3DSTopScreen(Runner* runner, Instance* inst);
 static bool Runner_is3DSBattleBackdropInstance(Runner* runner, Instance* inst);
 static bool Runner_shouldOffset3DSTopBattleInstance(Runner* runner, Instance* inst);
+static bool Runner_is3DSBattleFieldObject(Runner* runner, Instance* inst);
+static bool Runner_is3DSAsrielBattle(Runner* runner);
 static bool Runner_is3DSUndyneBattle(Runner* runner);
 
 static RValue Runner_get3DSGlobal(Runner* runner, const char* name) {
@@ -161,6 +165,7 @@ static void Runner_prepare3DSDrawBattleState(Runner* runner) {
     if (runner == NULL || runner->n3dsDrawBattleStateValid) return;
 
     runner->n3dsDrawHasTopEnemyDialogue = false;
+    runner->n3dsDrawAsrielBattle = false;
     bool hasLiveBattleBorder = false;
     bool hasActiveBattleController = false;
     if (runner->instances != NULL) {
@@ -170,6 +175,18 @@ static void Runner_prepare3DSDrawBattleState(Runner* runner) {
             if (inst == NULL || inst->destroyed || !inst->active) continue;
             if (Runner_is3DSLiveBattleBorderObject(runner, inst)) {
                 if (inst->visible) hasLiveBattleBorder = true;
+            }
+            if (inst->visible &&
+                Runner_is3DSValidObjectIndex(runner, inst->objectIndex) &&
+                !Runner_is3DSBattleBackdropInstance(runner, inst)) {
+                if (Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "asriel")) {
+                    runner->n3dsDrawAsrielBattle = true;
+                } else if (inst->spriteIndex >= 0 && (uint32_t) inst->spriteIndex < runner->dataWin->sprt.count) {
+                    const char* spriteName = runner->dataWin->sprt.sprites[inst->spriteIndex].name;
+                    if (Runner_stringContainsToken(spriteName, "asriel")) {
+                        runner->n3dsDrawAsrielBattle = true;
+                    }
+                }
             }
             if (Runner_is3DSValidObjectIndex(runner, inst->objectIndex) &&
                 Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_battlecontroller") &&
@@ -248,10 +265,26 @@ static bool Runner_is3DSInstanceInsideBattleField(Runner* runner, Instance* inst
 
     double marginX = 24.0;
     double marginY = 24.0;
+    double expandedLeft = left - marginX;
+    double expandedRight = right + marginX;
+    double expandedTop = top - marginY;
+    double expandedBottom = bottom + marginY;
+
+    InstanceBBox bbox = Collision_computeBBox(runner->dataWin, inst);
+    if (bbox.valid) {
+        double overlapLeft = fmax((double) bbox.left, expandedLeft);
+        double overlapRight = fmin((double) bbox.right, expandedRight);
+        double overlapTop = fmax((double) bbox.top, expandedTop);
+        double overlapBottom = fmin((double) bbox.bottom, expandedBottom);
+        if ((overlapRight - overlapLeft) > 4.0 && (overlapBottom - overlapTop) > 4.0) {
+            return true;
+        }
+    }
+
     double x = inst->x;
     double y = inst->y;
-    return x >= left - marginX && x <= right + marginX &&
-        y >= top - marginY && y <= bottom + marginY;
+    return x >= expandedLeft && x <= expandedRight &&
+        y >= expandedTop && y <= expandedBottom;
 }
 
 static bool Runner_shouldCull3DSBottomBattleFieldInstance(Runner* runner, Instance* inst) {
@@ -327,6 +360,7 @@ static bool Runner_shouldOffset3DSTopBattleInstance(Runner* runner, Instance* in
     if (runner == NULL || inst == NULL) return false;
     Runner_prepare3DSDrawBattleState(runner);
     if (!runner->n3dsDrawBattleActive) return false;
+    if (Runner_is3DSAsrielBattle(runner)) return false;
     if (Runner_shouldHideOn3DSTopScreen(runner, inst)) return false;
     if (Runner_is3DSBattleBackdropInstance(runner, inst)) return false;
     if (Runner_is3DSTopEnemyDialogueObject(runner, inst)) return false;
@@ -432,6 +466,39 @@ static bool Runner_is3DSBattleFieldObject(Runner* runner, Instance* inst) {
     return false;
 }
 
+static bool Runner_is3DSBattleFieldBackLayerObject(Runner* runner, Instance* inst) {
+    if (runner == NULL || inst == NULL) return false;
+    if (!Runner_is3DSValidObjectIndex(runner, inst->objectIndex)) return false;
+
+    if (Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_battlecontroller") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_blackborderer") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_uborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_dborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_lborder") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_rborder")) {
+        return true;
+    }
+
+    if (Runner_objectContains3DSTokenInHierarchy(runner, inst->objectIndex, "border")) {
+        return true;
+    }
+
+    if (inst->spriteIndex >= 0 && (uint32_t) inst->spriteIndex < runner->dataWin->sprt.count) {
+        const char* spriteName = runner->dataWin->sprt.sprites[inst->spriteIndex].name;
+        if (Runner_stringContainsToken(spriteName, "border")) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool Runner_is3DSAsrielBattle(Runner* runner) {
+    if (runner == NULL) return false;
+    Runner_prepare3DSDrawBattleState(runner);
+    return runner->n3dsDrawBattleActive && runner->n3dsDrawAsrielBattle;
+}
+
 static bool Runner_is3DSUndyneBattle(Runner* runner) {
     if (runner == NULL) return false;
     Runner_prepare3DSDrawBattleState(runner);
@@ -480,9 +547,24 @@ static void Runner_prepare3DSBattleReplayLists(Runner* runner, Drawable* drawabl
         Instance* inst = d->instance;
         if (inst == NULL || !inst->active || !inst->visible) continue;
 
+        if (Runner_is3DSBattleFieldObject(runner, inst) &&
+            Runner_is3DSBattleFieldBackLayerObject(runner, inst)) {
+            arrput(runner->n3dsBattleFieldInstances, inst);
+        }
+    }
+
+    repeat(drawableCount, i) {
+        Drawable* d = &drawables[i];
+        if (d->type != DRAWABLE_INSTANCE) continue;
+
+        Instance* inst = d->instance;
+        if (inst == NULL || !inst->active || !inst->visible) continue;
+
         bool isBattleFieldObject = Runner_is3DSBattleFieldObject(runner, inst);
         bool isBattleUIObject = Runner_is3DSBattleUIObject(runner, inst);
-        if (isBattleFieldObject) arrput(runner->n3dsBattleFieldInstances, inst);
+        if (isBattleFieldObject && !Runner_is3DSBattleFieldBackLayerObject(runner, inst)) {
+            arrput(runner->n3dsBattleFieldInstances, inst);
+        }
         if (hasTopEnemyDialogue && Runner_is3DSBattleWriterObjectIndex(runner, inst->objectIndex)) {
             isBattleUIObject = false;
         }
@@ -562,9 +644,9 @@ static void Runner_draw3DSBottomBattleUI(Runner* runner, Drawable* drawables, in
     if (runner == NULL || runner->renderer == NULL) return;
     int32_t slot = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_DRAW, subtype);
     if (subtype != DRAW_NORMAL && slot < 0) return;
+    if (Runner_is3DSAsrielBattle(runner)) return;
     Runner_prepare3DSBattleReplayLists(runner, drawables, drawableCount);
     if (!runner->n3dsDrawBattleActive) return;
-
     Instance** instances = drawBattleFieldOnly ? runner->n3dsBattleFieldInstances : runner->n3dsBattleUIInstances;
     int32_t instanceCount = (int32_t) arrlen(instances);
     if (instanceCount <= 0) return;
@@ -602,6 +684,7 @@ static void Runner_draw3DSBottomBattleUI(Runner* runner, Drawable* drawables, in
 
 static bool Runner_shouldHideOn3DSTopScreen(Runner* runner, Instance* inst) {
     if (runner == NULL || runner->renderer == NULL || inst == NULL) return false;
+    if (Runner_is3DSAsrielBattle(runner)) return false;
     return Runner_is3DSBattleUIObject(runner, inst);
 }
 #endif
@@ -1933,9 +2016,10 @@ void Runner_draw(Runner* runner) {
     if (runner->renderer != NULL) {
         if (Runner_is3DSBattleActive(runner)) {
         bool isDodgingBullets = Runner_is3DSDodgingBullets(runner);
+        bool isAsrielBattle = Runner_is3DSAsrielBattle(runner);
         bool isUndyneBattle = Runner_is3DSUndyneBattle(runner);
-        float battleFieldScale = isDodgingBullets ? (isUndyneBattle ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
-        float battleFieldYOffset = isDodgingBullets ? k3DSBottomBattleFieldYOffset : 0.0f;
+        float battleFieldScale = isDodgingBullets ? ((isUndyneBattle || isAsrielBattle) ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
+        float battleFieldYOffset = isDodgingBullets ? (isAsrielBattle ? 0.0f : k3DSBottomBattleFieldYOffset) : 0.0f;
         Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_NORMAL, true, battleFieldScale, battleFieldYOffset);
         Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_NORMAL, false, 1.0f, 0.0f);
         }
@@ -1964,9 +2048,10 @@ void Runner_drawGUI(Runner* runner) {
         if (runner->n3dsDrawBattleActive) {
         double battleReplayStartMs = Runner_nowMs();
         bool isDodgingBullets = runner->n3dsDrawDodgingBullets;
+        bool isAsrielBattle = Runner_is3DSAsrielBattle(runner);
         bool isUndyneBattle = Runner_is3DSUndyneBattle(runner);
-        float battleFieldScale = isDodgingBullets ? (isUndyneBattle ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
-        float battleFieldYOffset = isDodgingBullets ? k3DSBottomBattleFieldYOffset : 0.0f;
+        float battleFieldScale = isDodgingBullets ? ((isUndyneBattle || isAsrielBattle) ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
+        float battleFieldYOffset = isDodgingBullets ? (isAsrielBattle ? 0.0f : k3DSBottomBattleFieldYOffset) : 0.0f;
         Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI_BEGIN, true, battleFieldScale, battleFieldYOffset);
         Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI_BEGIN, false, 1.0f, 0.0f);
         runner->frameDrawBattleReplayMs += Runner_nowMs() - battleReplayStartMs;
@@ -1982,9 +2067,10 @@ void Runner_drawGUI(Runner* runner) {
         if (runner->n3dsDrawBattleActive) {
         double battleReplayStartMs = Runner_nowMs();
         bool isDodgingBullets = runner->n3dsDrawDodgingBullets;
+        bool isAsrielBattle = Runner_is3DSAsrielBattle(runner);
         bool isUndyneBattle = Runner_is3DSUndyneBattle(runner);
-        float battleFieldScale = isDodgingBullets ? (isUndyneBattle ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
-        float battleFieldYOffset = isDodgingBullets ? k3DSBottomBattleFieldYOffset : 0.0f;
+        float battleFieldScale = isDodgingBullets ? ((isUndyneBattle || isAsrielBattle) ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
+        float battleFieldYOffset = isDodgingBullets ? (isAsrielBattle ? 0.0f : k3DSBottomBattleFieldYOffset) : 0.0f;
         Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI, true, battleFieldScale, battleFieldYOffset);
         Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI, false, 1.0f, 0.0f);
         runner->frameDrawBattleReplayMs += Runner_nowMs() - battleReplayStartMs;
@@ -2000,9 +2086,10 @@ void Runner_drawGUI(Runner* runner) {
         if (runner->n3dsDrawBattleActive) {
         double battleReplayStartMs = Runner_nowMs();
         bool isDodgingBullets = runner->n3dsDrawDodgingBullets;
+        bool isAsrielBattle = Runner_is3DSAsrielBattle(runner);
         bool isUndyneBattle = Runner_is3DSUndyneBattle(runner);
-        float battleFieldScale = isDodgingBullets ? (isUndyneBattle ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
-        float battleFieldYOffset = isDodgingBullets ? k3DSBottomBattleFieldYOffset : 0.0f;
+        float battleFieldScale = isDodgingBullets ? ((isUndyneBattle || isAsrielBattle) ? 1.0f : k3DSBottomBattleFieldScale) : 1.0f;
+        float battleFieldYOffset = isDodgingBullets ? (isAsrielBattle ? 0.0f : k3DSBottomBattleFieldYOffset) : 0.0f;
         Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI_END, true, battleFieldScale, battleFieldYOffset);
         Runner_draw3DSBottomBattleUI(runner, drawables, drawableCount, DRAW_GUI_END, false, 1.0f, 0.0f);
         runner->frameDrawBattleReplayMs += Runner_nowMs() - battleReplayStartMs;

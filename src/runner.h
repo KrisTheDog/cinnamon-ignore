@@ -475,6 +475,7 @@ typedef struct Runner {
     bool n3dsDrawBattleStateValid;
     bool n3dsDrawBattleActive;
     bool n3dsDrawDodgingBullets;
+    bool n3dsDrawAsrielBattle;
     bool n3dsDrawHasTopEnemyDialogue;
     bool n3dsBattleReplayListsValid;
     bool n3dsTopScreenGUIListValid;

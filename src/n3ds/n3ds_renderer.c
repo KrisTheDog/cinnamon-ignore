@@ -31,11 +31,17 @@
 #define N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS 5u
 #define N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT 6u
 #define N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT 7u
+#define N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED 8u
+#define N3DS_DIRECT_ASSET_MAGIC 0x3152444Eu /* NDR1 */
+#define N3DS_DIRECT_ASSET_VERSION 1u
+#define N3DS_DIRECT_ASSET_ENTRY_SIZE 16u
 #define N3DS_TOP_WIDTH 400
 #define N3DS_TOP_HEIGHT 240
 #define N3DS_BOTTOM_WIDTH 320
 #define N3DS_BOTTOM_HEIGHT 240
+#define N3DS_SDMC_ASSET_BASE "sdmc:/3ds/cinnamon/gfx"
 #define N3DS_ROMFS_ASSET_BASE "romfs:/gfx"
+#define N3DS_RENDERER_FILE_BUFFER_SIZE (32u * 1024u)
 #define N3DS_TILE_LAYER_CHUNK_SIZE 256u
 #define N3DS_MAX_RESIDENT_ATLAS_PAGES_OLD3DS 16u
 #define N3DS_MAX_RESIDENT_ATLAS_PAGES_NEW3DS 32u
@@ -45,10 +51,14 @@
 #define N3DS_PREWARM_GPU_PAGE_BUDGET_NEW3DS 32u
 #define N3DS_PREWARM_GPU_PAGE_BUDGET_OLD3DS_ETC1A4 20u
 #define N3DS_PREWARM_GPU_PAGE_BUDGET_NEW3DS_ETC1A4 48u
+#define N3DS_PREWARM_BLOB_BYTES_OLD3DS (8u * 1024u * 1024u)
+#define N3DS_PREWARM_BLOB_BYTES_NEW3DS (12u * 1024u * 1024u)
 #define N3DS_RESIDENT_ATLAS_VRAM_BUDGET_OLD3DS (2560u * 1024u)
 #define N3DS_RESIDENT_ATLAS_VRAM_BUDGET_NEW3DS (5120u * 1024u)
 #define N3DS_MAX_CACHED_T3X_BYTES_OLD3DS (16u * 1024u * 1024u)
 #define N3DS_MAX_CACHED_T3X_BYTES_NEW3DS (24u * 1024u * 1024u)
+#define N3DS_MAX_CACHED_DIRECT_T3X_BYTES_OLD3DS (4u * 1024u * 1024u)
+#define N3DS_MAX_CACHED_DIRECT_T3X_BYTES_NEW3DS (8u * 1024u * 1024u)
 #define N3DS_DIRECT_ASSET_VRAM_BUDGET_OLD3DS (1024u * 1024u)
 #define N3DS_DIRECT_ASSET_VRAM_BUDGET_NEW3DS (3072u * 1024u)
 // battle screen offset
@@ -130,6 +140,9 @@ typedef struct {
 typedef struct {
     C2D_SpriteSheet sheet;
     C2D_Image image;
+    uint8_t* blobData;
+    uint32_t blobSize;
+    uint32_t blobLastUsedStamp;
     bool ready;
     bool failed;
     bool pinned;
@@ -210,6 +223,21 @@ typedef struct {
 } N3DSCachedTextLayout;
 
 typedef struct {
+    char* key;
+    char* value;
+} N3DSResolvedAssetPathEntry;
+
+typedef struct {
+    uint32_t dataOffset;
+    uint32_t dataSize;
+} N3DSPackedDirectAssetEntry;
+
+typedef struct {
+    char* key;
+    N3DSPackedDirectAssetEntry value;
+} N3DSPackedDirectAssetMapEntry;
+
+typedef struct {
     Renderer base;
     C3D_RenderTarget* topTarget;
     C3D_RenderTarget* bottomTarget;
@@ -260,12 +288,16 @@ typedef struct {
     uint32_t residentAtlasPageLimit;
     uint32_t residentAtlasVRAMLimitBytes;
     uint32_t directAssetUseCounter;
+    uint32_t directBlobUseCounter;
     uint32_t residentDirectAssetVRAMBytes;
     uint32_t residentDirectAssetVRAMLimitBytes;
     uint32_t prewarmGpuPageBudget;
     uint32_t cachedT3xByteLimit;
     uint32_t cachedT3xBytes;
+    uint32_t cachedDirectT3xByteLimit;
+    uint32_t cachedDirectT3xBytes;
     uint32_t frameBlobReads;
+    uint32_t frameDirectBlobReads;
     uint32_t framePageImports;
     uint32_t frameImportFailures;
     uint32_t frameImportEvictions;
@@ -277,6 +309,8 @@ typedef struct {
     uint32_t frameTextureSwitches;
     uint32_t frameTextGlyphDraws;
     uint32_t frameTextTenthsMs;
+    bool atlasLoaded;
+    char startupError[160];
     int32_t lastDirectTPAGIndex;
     C2D_Image* lastDirectTPAGImage;
     uint32_t perfWindowFrames;
@@ -290,8 +324,12 @@ typedef struct {
     uint32_t frameSequence;
     const Room* lastPrewarmedRoom;
     N3DSCachedTextLayout cachedTextLayout;
+    N3DSResolvedAssetPathEntry* resolvedAssetPathCache;
+    N3DSPackedDirectAssetMapEntry* packedDirectAssetMap;
     uint8_t* atlasTraceMask;
     FILE* atlasTraceFile;
+    FILE* packedAtlasFile;
+    FILE* packedDirectAssetFile;
     bool bottomScreenGuiActive;
     bool topScreenGuiActive;
     bool topScreenGui2xActive;
@@ -329,6 +367,10 @@ static bool N3DSRenderer_getPageIndexForTPAG(N3DSRenderer* renderer, int32_t tpa
 static N3DSTileAtlasEntry* N3DSRenderer_findTileEntryByKey(N3DSRenderer* renderer, int32_t backgroundIndex, int32_t srcX, int32_t srcY, int32_t srcW, int32_t srcH, uint32_t* outEntryIndex);
 static N3DSTileAtlasEntry* N3DSRenderer_findTileEntry(N3DSRenderer* renderer, RoomTile* tile);
 static void N3DSRenderer_prewarmPage(N3DSRenderer* renderer, bool* seenPages, uint32_t pageIndex);
+static bool N3DSRenderer_prewarmPageBlobOnly(N3DSRenderer* renderer, bool* seenPages, uint32_t pageIndex, uint32_t* remainingBlobBytes);
+static void N3DSRenderer_prewarmTPAGBlobOnly(N3DSRenderer* renderer, bool* seenPages, int32_t tpagIndex, uint32_t* remainingBlobBytes);
+static void N3DSRenderer_prewarmTileEntryBlobOnly(N3DSRenderer* renderer, bool* seenPages, const N3DSTileAtlasEntry* entry, uint32_t* remainingBlobBytes);
+static void N3DSRenderer_prewarmRoomBlobCache(N3DSRenderer* renderer, Runner* runner);
 static void N3DSRenderer_preloadFontPages(N3DSRenderer* renderer);
 static bool N3DSRenderer_ensurePageBlobLoaded(N3DSRenderer* renderer, uint32_t pageIndex);
 static void N3DSRenderer_prewarmDirectSpriteFrames(N3DSRenderer* renderer, int32_t spriteIndex);
@@ -338,10 +380,14 @@ static void N3DSRenderer_appendCachedTextLayoutSuffix(N3DSCachedTextLayout* layo
 static const N3DSCachedTextLayout* N3DSRenderer_getCachedTextLayout(N3DSRenderer* renderer, Font* font, int32_t fontIndex, const char* text);
 static bool N3DSRenderer_drawPackedTileEntry(Renderer* base, N3DSRenderer* renderer, const N3DSTileAtlasEntry* tileEntry, float drawX, float drawY, float xscale, float yscale, uint32_t color, float alpha);
 static bool N3DSRenderer_isFragmentedAtlasVersion(uint16_t atlasVersion);
+static bool N3DSRenderer_isPackedAtlasVersion(uint16_t atlasVersion);
 static const char* N3DSRenderer_getTextureFormatName(uint32_t textureFormat);
 static void N3DSRenderer_sceneBeginTarget(N3DSRenderer* renderer, uint8_t targetKind, bool force);
 static void N3DSRenderer_freeTileLayerChunkCache(N3DSTileLayerChunkCache* cache);
 static void N3DSRenderer_freeDirectTextureAsset(N3DSDirectTextureAsset* asset, N3DSRenderer* renderer);
+static void N3DSRenderer_unloadDirectTextureBlob(N3DSDirectTextureAsset* asset, N3DSRenderer* renderer);
+static bool N3DSRenderer_evictLRUDirectAsset(N3DSRenderer* renderer, const N3DSDirectTextureAsset* excludeAsset);
+static bool N3DSRenderer_evictLRUDirectAssetBlob(N3DSRenderer* renderer, const N3DSDirectTextureAsset* excludeAsset);
 static void N3DSRenderer_buildDirectAssetMaps(N3DSRenderer* renderer);
 static bool N3DSRenderer_tryDrawDirectMappedSprite(Renderer* base, int32_t tpagIndex, float x, float y, float originX, float originY, float xscale, float yscale, float angleDeg, uint32_t color, float alpha);
 static bool N3DSRenderer_tryResolveDirectFontImage(N3DSRenderer* renderer, int32_t fontIndex, C2D_Image* outImage, Tex3DS_SubTexture* outSubtex);
@@ -349,7 +395,8 @@ static void N3DSRenderer_drawImage(Renderer* base, C2D_Image* image, float local
 static void N3DSRenderer_getActiveTargetSize(const N3DSRenderer* renderer, float* outW, float* outH);
 static bool N3DSRenderer_isScreenRectOffscreen(const N3DSRenderer* renderer, float x, float y, float w, float h);
 static bool N3DSRenderer_isScreenRotatedRectOffscreen(const N3DSRenderer* renderer, float x, float y, float w, float h, float angleDeg);
-static bool N3DSRenderer_tpagHasDirectMapping(const N3DSRenderer* renderer, int32_t tpagIndex);
+static bool N3DSRenderer_loadPackedDirectAssets(N3DSRenderer* renderer);
+static bool N3DSRenderer_tryLoadPackedDirectTextureBlob(N3DSRenderer* renderer, N3DSDirectTextureAsset* asset, const char* relativePath);
 
 enum {
     N3DS_TRACE_KIND_SPRITE = 1u << 0,
@@ -491,7 +538,12 @@ static bool N3DSRenderer_isFragmentedAtlasVersion(uint16_t atlasVersion) {
         atlasVersion == N3DS_ATLAS_VERSION_FRAGMENTED_TILES ||
         atlasVersion == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS ||
         atlasVersion == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT ||
-        atlasVersion == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT;
+        atlasVersion == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT ||
+        atlasVersion == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED;
+}
+
+static bool N3DSRenderer_isPackedAtlasVersion(uint16_t atlasVersion) {
+    return atlasVersion == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED;
 }
 
 static double N3DSRenderer_ticksToMs(u64 ticks) {
@@ -702,6 +754,19 @@ static void N3DSRenderer_freeDirectTextureAsset(N3DSDirectTextureAsset* asset, N
     asset->lastUsedFrame = 0;
 }
 
+static void N3DSRenderer_unloadDirectTextureBlob(N3DSDirectTextureAsset* asset, N3DSRenderer* renderer) {
+    if (asset == NULL || asset->blobData == NULL) return;
+
+    free(asset->blobData);
+    asset->blobData = NULL;
+    if (renderer != NULL) {
+        if (renderer->cachedDirectT3xBytes >= asset->blobSize) renderer->cachedDirectT3xBytes -= asset->blobSize;
+        else renderer->cachedDirectT3xBytes = 0;
+    }
+    asset->blobSize = 0;
+    asset->blobLastUsedStamp = 0;
+}
+
 static void N3DSRenderer_buildSheetFrameImages(N3DSDirectSpriteAsset* spriteAsset) {
     if (spriteAsset == NULL) return;
     if (spriteAsset->sheetAsset.sheet == NULL || spriteAsset->sheetFrameCount == 0) return;
@@ -732,6 +797,30 @@ static void N3DSRenderer_clearDirectAssetPins(N3DSRenderer* renderer) {
 
     repeat(renderer->directFontAssetCount, fontIndex) {
         renderer->directFontAssets[fontIndex].pinned = false;
+    }
+}
+
+static void N3DSRenderer_flushRoomDirectAssets(N3DSRenderer* renderer) {
+    if (renderer == NULL) return;
+
+    repeat(renderer->directSpriteAssetCount, spriteIndex) {
+        N3DSDirectSpriteAsset* spriteAsset = &renderer->directSpriteAssets[spriteIndex];
+        if (!spriteAsset->sheetAsset.pinned) {
+            N3DSRenderer_freeDirectTextureAsset(&spriteAsset->sheetAsset, renderer);
+            N3DSRenderer_unloadDirectTextureBlob(&spriteAsset->sheetAsset, renderer);
+        }
+
+        repeat(spriteAsset->frameCount, frameIndex) {
+            N3DSDirectTextureAsset* frameAsset = &spriteAsset->frameAssets[frameIndex];
+            if (frameAsset->pinned) continue;
+            N3DSRenderer_freeDirectTextureAsset(frameAsset, renderer);
+            N3DSRenderer_unloadDirectTextureBlob(frameAsset, renderer);
+        }
+    }
+
+    repeat(renderer->directBackgroundAssetCount, bgIndex) {
+        N3DSRenderer_freeDirectTextureAsset(&renderer->directBackgroundAssets[bgIndex], renderer);
+        N3DSRenderer_unloadDirectTextureBlob(&renderer->directBackgroundAssets[bgIndex], renderer);
     }
 }
 
@@ -801,15 +890,209 @@ static bool N3DS_pathExists(const char* path) {
     return path != NULL && stat(path, &st) == 0;
 }
 
-static FILE* N3DSRenderer_openAssetFile(const char* relativePath, char* resolvedPath, size_t resolvedPathSize) {
+static void N3DSRenderer_configureFileBuffer(FILE* file) {
+    if (file == NULL) return;
+    setvbuf(file, NULL, _IOFBF, N3DS_RENDERER_FILE_BUFFER_SIZE);
+}
+
+static char* N3DSRenderer_getCachedAssetPath(N3DSRenderer* renderer, const char* relativePath) {
+    if (renderer == NULL || relativePath == NULL) return NULL;
+    ptrdiff_t idx = shgeti(renderer->resolvedAssetPathCache, relativePath);
+    if (idx < 0) return NULL;
+    return safeStrdup(renderer->resolvedAssetPathCache[idx].value);
+}
+
+static void N3DSRenderer_setCachedAssetPath(N3DSRenderer* renderer, const char* relativePath, const char* resolvedPath) {
+    if (renderer == NULL || relativePath == NULL || resolvedPath == NULL) return;
+    ptrdiff_t idx = shgeti(renderer->resolvedAssetPathCache, relativePath);
+    if (idx >= 0) {
+        free(renderer->resolvedAssetPathCache[idx].value);
+        renderer->resolvedAssetPathCache[idx].value = safeStrdup(resolvedPath);
+        return;
+    }
+
+    shput(renderer->resolvedAssetPathCache, relativePath, safeStrdup(resolvedPath));
+}
+
+static void N3DSRenderer_setStartupError(N3DSRenderer* renderer, const char* message) {
+    if (renderer == NULL) return;
+    snprintf(
+        renderer->startupError,
+        sizeof(renderer->startupError),
+        "%s",
+        message != NULL ? message : "Unknown 3DS renderer startup error"
+    );
+}
+
+static bool N3DSRenderer_resolveAssetPath(N3DSRenderer* renderer, const char* relativePath, char* resolvedPath, size_t resolvedPathSize) {
+    if (relativePath == NULL || resolvedPath == NULL || resolvedPathSize == 0) return false;
+
+    char* cachedPath = N3DSRenderer_getCachedAssetPath(renderer, relativePath);
+    if (cachedPath != NULL) {
+        snprintf(resolvedPath, resolvedPathSize, "%s", cachedPath);
+        free(cachedPath);
+        return true;
+    }
+
     snprintf(resolvedPath, resolvedPathSize, "%s/%s", N3DS_ROMFS_ASSET_BASE, relativePath);
     if (N3DS_pathExists(resolvedPath)) {
-        FILE* file = fopen(resolvedPath, "rb");
-        if (file != NULL) return file;
+        N3DSRenderer_setCachedAssetPath(renderer, relativePath, resolvedPath);
+        return true;
+    }
+
+    snprintf(resolvedPath, resolvedPathSize, "%s/%s", N3DS_SDMC_ASSET_BASE, relativePath);
+    if (N3DS_pathExists(resolvedPath)) {
+        N3DSRenderer_setCachedAssetPath(renderer, relativePath, resolvedPath);
+        return true;
     }
 
     resolvedPath[0] = '\0';
-    return NULL;
+    return false;
+}
+
+static FILE* N3DSRenderer_openAssetFile(N3DSRenderer* renderer, const char* relativePath, char* resolvedPath, size_t resolvedPathSize) {
+    if (!N3DSRenderer_resolveAssetPath(renderer, relativePath, resolvedPath, resolvedPathSize)) return NULL;
+    FILE* file = fopen(resolvedPath, "rb");
+    N3DSRenderer_configureFileBuffer(file);
+    return file;
+}
+
+static bool N3DSRenderer_loadPackedDirectAssets(N3DSRenderer* renderer) {
+    if (renderer == NULL) return false;
+    if (renderer->packedDirectAssetFile != NULL) return true;
+
+    char resolvedPath[512];
+    FILE* file = N3DSRenderer_openAssetFile(renderer, "direct_assets.bin", resolvedPath, sizeof(resolvedPath));
+    if (file == NULL) return false;
+
+    uint8_t header[16];
+    if (fread(header, 1, sizeof(header), file) != sizeof(header)) {
+        fclose(file);
+        return false;
+    }
+
+    uint32_t magic = N3DS_readU32(header + 0);
+    uint32_t version = N3DS_readU32(header + 4);
+    uint32_t entryCount = N3DS_readU32(header + 8);
+    uint32_t stringTableSize = N3DS_readU32(header + 12);
+    if (magic != N3DS_DIRECT_ASSET_MAGIC || version != N3DS_DIRECT_ASSET_VERSION) {
+        fclose(file);
+        return false;
+    }
+    if (entryCount > (UINT32_MAX / N3DS_DIRECT_ASSET_ENTRY_SIZE)) {
+        fclose(file);
+        return false;
+    }
+
+    uint32_t entryTableSize = entryCount * N3DS_DIRECT_ASSET_ENTRY_SIZE;
+    uint64_t metadataSize64 = 16u + (uint64_t) entryTableSize + (uint64_t) stringTableSize;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return false;
+    }
+    long fileSizeLong = ftell(file);
+    if (fileSizeLong <= 0 || metadataSize64 > (uint64_t) fileSizeLong) {
+        fclose(file);
+        return false;
+    }
+    uint32_t fileSize = (uint32_t) fileSizeLong;
+    if (fseek(file, 16, SEEK_SET) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    uint8_t* entryTable = safeMalloc(entryTableSize > 0 ? (size_t) entryTableSize : 1u);
+    uint8_t* stringTable = safeMalloc(stringTableSize > 0 ? (size_t) stringTableSize : 1u);
+    bool ok = true;
+    if (entryTableSize > 0) {
+        ok = fread(entryTable, 1, (size_t) entryTableSize, file) == (size_t) entryTableSize;
+    }
+    if (ok && stringTableSize > 0) {
+        ok = fread(stringTable, 1, (size_t) stringTableSize, file) == (size_t) stringTableSize;
+    }
+    if (!ok) {
+        free(entryTable);
+        free(stringTable);
+        fclose(file);
+        return false;
+    }
+
+    if (renderer->packedDirectAssetMap != NULL) {
+        shfree(renderer->packedDirectAssetMap);
+        renderer->packedDirectAssetMap = NULL;
+    }
+    sh_new_strdup(renderer->packedDirectAssetMap);
+
+    repeat(entryCount, i) {
+        const uint8_t* row = entryTable + ((size_t) i * N3DS_DIRECT_ASSET_ENTRY_SIZE);
+        uint32_t pathOffset = N3DS_readU32(row + 0);
+        uint32_t dataOffset = N3DS_readU32(row + 4);
+        uint32_t dataSize = N3DS_readU32(row + 8);
+        if (pathOffset >= stringTableSize || dataOffset > fileSize || dataSize > fileSize || dataOffset + dataSize > fileSize) {
+            ok = false;
+            break;
+        }
+
+        const char* path = (const char*) (stringTable + pathOffset);
+        size_t remaining = (size_t) (stringTableSize - pathOffset);
+        if (memchr(path, '\0', remaining) == NULL) {
+            ok = false;
+            break;
+        }
+
+        N3DSPackedDirectAssetEntry entry = {
+            .dataOffset = dataOffset,
+            .dataSize = dataSize,
+        };
+        shput(renderer->packedDirectAssetMap, path, entry);
+    }
+
+    free(entryTable);
+    free(stringTable);
+    if (!ok) {
+        shfree(renderer->packedDirectAssetMap);
+        renderer->packedDirectAssetMap = NULL;
+        fclose(file);
+        return false;
+    }
+
+    renderer->packedDirectAssetFile = file;
+    fprintf(stderr, "N3DS: loaded packed direct texture blob (%u entries)\n", (unsigned int) entryCount);
+    return true;
+}
+
+static bool N3DSRenderer_tryLoadPackedDirectTextureBlob(N3DSRenderer* renderer, N3DSDirectTextureAsset* asset, const char* relativePath) {
+    if (renderer == NULL || asset == NULL || relativePath == NULL) return false;
+    if (renderer->packedDirectAssetFile == NULL || renderer->packedDirectAssetMap == NULL) return false;
+
+    ptrdiff_t mapIndex = shgeti(renderer->packedDirectAssetMap, relativePath);
+    if (mapIndex < 0) return false;
+
+    N3DSPackedDirectAssetEntry entry = renderer->packedDirectAssetMap[mapIndex].value;
+    if (entry.dataSize == 0) return false;
+
+    while (renderer->cachedDirectT3xBytes + entry.dataSize > renderer->cachedDirectT3xByteLimit) {
+        if (!N3DSRenderer_evictLRUDirectAssetBlob(renderer, asset)) break;
+    }
+
+    uint8_t* blobData = safeMalloc((size_t) entry.dataSize);
+    if (blobData == NULL) return false;
+
+    if (fseek(renderer->packedDirectAssetFile, (long) entry.dataOffset, SEEK_SET) != 0) {
+        free(blobData);
+        return false;
+    }
+    if (fread(blobData, 1, (size_t) entry.dataSize, renderer->packedDirectAssetFile) != (size_t) entry.dataSize) {
+        free(blobData);
+        return false;
+    }
+
+    asset->blobData = blobData;
+    asset->blobSize = entry.dataSize;
+    asset->blobLastUsedStamp = ++renderer->directBlobUseCounter;
+    renderer->cachedDirectT3xBytes += entry.dataSize;
+    renderer->frameDirectBlobReads++;
+    return true;
 }
 
 static void N3DSRenderer_unloadPage(N3DSRenderer* renderer, uint32_t pageIndex) {
@@ -893,34 +1176,58 @@ static bool N3DSRenderer_ensurePageBlobLoaded(N3DSRenderer* renderer, uint32_t p
         return true;
     }
 
+    FILE* pageFile = NULL;
+    uint32_t size = 0;
+    uint32_t dataOffset = 0;
+    bool usingPackedAtlas = false;
     char assetPath[256];
     char pageName[32];
-    const char* extension = page->textureFormat == N3DS_TEXFMT_INDEXED8 ? "i8" : "t3x";
-    snprintf(pageName, sizeof(pageName), "page_%03lu.%s", (unsigned long) pageIndex, extension);
-    FILE* t3xFile = N3DSRenderer_openAssetFile(pageName, assetPath, sizeof(assetPath));
-    if (t3xFile == NULL) {
-        fprintf(stderr, "N3DS: missing %s\n", pageName);
-        return false;
-    }
 
-    fseek(t3xFile, 0, SEEK_END);
-    long t3xSize = ftell(t3xFile);
-    fseek(t3xFile, 0, SEEK_SET);
-    if (t3xSize <= 0) {
-        fclose(t3xFile);
-        fprintf(stderr, "N3DS: empty %s\n", assetPath);
-        return false;
-    }
+    if (N3DSRenderer_isPackedAtlasVersion(renderer->atlasVersion) &&
+        renderer->packedAtlasFile != NULL &&
+        page->dataSize > 0) {
+        pageFile = renderer->packedAtlasFile;
+        size = page->dataSize;
+        dataOffset = page->dataOffset;
+        usingPackedAtlas = true;
+    } else {
+        const char* extension = page->textureFormat == N3DS_TEXFMT_INDEXED8 ? "i8" : "t3x";
+        snprintf(pageName, sizeof(pageName), "page_%03lu.%s", (unsigned long) pageIndex, extension);
+        pageFile = N3DSRenderer_openAssetFile(renderer, pageName, assetPath, sizeof(assetPath));
+        if (pageFile == NULL) {
+            fprintf(stderr, "N3DS: missing %s\n", pageName);
+            return false;
+        }
 
-    uint32_t size = (uint32_t) t3xSize;
+        fseek(pageFile, 0, SEEK_END);
+        long t3xSize = ftell(pageFile);
+        fseek(pageFile, 0, SEEK_SET);
+        if (t3xSize <= 0) {
+            fclose(pageFile);
+            fprintf(stderr, "N3DS: empty %s\n", assetPath);
+            return false;
+        }
+
+        size = (uint32_t) t3xSize;
+    }
     while (renderer->cachedT3xBytes + size > renderer->cachedT3xByteLimit) {
         if (!N3DSRenderer_evictLRUPageBlob(renderer, pageIndex)) break;
     }
 
     page->t3xData = safeMalloc((size_t) size);
     page->t3xSize = size;
-    fread(page->t3xData, 1, (size_t) size, t3xFile);
-    fclose(t3xFile);
+    if (usingPackedAtlas) {
+        fseek(pageFile, (long) dataOffset, SEEK_SET);
+    }
+    if (fread(page->t3xData, 1, (size_t) size, pageFile) != (size_t) size) {
+        free(page->t3xData);
+        page->t3xData = NULL;
+        page->t3xSize = 0;
+        if (!usingPackedAtlas) fclose(pageFile);
+        fprintf(stderr, "N3DS: failed to read atlas page blob %lu\n", (unsigned long) pageIndex);
+        return false;
+    }
+    if (!usingPackedAtlas) fclose(pageFile);
 
     renderer->cachedT3xBytes += size;
     page->blobLastUsedStamp = ++renderer->blobUseCounter;
@@ -978,7 +1285,7 @@ static bool N3DSRenderer_loadPage(N3DSRenderer* renderer, uint32_t pageIndex) {
 
     if (renderer->atlasVersion == N3DS_ATLAS_VERSION_RAW) {
         char assetPath[256];
-        FILE* textureFile = N3DSRenderer_openAssetFile("textures.bin", assetPath, sizeof(assetPath));
+        FILE* textureFile = N3DSRenderer_openAssetFile(renderer, "textures.bin", assetPath, sizeof(assetPath));
         if (textureFile == NULL) {
             fprintf(stderr, "N3DS: missing textures.bin for raw atlas version\n");
             return false;
@@ -1142,16 +1449,121 @@ static bool N3DSRenderer_evictLRUDirectAsset(N3DSRenderer* renderer, const N3DSD
     return true;
 }
 
-static bool N3DSRenderer_loadDirectTextureAsset(N3DSRenderer* renderer, N3DSDirectTextureAsset* asset, const char* path) {
-    if (renderer == NULL || asset == NULL || path == NULL) return false;
+static bool N3DSRenderer_evictLRUDirectAssetBlob(N3DSRenderer* renderer, const N3DSDirectTextureAsset* excludeAsset) {
+    if (renderer == NULL) return false;
+
+    N3DSDirectTextureAsset* bestAsset = NULL;
+    uint32_t bestStamp = UINT32_MAX;
+
+    repeat(renderer->directSpriteAssetCount, spriteIndex) {
+        N3DSDirectSpriteAsset* spriteAsset = &renderer->directSpriteAssets[spriteIndex];
+        N3DSDirectTextureAsset* asset = &spriteAsset->sheetAsset;
+        if (asset->blobData != NULL && !asset->ready && asset != excludeAsset && asset->blobLastUsedStamp < bestStamp) {
+            bestStamp = asset->blobLastUsedStamp;
+            bestAsset = asset;
+        }
+
+        repeat(spriteAsset->frameCount, frameIndex) {
+            asset = &spriteAsset->frameAssets[frameIndex];
+            if (asset->blobData == NULL || asset->ready || asset == excludeAsset) continue;
+            if (asset->blobLastUsedStamp < bestStamp) {
+                bestStamp = asset->blobLastUsedStamp;
+                bestAsset = asset;
+            }
+        }
+    }
+
+    repeat(renderer->directBackgroundAssetCount, bgIndex) {
+        N3DSDirectTextureAsset* asset = &renderer->directBackgroundAssets[bgIndex];
+        if (asset->blobData == NULL || asset->ready || asset == excludeAsset) continue;
+        if (asset->blobLastUsedStamp < bestStamp) {
+            bestStamp = asset->blobLastUsedStamp;
+            bestAsset = asset;
+        }
+    }
+
+    repeat(renderer->directFontAssetCount, fontIndex) {
+        N3DSDirectTextureAsset* asset = &renderer->directFontAssets[fontIndex];
+        if (asset->blobData == NULL || asset->ready || asset == excludeAsset) continue;
+        if (asset->blobLastUsedStamp < bestStamp) {
+            bestStamp = asset->blobLastUsedStamp;
+            bestAsset = asset;
+        }
+    }
+
+    if (bestAsset == NULL) return false;
+    N3DSRenderer_unloadDirectTextureBlob(bestAsset, renderer);
+    return true;
+}
+
+static bool N3DSRenderer_ensureDirectTextureBlobLoaded(N3DSRenderer* renderer, N3DSDirectTextureAsset* asset, const char* relativePath) {
+    if (renderer == NULL || asset == NULL || relativePath == NULL) return false;
+    if (asset->blobData != NULL && asset->blobSize > 0) {
+        asset->blobLastUsedStamp = ++renderer->directBlobUseCounter;
+        return true;
+    }
+
+    if (N3DSRenderer_tryLoadPackedDirectTextureBlob(renderer, asset, relativePath)) {
+        return true;
+    }
+
+    char resolvedPath[512];
+    if (!N3DSRenderer_resolveAssetPath(renderer, relativePath, resolvedPath, sizeof(resolvedPath))) return false;
+
+    FILE* file = fopen(resolvedPath, "rb");
+    if (file == NULL) return false;
+    N3DSRenderer_configureFileBuffer(file);
+
+    fseek(file, 0, SEEK_END);
+    long sizeLong = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (sizeLong <= 0) {
+        fclose(file);
+        return false;
+    }
+
+    uint32_t size = (uint32_t) sizeLong;
+    while (renderer->cachedDirectT3xBytes + size > renderer->cachedDirectT3xByteLimit) {
+        if (!N3DSRenderer_evictLRUDirectAssetBlob(renderer, asset)) break;
+    }
+
+    uint8_t* blobData = safeMalloc((size_t) size);
+    if (blobData == NULL) {
+        fclose(file);
+        return false;
+    }
+
+    bool ok = fread(blobData, 1, (size_t) size, file) == (size_t) size;
+    fclose(file);
+    if (!ok) {
+        free(blobData);
+        return false;
+    }
+
+    asset->blobData = blobData;
+    asset->blobSize = size;
+    asset->blobLastUsedStamp = ++renderer->directBlobUseCounter;
+    renderer->cachedDirectT3xBytes += size;
+    renderer->frameDirectBlobReads++;
+    return true;
+}
+
+static bool N3DSRenderer_loadDirectTextureAsset(N3DSRenderer* renderer, N3DSDirectTextureAsset* asset, const char* relativePath) {
+    if (renderer == NULL || asset == NULL || relativePath == NULL) return false;
     if (asset->ready) {
         asset->lastUsedStamp = ++renderer->directAssetUseCounter;
         asset->lastUsedFrame = renderer->frameSequence;
+        if (asset->blobData != NULL) asset->blobLastUsedStamp = ++renderer->directBlobUseCounter;
         return true;
     }
     if (asset->failed) return false;
 
-    C2D_SpriteSheet sheet = C2D_SpriteSheetLoad(path);
+    if (!N3DSRenderer_ensureDirectTextureBlobLoaded(renderer, asset, relativePath)) {
+        asset->failed = true;
+        return false;
+    }
+
+    C2D_SpriteSheet sheet = C2D_SpriteSheetLoadFromMem(asset->blobData, asset->blobSize);
     if (sheet == NULL) {
         asset->failed = true;
         return false;
@@ -1499,6 +1911,17 @@ static bool N3DSRenderer_tryLoadDirectSpriteImage(N3DSRenderer* renderer, int32_
 
     if (preferFrameFallback) spriteAsset->useFrameFallback = true;
 
+    bool hasLoadedDirectSheet = sheetAsset->ready || (sheetAsset->blobData != NULL && sheetAsset->blobSize > 0);
+    bool hasLoadedDirectFrame = false;
+    if (spriteAsset->frameAssets != NULL) {
+        N3DSDirectTextureAsset* existingFrameAsset = &spriteAsset->frameAssets[frameIndex];
+        hasLoadedDirectFrame = existingFrameAsset->ready || (existingFrameAsset->blobData != NULL && existingFrameAsset->blobSize > 0);
+    }
+    bool allowColdDirectLoad = preferNamedButtonOverride || renderer->directOnlyBattleAssets;
+    if (!allowColdDirectLoad && !hasLoadedDirectSheet && !hasLoadedDirectFrame) {
+        return false;
+    }
+
     if (preferNamedButtonOverride && spriteAsset->frameAssets != NULL) {
         N3DSDirectTextureAsset* frameAsset = &spriteAsset->frameAssets[frameIndex];
         if (frameAsset->ready) {
@@ -1515,12 +1938,12 @@ static bool N3DSRenderer_tryLoadDirectSpriteImage(N3DSRenderer* renderer, int32_
             } else if (strcmp(spriteName, "spr_talkbt_hollow") == 0) {
                 overrideBaseName = "spr_actbt_center_hole";
             }
-            snprintf(overridePath, sizeof(overridePath), "romfs:/gfx/button_overrides/%s_%d.t3x", overrideBaseName, (int) frameIndex);
+            snprintf(overridePath, sizeof(overridePath), "button_overrides/%s_%d.t3x", overrideBaseName, (int) frameIndex);
             if (N3DSRenderer_loadDirectTextureAsset(renderer, frameAsset, overridePath)) {
                 *outImage = &frameAsset->image;
                 return true;
             }
-            snprintf(overridePath, sizeof(overridePath), "romfs:/gfx/button_overrides/%s.t3x", overrideBaseName);
+            snprintf(overridePath, sizeof(overridePath), "button_overrides/%s.t3x", overrideBaseName);
             if (frameIndex == 0 && N3DSRenderer_loadDirectTextureAsset(renderer, frameAsset, overridePath)) {
                 *outImage = &frameAsset->image;
                 return true;
@@ -1538,7 +1961,7 @@ static bool N3DSRenderer_tryLoadDirectSpriteImage(N3DSRenderer* renderer, int32_
         }
         if (!frameAsset->failed) {
             char fallbackPath[256];
-            snprintf(fallbackPath, sizeof(fallbackPath), "romfs:/gfx/sprites/spr_%05d_frame_%05d.t3x", (int) spriteIndex, (int) frameIndex);
+            snprintf(fallbackPath, sizeof(fallbackPath), "sprites/spr_%05d_frame_%05d.t3x", (int) spriteIndex, (int) frameIndex);
             if (N3DSRenderer_loadDirectTextureAsset(renderer, frameAsset, fallbackPath)) {
                 *outImage = &frameAsset->image;
                 return true;
@@ -1561,7 +1984,7 @@ static bool N3DSRenderer_tryLoadDirectSpriteImage(N3DSRenderer* renderer, int32_
     if (!spriteAsset->sheetLoadAttempted) {
         char path[256];
         spriteAsset->sheetLoadAttempted = true;
-        snprintf(path, sizeof(path), "romfs:/gfx/sprites/spr_%05d.t3x", (int) spriteIndex);
+        snprintf(path, sizeof(path), "sprites/spr_%05d.t3x", (int) spriteIndex);
         if (N3DSRenderer_loadDirectTextureAsset(renderer, sheetAsset, path) && sheetAsset->sheet != NULL) {
             spriteAsset->sheetFrameCount = (uint32_t) C2D_SpriteSheetCount(sheetAsset->sheet);
             if ((uint32_t) frameIndex < spriteAsset->sheetFrameCount) {
@@ -1591,7 +2014,7 @@ static bool N3DSRenderer_tryLoadDirectSpriteImage(N3DSRenderer* renderer, int32_
     if (frameAsset->failed) return false;
 
     char fallbackPath[256];
-    snprintf(fallbackPath, sizeof(fallbackPath), "romfs:/gfx/sprites/spr_%05d_frame_%05d.t3x", (int) spriteIndex, (int) frameIndex);
+    snprintf(fallbackPath, sizeof(fallbackPath), "sprites/spr_%05d_frame_%05d.t3x", (int) spriteIndex, (int) frameIndex);
     if (!N3DSRenderer_loadDirectTextureAsset(renderer, frameAsset, fallbackPath)) return false;
     *outImage = &frameAsset->image;
     return true;
@@ -1602,8 +2025,11 @@ static bool N3DSRenderer_tryLoadDirectBackgroundImage(N3DSRenderer* renderer, in
     if (backgroundIndex < 0 || (uint32_t) backgroundIndex >= renderer->directBackgroundAssetCount) return false;
 
     N3DSDirectTextureAsset* asset = &renderer->directBackgroundAssets[backgroundIndex];
+    if (!asset->ready && (asset->blobData == NULL || asset->blobSize == 0)) {
+        return false;
+    }
     char path[256];
-    snprintf(path, sizeof(path), "romfs:/gfx/backgrounds/bg_%05d.t3x", (int) backgroundIndex);
+    snprintf(path, sizeof(path), "backgrounds/bg_%05d.t3x", (int) backgroundIndex);
     if (!N3DSRenderer_loadDirectTextureAsset(renderer, asset, path)) return false;
     *outImage = &asset->image;
     return true;
@@ -1622,7 +2048,7 @@ static bool N3DSRenderer_tryResolveDirectFontImage(N3DSRenderer* renderer, int32
 
     N3DSDirectTextureAsset* asset = &renderer->directFontAssets[fontIndex];
     char path[256];
-    snprintf(path, sizeof(path), "romfs:/gfx/fonts/font_%05d.t3x", (int) fontIndex);
+    snprintf(path, sizeof(path), "fonts/font_%05d.t3x", (int) fontIndex);
     if (!N3DSRenderer_loadDirectTextureAsset(renderer, asset, path)) return false;
     if (asset->image.tex == NULL || asset->image.subtex == NULL) return false;
 
@@ -1630,24 +2056,6 @@ static bool N3DSRenderer_tryResolveDirectFontImage(N3DSRenderer* renderer, int32
     *outSubtex = *asset->image.subtex;
     outImage->subtex = outSubtex;
     return true;
-}
-
-static bool N3DSRenderer_tpagHasDirectMapping(const N3DSRenderer* renderer, int32_t tpagIndex) {
-    if (renderer == NULL || renderer->base.dataWin == NULL) return false;
-    if (tpagIndex < 0 || (uint32_t) tpagIndex >= renderer->base.dataWin->tpag.count) return false;
-
-    if (renderer->tpagToSpriteIndex != NULL && renderer->tpagToSpriteFrameIndex != NULL) {
-        int32_t spriteIndex = renderer->tpagToSpriteIndex[tpagIndex];
-        int32_t frameIndex = renderer->tpagToSpriteFrameIndex[tpagIndex];
-        if (spriteIndex >= 0 && frameIndex >= 0) return true;
-    }
-
-    if (renderer->tpagToBackgroundIndex != NULL) {
-        int32_t backgroundIndex = renderer->tpagToBackgroundIndex[tpagIndex];
-        if (backgroundIndex >= 0) return true;
-    }
-
-    return false;
 }
 
 static bool N3DSRenderer_tryDrawDirectMappedSprite(Renderer* base, int32_t tpagIndex, float x, float y, float originX, float originY, float xscale, float yscale, float angleDeg, uint32_t color, float alpha) {
@@ -1736,8 +2144,9 @@ static bool N3DSRenderer_tryDrawDirectMappedSprite(Renderer* base, int32_t tpagI
 
 static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
     char assetPath[256];
-    FILE* atlasFile = N3DSRenderer_openAssetFile("atlas.bin", assetPath, sizeof(assetPath));
+    FILE* atlasFile = N3DSRenderer_openAssetFile(renderer, "atlas.bin", assetPath, sizeof(assetPath));
     if (atlasFile == NULL) {
+        N3DSRenderer_setStartupError(renderer, "Missing gfx/atlas.bin on SD or ROMFS");
         fprintf(stderr, "N3DS: missing atlas.bin in sdmc:/3ds/cinnamon/gfx or romfs:/gfx\n");
         return false;
     }
@@ -1746,39 +2155,45 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
     fseek(atlasFile, 0, SEEK_END);
     long atlasSize = ftell(atlasFile);
     fseek(atlasFile, 0, SEEK_SET);
-    if (atlasSize < 16) {
+    if (atlasSize < 24) {
         fclose(atlasFile);
+        N3DSRenderer_setStartupError(renderer, "gfx/atlas.bin is too small or corrupt");
         return false;
     }
 
-    uint8_t* blob = safeMalloc((size_t) atlasSize);
-    fread(blob, 1, (size_t) atlasSize, atlasFile);
-    fclose(atlasFile);
+    uint8_t header[24];
+    if (fread(header, 1, sizeof(header), atlasFile) != sizeof(header)) {
+        fclose(atlasFile);
+        N3DSRenderer_setStartupError(renderer, "Failed to read gfx/atlas.bin header");
+        return false;
+    }
 
-    uint16_t version = N3DS_readU16(blob + 4);
-    if (N3DS_readU32(blob) != N3DS_ATLAS_MAGIC ||
+    uint16_t version = N3DS_readU16(header + 4);
+    if (N3DS_readU32(header) != N3DS_ATLAS_MAGIC ||
         (version != N3DS_ATLAS_VERSION_RAW &&
          version != N3DS_ATLAS_VERSION_T3X &&
          version != N3DS_ATLAS_VERSION_FRAGMENTED &&
          version != N3DS_ATLAS_VERSION_FRAGMENTED_TILES &&
          version != N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS &&
          version != N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT &&
-         version != N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT)) {
-        free(blob);
+         version != N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT &&
+         version != N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED)) {
+        fclose(atlasFile);
+        N3DSRenderer_setStartupError(renderer, "gfx/atlas.bin has an invalid header");
         fprintf(stderr, "N3DS: invalid atlas header\n");
         return false;
     }
 
     renderer->atlasVersion = version;
     renderer->atlasTextureFormat = N3DS_TEXFMT_RGBA5551;
-    renderer->atlasPageCount = N3DS_readU16(blob + 6);
-    renderer->atlasItemCount = N3DS_readU32(blob + 8);
-    if (version == N3DS_ATLAS_VERSION_FRAGMENTED || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) {
-        renderer->atlasFragmentCount = N3DS_readU32(blob + 12);
-        if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) {
-            renderer->tileEntryCount = N3DS_readU32(blob + 16);
-            if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) {
-                renderer->atlasTextureFormat = N3DS_readU32(blob + 20);
+    renderer->atlasPageCount = N3DS_readU16(header + 6);
+    renderer->atlasItemCount = N3DS_readU32(header + 8);
+    if (version == N3DS_ATLAS_VERSION_FRAGMENTED || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
+        renderer->atlasFragmentCount = N3DS_readU32(header + 12);
+        if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
+            renderer->tileEntryCount = N3DS_readU32(header + 16);
+            if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
+                renderer->atlasTextureFormat = N3DS_readU32(header + 20);
             }
         }
     }
@@ -1795,7 +2210,8 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
         version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES ||
         version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS ||
         version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT ||
-        version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) {
+        version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT ||
+        version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
         renderer->atlasItemsV3 = safeCalloc(renderer->atlasItemCount, sizeof(N3DSAtlasItemV3));
         renderer->atlasFragments = safeCalloc(renderer->atlasFragmentCount, sizeof(N3DSAtlasFragment));
         if (renderer->tileEntryCount > 0) {
@@ -1808,7 +2224,46 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
     size_t cursor = 12;
     if (version == N3DS_ATLAS_VERSION_FRAGMENTED) cursor = 16;
     if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS) cursor = 20;
-    if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) cursor = 24;
+    if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) cursor = 24;
+
+    size_t metadataSize = cursor;
+    if (version == N3DS_ATLAS_VERSION_RAW) metadataSize += (size_t) renderer->atlasPageCount * 12u;
+    else if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) metadataSize += (size_t) renderer->atlasPageCount * 8u;
+    else if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) metadataSize += (size_t) renderer->atlasPageCount * 16u;
+    else metadataSize += (size_t) renderer->atlasPageCount * 4u;
+
+    if (version == N3DS_ATLAS_VERSION_FRAGMENTED ||
+        version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES ||
+        version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS ||
+        version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT ||
+        version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT ||
+        version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
+        metadataSize += (size_t) renderer->atlasItemCount * 10u;
+        metadataSize += (size_t) renderer->atlasFragmentCount * 14u;
+        if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES) metadataSize += (size_t) renderer->tileEntryCount * 20u;
+        else if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS ||
+                 version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT ||
+                 version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT ||
+                 version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) metadataSize += (size_t) renderer->tileEntryCount * 26u;
+    } else {
+        metadataSize += (size_t) renderer->atlasItemCount * 10u;
+    }
+
+    if ((long) metadataSize > atlasSize) {
+        fclose(atlasFile);
+        N3DSRenderer_setStartupError(renderer, "gfx/atlas.bin metadata is truncated");
+        return false;
+    }
+
+    fseek(atlasFile, 0, SEEK_SET);
+    uint8_t* blob = safeMalloc(metadataSize);
+    if (fread(blob, 1, metadataSize, atlasFile) != metadataSize) {
+        free(blob);
+        fclose(atlasFile);
+        N3DSRenderer_setStartupError(renderer, "Failed to read gfx/atlas.bin metadata");
+        return false;
+    }
+
     N3DSAtlasPageInfo* pageInfos = safeCalloc(renderer->atlasPageCount, sizeof(N3DSAtlasPageInfo));
     repeat(renderer->atlasPageCount, i) {
         pageInfos[i].width = N3DS_readU16(blob + cursor + 0);
@@ -1818,6 +2273,11 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
             pageInfos[i].dataOffset = N3DS_readU32(blob + cursor + 4);
             pageInfos[i].dataSize = N3DS_readU32(blob + cursor + 8);
             cursor += 12;
+        } else if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
+            pageInfos[i].textureFormat = N3DS_readU32(blob + cursor + 4);
+            pageInfos[i].dataOffset = N3DS_readU32(blob + cursor + 8);
+            pageInfos[i].dataSize = N3DS_readU32(blob + cursor + 12);
+            cursor += 16;
         } else if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) {
             pageInfos[i].textureFormat = N3DS_readU32(blob + cursor + 4);
             cursor += 8;
@@ -1825,7 +2285,7 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
             cursor += 4;
         }
     }
-    if (version == N3DS_ATLAS_VERSION_FRAGMENTED || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) {
+    if (version == N3DS_ATLAS_VERSION_FRAGMENTED || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
         repeat(renderer->atlasItemCount, i) {
             renderer->atlasItemsV3[i].width = N3DS_readU16(blob + cursor + 0);
             renderer->atlasItemsV3[i].height = N3DS_readU16(blob + cursor + 2);
@@ -1843,7 +2303,7 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
             renderer->atlasFragments[i].sourceY = N3DS_readU16(blob + cursor + 12);
             cursor += 14;
         }
-        if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) {
+        if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILES || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
             repeat(renderer->tileEntryCount, i) {
                 renderer->tileEntries[i].bgDef = (int16_t) N3DS_readU16(blob + cursor + 0);
                 renderer->tileEntries[i].srcX = N3DS_readU16(blob + cursor + 2);
@@ -1855,7 +2315,7 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
                 renderer->tileEntries[i].y = N3DS_readU16(blob + cursor + 14);
                 renderer->tileEntries[i].width = N3DS_readU16(blob + cursor + 16);
                 renderer->tileEntries[i].height = N3DS_readU16(blob + cursor + 18);
-                if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) {
+                if (version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_FMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
                     renderer->tileEntries[i].fragmentStart = N3DS_readU32(blob + cursor + 20);
                     renderer->tileEntries[i].fragmentCount = N3DS_readU16(blob + cursor + 24);
                     cursor += 26;
@@ -1877,6 +2337,8 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
         }
     }
     free(blob);
+    if (N3DSRenderer_isPackedAtlasVersion(version)) renderer->packedAtlasFile = atlasFile;
+    else fclose(atlasFile);
 
     repeat(renderer->atlasPageCount, i) {
         N3DSLoadedAtlasPage* page = &renderer->atlasPages[i];
@@ -1911,7 +2373,7 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
             (unsigned int) renderer->prewarmGpuPageBudget);
     } else if (renderer->atlasTextureFormat == N3DS_TEXFMT_INDEXED8) {
         fprintf(stderr, "N3DS: indexed8 atlas detected; using temporary CPU expansion to rgba5551 until shader-backed palette sampling lands\n");
-    } else if (renderer->atlasTextureFormat == N3DS_TEXFMT_HYBRID || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT) {
+    } else if (renderer->atlasTextureFormat == N3DS_TEXFMT_HYBRID || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PAGEFMT || version == N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED) {
         renderer->residentAtlasPageLimit = renderer->isNew3DS ? N3DS_MAX_RESIDENT_ATLAS_PAGES_NEW3DS_ETC1A4 : N3DS_MAX_RESIDENT_ATLAS_PAGES_OLD3DS_ETC1A4;
         renderer->prewarmGpuPageBudget = renderer->isNew3DS ? N3DS_PREWARM_GPU_PAGE_BUDGET_NEW3DS_ETC1A4 : N3DS_PREWARM_GPU_PAGE_BUDGET_OLD3DS_ETC1A4;
         fprintf(stderr, "N3DS: hybrid atlas detected; mixed page formats enabled\n");
@@ -1996,6 +2458,66 @@ static void N3DSRenderer_prewarmTileEntry(N3DSRenderer* renderer, bool* seenPage
     } else if (entry->atlasId < renderer->atlasPageCount) {
         N3DSRenderer_prewarmPage(renderer, seenPages, entry->atlasId);
     }
+}
+
+static bool N3DSRenderer_prewarmPageBlobOnly(N3DSRenderer* renderer, bool* seenPages, uint32_t pageIndex, uint32_t* remainingBlobBytes) {
+    if (renderer == NULL || seenPages == NULL) return false;
+    if (pageIndex >= renderer->atlasPageCount || seenPages[pageIndex]) return false;
+
+    N3DSLoadedAtlasPage* page = &renderer->atlasPages[pageIndex];
+    seenPages[pageIndex] = true;
+
+    if (page->t3xData != NULL && page->t3xSize > 0) {
+        page->blobLastUsedStamp = ++renderer->blobUseCounter;
+        return true;
+    }
+
+    uint32_t blobSize = page->dataSize;
+    if (blobSize == 0 && page->t3xSize > 0) blobSize = page->t3xSize;
+    if (remainingBlobBytes != NULL && blobSize > 0 && *remainingBlobBytes < blobSize) {
+        return false;
+    }
+
+    if (!N3DSRenderer_ensurePageBlobLoaded(renderer, pageIndex)) return false;
+
+    if (remainingBlobBytes != NULL && blobSize > 0) {
+        if (*remainingBlobBytes > blobSize) *remainingBlobBytes -= blobSize;
+        else *remainingBlobBytes = 0;
+    }
+    return true;
+}
+
+static void N3DSRenderer_prewarmTileEntryBlobOnly(N3DSRenderer* renderer, bool* seenPages, const N3DSTileAtlasEntry* entry, uint32_t* remainingBlobBytes) {
+    if (renderer == NULL || seenPages == NULL || entry == NULL || remainingBlobBytes == NULL || *remainingBlobBytes == 0) return;
+
+    if (entry->fragmentCount > 0) {
+        repeat(entry->fragmentCount, i) {
+            uint32_t fragmentIndex = entry->fragmentStart + (uint32_t) i;
+            if (fragmentIndex >= renderer->atlasFragmentCount) break;
+            (void) N3DSRenderer_prewarmPageBlobOnly(renderer, seenPages, renderer->atlasFragments[fragmentIndex].atlasId, remainingBlobBytes);
+            if (*remainingBlobBytes == 0) break;
+        }
+    } else if (entry->atlasId < renderer->atlasPageCount) {
+        (void) N3DSRenderer_prewarmPageBlobOnly(renderer, seenPages, entry->atlasId, remainingBlobBytes);
+    }
+}
+
+static void N3DSRenderer_prewarmTPAGBlobOnly(N3DSRenderer* renderer, bool* seenPages, int32_t tpagIndex, uint32_t* remainingBlobBytes) {
+    if (renderer == NULL || seenPages == NULL || remainingBlobBytes == NULL || *remainingBlobBytes == 0) return;
+    if (tpagIndex < 0 || (uint32_t) tpagIndex >= renderer->atlasItemCount) return;
+
+    if (N3DSRenderer_isFragmentedAtlasVersion(renderer->atlasVersion)) {
+        N3DSAtlasItemV3* item = &renderer->atlasItemsV3[tpagIndex];
+        repeat(item->fragmentCount, i) {
+            uint32_t fragmentIndex = item->fragmentStart + (uint32_t) i;
+            if (fragmentIndex >= renderer->atlasFragmentCount) break;
+            (void) N3DSRenderer_prewarmPageBlobOnly(renderer, seenPages, renderer->atlasFragments[fragmentIndex].atlasId, remainingBlobBytes);
+            if (*remainingBlobBytes == 0) break;
+        }
+        return;
+    }
+
+    (void) N3DSRenderer_prewarmPageBlobOnly(renderer, seenPages, renderer->atlasItems[tpagIndex].atlasId, remainingBlobBytes);
 }
 
 static void N3DSRenderer_prewarmPage(N3DSRenderer* renderer, bool* seenPages, uint32_t pageIndex) {
@@ -2242,104 +2764,98 @@ static void N3DSRenderer_preloadFontPages(N3DSRenderer* renderer) {
     }
 }
 
+static void N3DSRenderer_prewarmRoomBlobCache(N3DSRenderer* renderer, Runner* runner) {
+    if (renderer == NULL || runner == NULL || runner->currentRoom == NULL || renderer->atlasPageCount == 0) return;
+
+    DataWin* dw = renderer->base.dataWin;
+    Room* room = runner->currentRoom;
+    uint32_t remainingBlobBytes = renderer->isNew3DS ? N3DS_PREWARM_BLOB_BYTES_NEW3DS : N3DS_PREWARM_BLOB_BYTES_OLD3DS;
+    bool* seenPages = safeCalloc(renderer->atlasPageCount, sizeof(bool));
+
+    repeat(8, i) {
+        RuntimeBackground* bg = &runner->backgrounds[i];
+        if (!bg->visible || bg->backgroundIndex < 0) continue;
+        N3DSRenderer_prewarmTPAGBlobOnly(renderer, seenPages, Renderer_resolveBackgroundTPAGIndex(dw, bg->backgroundIndex), &remainingBlobBytes);
+        if (remainingBlobBytes == 0) goto done;
+    }
+
+    repeat(room->layerCount, layerIndex) {
+        RoomLayer* layer = &room->layers[layerIndex];
+
+        if (layer->backgroundData != NULL && layer->backgroundData->visible && layer->backgroundData->spriteIndex >= 0) {
+            N3DSRenderer_prewarmTPAGBlobOnly(renderer, seenPages, Renderer_resolveSpriteTPAGIndex(dw, layer->backgroundData->spriteIndex), &remainingBlobBytes);
+            if (remainingBlobBytes == 0) goto done;
+        }
+
+        if (layer->assetsData != NULL) {
+            repeat(layer->assetsData->legacyTileCount, tileIndex) {
+                N3DSTileAtlasEntry* entry = N3DSRenderer_findTileEntry(renderer, &layer->assetsData->legacyTiles[tileIndex]);
+                N3DSRenderer_prewarmTileEntryBlobOnly(renderer, seenPages, entry, &remainingBlobBytes);
+                if (remainingBlobBytes == 0) goto done;
+            }
+
+            repeat(layer->assetsData->spriteCount, spriteIndex) {
+                SpriteInstance* sprite = &layer->assetsData->sprites[spriteIndex];
+                int32_t tpagIndex = Renderer_resolveTPAGIndex(dw, sprite->spriteIndex, (int32_t) sprite->frameIndex);
+                N3DSRenderer_prewarmTPAGBlobOnly(renderer, seenPages, tpagIndex, &remainingBlobBytes);
+                if (remainingBlobBytes == 0) goto done;
+            }
+        }
+    }
+
+    repeat(room->tileCount, tileIndex) {
+        N3DSTileAtlasEntry* entry = N3DSRenderer_findTileEntry(renderer, &room->tiles[tileIndex]);
+        N3DSRenderer_prewarmTileEntryBlobOnly(renderer, seenPages, entry, &remainingBlobBytes);
+        if (remainingBlobBytes == 0) goto done;
+    }
+
+    if (runner->tileLayerCaches != NULL) {
+        repeat(runner->tileLayerCacheCount, cacheIndex) {
+            TileLayerRenderCache* cache = &runner->tileLayerCaches[cacheIndex];
+            if (!cache->built || cache->cells == NULL) continue;
+
+            repeat(arrlen(cache->cells), cellIndex) {
+                const TileLayerCacheCell* cell = &cache->cells[cellIndex];
+                if (cell->n3dsTileEntryIndex >= 0 && (uint32_t) cell->n3dsTileEntryIndex < renderer->tileEntryCount) {
+                    N3DSRenderer_prewarmTileEntryBlobOnly(renderer, seenPages, &renderer->tileEntries[cell->n3dsTileEntryIndex], &remainingBlobBytes);
+                } else {
+                    N3DSRenderer_prewarmTPAGBlobOnly(renderer, seenPages, cell->tpagIndex, &remainingBlobBytes);
+                }
+                if (remainingBlobBytes == 0) goto done;
+            }
+        }
+    }
+
+    repeat(arrlen(runner->instances), instanceIndex) {
+        Instance* inst = runner->instances[instanceIndex];
+        if (inst == NULL || inst->destroyed || !inst->visible || inst->spriteIndex < 0) continue;
+        int32_t tpagIndex = Renderer_resolveTPAGIndex(dw, inst->spriteIndex, (int32_t) inst->imageIndex);
+        N3DSRenderer_prewarmTPAGBlobOnly(renderer, seenPages, tpagIndex, &remainingBlobBytes);
+        if (remainingBlobBytes == 0) goto done;
+    }
+
+done:
+    free(seenPages);
+}
+
 static void N3DSRenderer_prewarmRoom(Renderer* base, Runner* runner) {
     if (base == NULL || runner == NULL || runner->currentRoom == NULL) return;
 
     N3DSRenderer* renderer = (N3DSRenderer*) base;
-    DataWin* dw = base->dataWin;
     Room* room = runner->currentRoom;
     bool roomChanged = renderer->lastPrewarmedRoom != room;
     bool battleRoom = room->name != NULL && strstr(room->name, "battle") != NULL;
 
+    N3DSRenderer_clearDirectAssetPins(renderer);
+    if (roomChanged) {
+        N3DSRenderer_flushRoomDirectAssets(renderer);
+    }
     if (roomChanged && !renderer->isNew3DS) {
         renderer->pendingOld3DSAtlasFlush = true;
     }
-
-    N3DSRenderer_clearDirectAssetPins(renderer);
     renderer->directOnlyBattleAssets = battleRoom;
-    if (!renderer->isNew3DS) {
-        renderer->lastPrewarmedRoom = room;
-        return;
-    }
-
-    bool* seenPages = safeCalloc(renderer->atlasPageCount > 0 ? renderer->atlasPageCount : 1u, sizeof(bool));
-
-    repeat(8, i) {
-        RuntimeBackground* bg = &runner->backgrounds[i];
-        if (!bg->visible) continue;
-        N3DSRenderer_prewarmTPAG(renderer, seenPages, Renderer_resolveBackgroundTPAGIndex(dw, bg->backgroundIndex));
-    }
-
-    repeat(room->tileCount, i) {
-        N3DSRenderer_prewarmTileEntry(renderer, seenPages, &room->tiles[i]);
-        N3DSRenderer_prewarmTPAG(renderer, seenPages, Renderer_resolveObjectTPAGIndex(dw, &room->tiles[i]));
-    }
-
-    repeat(room->layerCount, i) {
-        RoomLayer* layer = &room->layers[i];
-        if (!layer->visible) continue;
-
-        if (layer->backgroundData != NULL && layer->backgroundData->visible && layer->backgroundData->spriteIndex >= 0) {
-            N3DSRenderer_prewarmTPAG(renderer, seenPages, Renderer_resolveTPAGIndex(dw, layer->backgroundData->spriteIndex, (int32_t) layer->backgroundData->firstFrame));
-        }
-
-        if (layer->tilesData != NULL) {
-            N3DSRenderer_prewarmTPAG(renderer, seenPages, Renderer_resolveBackgroundTPAGIndex(dw, layer->tilesData->backgroundIndex));
-        }
-
-        if (layer->assetsData != NULL) {
-            repeat(layer->assetsData->legacyTileCount, j) {
-                N3DSRenderer_prewarmTileEntry(renderer, seenPages, &layer->assetsData->legacyTiles[j]);
-                N3DSRenderer_prewarmTPAG(renderer, seenPages, Renderer_resolveObjectTPAGIndex(dw, &layer->assetsData->legacyTiles[j]));
-            }
-            repeat(layer->assetsData->spriteCount, j) {
-                SpriteInstance* spr = &layer->assetsData->sprites[j];
-                if (spr->spriteIndex < 0) continue;
-                N3DSRenderer_prewarmTPAG(renderer, seenPages, Renderer_resolveTPAGIndex(dw, spr->spriteIndex, (int32_t) spr->frameIndex));
-                if (renderer->directOnlyBattleAssets) {
-                    N3DSRenderer_prewarmDirectSpriteFrames(renderer, spr->spriteIndex);
-                }
-            }
-        }
-    }
-
-    size_t runtimeLayerCount = arrlenu(runner->runtimeLayers);
-    repeat(runtimeLayerCount, i) {
-        RuntimeLayer* layer = &runner->runtimeLayers[i];
-        if (!layer->visible) continue;
-
-        size_t elementCount = arrlenu(layer->elements);
-        repeat(elementCount, j) {
-            RuntimeLayerElement* el = &layer->elements[j];
-            if (el->type == RuntimeLayerElementType_Background && el->backgroundElement != NULL) {
-                RuntimeBackgroundElement* bg = el->backgroundElement;
-                if (bg->visible && bg->spriteIndex >= 0) {
-                    N3DSRenderer_prewarmTPAG(renderer, seenPages, Renderer_resolveSpriteTPAGIndex(dw, bg->spriteIndex));
-                }
-            } else if (el->type == RuntimeLayerElementType_Sprite && el->spriteElement != NULL) {
-                RuntimeSpriteElement* spr = el->spriteElement;
-                if (spr->spriteIndex >= 0) {
-                    N3DSRenderer_prewarmTPAG(renderer, seenPages, Renderer_resolveTPAGIndex(dw, spr->spriteIndex, (int32_t) spr->frameIndex));
-                    if (renderer->directOnlyBattleAssets) {
-                        N3DSRenderer_prewarmDirectSpriteFrames(renderer, spr->spriteIndex);
-                    }
-                }
-            }
-        }
-    }
-
-    int32_t instanceCount = (int32_t) arrlen(runner->instances);
-    repeat(instanceCount, i) {
-        Instance* inst = runner->instances[i];
-        if (inst == NULL || !inst->active || !inst->visible || inst->spriteIndex < 0) continue;
-        N3DSRenderer_prewarmTPAG(renderer, seenPages, Renderer_resolveTPAGIndex(dw, inst->spriteIndex, (int32_t) inst->imageIndex));
-        if (renderer->directOnlyBattleAssets) {
-            N3DSRenderer_prewarmDirectSpriteFrames(renderer, inst->spriteIndex);
-        }
-    }
-
-    free(seenPages);
     renderer->lastPrewarmedRoom = room;
+    N3DSRenderer_prewarmRoomBlobCache(renderer, runner);
 }
 
 static void N3DSRenderer_computeFrameLayout(N3DSRenderer* renderer, int32_t gameW, int32_t gameH) {
@@ -2369,8 +2885,13 @@ static void N3DSRenderer_init(Renderer* base, DataWin* dataWin) {
     renderer->residentDirectAssetVRAMLimitBytes = renderer->isNew3DS ? N3DS_DIRECT_ASSET_VRAM_BUDGET_NEW3DS : N3DS_DIRECT_ASSET_VRAM_BUDGET_OLD3DS;
     renderer->prewarmGpuPageBudget = renderer->isNew3DS ? N3DS_PREWARM_GPU_PAGE_BUDGET_NEW3DS : N3DS_PREWARM_GPU_PAGE_BUDGET_OLD3DS;
     renderer->cachedT3xByteLimit = renderer->isNew3DS ? N3DS_MAX_CACHED_T3X_BYTES_NEW3DS : N3DS_MAX_CACHED_T3X_BYTES_OLD3DS;
-    N3DSRenderer_loadAtlas(renderer);
+    renderer->cachedDirectT3xByteLimit = renderer->isNew3DS ? N3DS_MAX_CACHED_DIRECT_T3X_BYTES_NEW3DS : N3DS_MAX_CACHED_DIRECT_T3X_BYTES_OLD3DS;
+    renderer->atlasLoaded = N3DSRenderer_loadAtlas(renderer);
+    if (!renderer->atlasLoaded && renderer->startupError[0] == '\0') {
+        N3DSRenderer_setStartupError(renderer, "Failed to load 3DS graphics atlas");
+    }
     N3DSRenderer_buildDirectAssetMaps(renderer);
+    (void) N3DSRenderer_loadPackedDirectAssets(renderer);
     renderer->atlasTraceMask = safeCalloc(renderer->atlasItemCount > 0 ? renderer->atlasItemCount : 1u, sizeof(uint8_t));
     renderer->atlasTraceFile = fopen(N3DS_ATLAS_TRACE_LOG_PATH, "wb");
     if (renderer->atlasTraceFile != NULL) {
@@ -2398,23 +2919,34 @@ static void N3DSRenderer_destroy(Renderer* base) {
         N3DSRenderer_unloadPageBlob(renderer, (uint32_t) i);
     }
     N3DSRenderer_freeCachedTextLayout(&renderer->cachedTextLayout);
+    repeat(shlen(renderer->resolvedAssetPathCache), i) {
+        free(renderer->resolvedAssetPathCache[i].value);
+    }
+    shfree(renderer->resolvedAssetPathCache);
+    shfree(renderer->packedDirectAssetMap);
     free(renderer->atlasTraceMask);
     if (renderer->atlasTraceFile != NULL) fclose(renderer->atlasTraceFile);
+    if (renderer->packedAtlasFile != NULL) fclose(renderer->packedAtlasFile);
+    if (renderer->packedDirectAssetFile != NULL) fclose(renderer->packedDirectAssetFile);
     repeat(renderer->directSpriteAssetCount, spriteIndex) {
         N3DSDirectSpriteAsset* spriteAsset = &renderer->directSpriteAssets[spriteIndex];
         N3DSRenderer_freeDirectTextureAsset(&spriteAsset->sheetAsset, renderer);
+        N3DSRenderer_unloadDirectTextureBlob(&spriteAsset->sheetAsset, renderer);
         free(spriteAsset->sheetFrameImages);
         spriteAsset->sheetFrameImages = NULL;
         repeat(spriteAsset->frameCount, frameIndex) {
             N3DSRenderer_freeDirectTextureAsset(&spriteAsset->frameAssets[frameIndex], renderer);
+            N3DSRenderer_unloadDirectTextureBlob(&spriteAsset->frameAssets[frameIndex], renderer);
         }
         free(spriteAsset->frameAssets);
     }
     repeat(renderer->directBackgroundAssetCount, bgIndex) {
         N3DSRenderer_freeDirectTextureAsset(&renderer->directBackgroundAssets[bgIndex], renderer);
+        N3DSRenderer_unloadDirectTextureBlob(&renderer->directBackgroundAssets[bgIndex], renderer);
     }
     repeat(renderer->directFontAssetCount, fontIndex) {
         N3DSRenderer_freeDirectTextureAsset(&renderer->directFontAssets[fontIndex], renderer);
+        N3DSRenderer_unloadDirectTextureBlob(&renderer->directFontAssets[fontIndex], renderer);
     }
     free(renderer->directSpriteAssets);
     free(renderer->directBackgroundAssets);
@@ -2657,6 +3189,11 @@ bool N3DSRenderer_isTopScreenGUIActive(Renderer* base) {
     return ((N3DSRenderer*) base)->topScreenGuiActive;
 }
 
+bool N3DSRenderer_isTopScreenBattleViewActive(Renderer* base) {
+    if (base == NULL) return false;
+    return ((N3DSRenderer*) base)->topScreenBattleViewActive;
+}
+
 void N3DSRenderer_setTopScreenBattleViewActive(Renderer* base, bool active) {
     if (base == NULL) return;
     ((N3DSRenderer*) base)->topScreenBattleViewActive = active;
@@ -2694,21 +3231,42 @@ static void N3DSRenderer_drawImage(Renderer* base, C2D_Image* image, float local
         return;
     }
 
+    bool flipX = false;
+    bool flipY = false;
     if (width < 0.0f) {
         localX += width;
         pivotX -= width;
         width = -width;
+        flipX = true;
     }
     if (height < 0.0f) {
         localY += height;
         pivotY -= height;
         height = -height;
+        flipY = true;
+    }
+
+    Tex3DS_SubTexture flippedSubtex;
+    C2D_Image drawImage = *image;
+    if (flipX || flipY) {
+        flippedSubtex = *image->subtex;
+        if (flipX) {
+            float tmp = flippedSubtex.left;
+            flippedSubtex.left = flippedSubtex.right;
+            flippedSubtex.right = tmp;
+        }
+        if (flipY) {
+            float tmp = flippedSubtex.top;
+            flippedSubtex.top = flippedSubtex.bottom;
+            flippedSubtex.bottom = tmp;
+        }
+        drawImage.subtex = &flippedSubtex;
     }
 
     if (fabsf(angleDeg) < 0.001f && fabsf(pivotX) < 0.001f && fabsf(pivotY) < 0.001f) {
-        float xscale = width / (float) image->subtex->width;
-        float yscale = height / (float) image->subtex->height;
-        N3DSRenderer_drawImageFast(base, image, localX, localY, xscale, yscale, color, alpha);
+        float xscale = width / (float) drawImage.subtex->width;
+        float yscale = height / (float) drawImage.subtex->height;
+        N3DSRenderer_drawImageFast(base, &drawImage, localX, localY, xscale, yscale, color, alpha);
         return;
     }
 
@@ -2727,8 +3285,8 @@ static void N3DSRenderer_drawImage(Renderer* base, C2D_Image* image, float local
     float pivotLocalY = localY + pivotY;
     float screenX = N3DSRenderer_transformScreenX(renderer, pivotLocalX);
     float screenY = N3DSRenderer_transformScreenY(renderer, pivotLocalY);
-    float screenScaleX = screenRectW / (float) image->subtex->width;
-    float screenScaleY = screenRectH / (float) image->subtex->height;
+    float screenScaleX = screenRectW / (float) drawImage.subtex->width;
+    float screenScaleY = screenRectH / (float) drawImage.subtex->height;
     float screenPivotX = (width != 0.0f) ? (pivotX / width) * screenRectW : 0.0f;
     float screenPivotY = (height != 0.0f) ? (pivotY / height) * screenRectH : 0.0f;
 
@@ -2738,14 +3296,14 @@ static void N3DSRenderer_drawImage(Renderer* base, C2D_Image* image, float local
         .depth = 0.5f,
         .angle = C3D_AngleFromDegrees(-angleDeg),
     };
-    N3DSRenderer_trackTextureUse(renderer, image);
-    N3DSRenderer_applyTextureFilterForScale(renderer, image->tex, screenScaleX, screenScaleY);
+    N3DSRenderer_trackTextureUse(renderer, &drawImage);
+    N3DSRenderer_applyTextureFilterForScale(renderer, drawImage.tex, screenScaleX, screenScaleY);
     if (N3DSRenderer_isIdentityTint(color, alpha)) {
-        C2D_DrawImage(*image, &params, NULL);
+        C2D_DrawImage(drawImage, &params, NULL);
     } else {
         C2D_ImageTint tint;
         C2D_PlainImageTint(&tint, N3DSRenderer_makeColor(color, alpha), 1.0f);
-        C2D_DrawImage(*image, &params, &tint);
+        C2D_DrawImage(drawImage, &params, &tint);
     }
 }
 
@@ -2785,9 +3343,6 @@ static void N3DSRenderer_drawSprite(Renderer* base, int32_t tpagIndex, float x, 
     N3DSRenderer_traceTPAGUsage(renderer, N3DS_TRACE_KIND_SPRITE, tpagIndex);
     renderer->frameSpriteDrawCalls++;
     if (N3DSRenderer_tryDrawDirectMappedSprite(base, tpagIndex, x, y, originX, originY, xscale, yscale, angleDeg, color, alpha)) {
-        return;
-    }
-    if (renderer->directOnlyBattleAssets && N3DSRenderer_tpagHasDirectMapping(renderer, tpagIndex)) {
         return;
     }
     if (N3DSRenderer_isFragmentedAtlasVersion(renderer->atlasVersion)) {
@@ -2856,7 +3411,45 @@ static void N3DSRenderer_drawSpritePart(Renderer* base, int32_t tpagIndex, int32
     N3DSRenderer* renderer = (N3DSRenderer*) base;
     N3DSRenderer_traceTPAGUsage(renderer, N3DS_TRACE_KIND_SPRITE_PART, tpagIndex);
     renderer->frameSpritePartDrawCalls++;
-    if (renderer->directOnlyBattleAssets && N3DSRenderer_tpagHasDirectMapping(renderer, tpagIndex)) {
+
+    C2D_Image* directImage = NULL;
+    if (renderer->tpagToSpriteIndex != NULL && renderer->tpagToSpriteFrameIndex != NULL &&
+        tpagIndex >= 0 && (uint32_t) tpagIndex < renderer->base.dataWin->tpag.count) {
+        int32_t spriteIndex = renderer->tpagToSpriteIndex[tpagIndex];
+        int32_t frameIndex = renderer->tpagToSpriteFrameIndex[tpagIndex];
+        if (spriteIndex >= 0 && frameIndex >= 0) {
+            N3DSRenderer_tryLoadDirectSpriteImage(renderer, spriteIndex, frameIndex, &directImage);
+        }
+    }
+    if (directImage == NULL && renderer->tpagToBackgroundIndex != NULL &&
+        tpagIndex >= 0 && (uint32_t) tpagIndex < renderer->base.dataWin->tpag.count) {
+        int32_t backgroundIndex = renderer->tpagToBackgroundIndex[tpagIndex];
+        if (backgroundIndex >= 0) {
+            N3DSRenderer_tryLoadDirectBackgroundImage(renderer, backgroundIndex, &directImage);
+        }
+    }
+    if (directImage != NULL && directImage->subtex != NULL) {
+        Tex3DS_SubTexture subtex = *directImage->subtex;
+        float baseLeft = subtex.left;
+        float baseRight = subtex.right;
+        float baseTop = subtex.top;
+        float baseBottom = subtex.bottom;
+        float baseWidth = (float) directImage->subtex->width;
+        float baseHeight = (float) directImage->subtex->height;
+        if (baseWidth <= 0.0f || baseHeight <= 0.0f) return;
+
+        subtex.width = (uint16_t) srcW;
+        subtex.height = (uint16_t) srcH;
+        subtex.left = baseLeft + (baseRight - baseLeft) * ((float) srcOffX / baseWidth);
+        subtex.right = baseLeft + (baseRight - baseLeft) * (((float) srcOffX + (float) srcW) / baseWidth);
+        subtex.top = baseTop + (baseBottom - baseTop) * ((float) srcOffY / baseHeight);
+        subtex.bottom = baseTop + (baseBottom - baseTop) * (((float) srcOffY + (float) srcH) / baseHeight);
+
+        C2D_Image image = {
+            .tex = directImage->tex,
+            .subtex = &subtex,
+        };
+        N3DSRenderer_drawImage(base, &image, x, y, (float) srcW * xscale, (float) srcH * yscale, pivotX - x, pivotY - y, angleDeg, color, alpha);
         return;
     }
     if (N3DSRenderer_isFragmentedAtlasVersion(renderer->atlasVersion)) {
@@ -3207,9 +3800,6 @@ static void N3DSRenderer_drawTiled(Renderer* base, int32_t tpagIndex, float orig
         if (backgroundIndex >= 0) {
             N3DSRenderer_tryLoadDirectBackgroundImage(renderer, backgroundIndex, &directImage);
         }
-    }
-    if (directImage == NULL && renderer->directOnlyBattleAssets && N3DSRenderer_tpagHasDirectMapping(renderer, tpagIndex)) {
-        return;
     }
     if (directImage != NULL && directImage->subtex != NULL) {
         cropX = 0;
@@ -3858,7 +4448,23 @@ Renderer* N3DSRenderer_create(void) {
     renderer->base.drawHalign = 0;
     renderer->base.drawValign = 0;
     renderer->base.circlePrecision = 24;
+    renderer->resolvedAssetPathCache = NULL;
+    sh_new_strdup(renderer->resolvedAssetPathCache);
+    renderer->packedDirectAssetMap = NULL;
+    sh_new_strdup(renderer->packedDirectAssetMap);
     return (Renderer*) renderer;
+}
+
+bool N3DSRenderer_isReady(Renderer* base) {
+    if (base == NULL) return false;
+    return ((N3DSRenderer*) base)->atlasLoaded;
+}
+
+const char* N3DSRenderer_getStartupError(Renderer* base) {
+    if (base == NULL) return "Renderer was not created";
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    if (renderer->startupError[0] == '\0') return NULL;
+    return renderer->startupError;
 }
 
 uint32_t N3DSRenderer_getResidentAtlasVRAMBytes(Renderer* base) {
@@ -3880,6 +4486,16 @@ uint32_t N3DSRenderer_getResidentAtlasPageCount(Renderer* base) {
 uint32_t N3DSRenderer_getResidentAtlasPageLimit(Renderer* base) {
     if (base == NULL) return 0;
     return ((N3DSRenderer*) base)->residentAtlasPageLimit;
+}
+
+uint32_t N3DSRenderer_getResidentDirectAssetVRAMBytes(Renderer* base) {
+    if (base == NULL) return 0;
+    return ((N3DSRenderer*) base)->residentDirectAssetVRAMBytes;
+}
+
+uint32_t N3DSRenderer_getResidentDirectAssetVRAMLimitBytes(Renderer* base) {
+    if (base == NULL) return 0;
+    return ((N3DSRenderer*) base)->residentDirectAssetVRAMLimitBytes;
 }
 
 uint32_t N3DSRenderer_getFrameFragmentDraws(Renderer* base) {

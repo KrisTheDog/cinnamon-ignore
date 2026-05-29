@@ -7,3 +7,5 @@
 
 #define STB_DS_IMPLEMENTATION
 #include <stb/ds/stb_ds.h>
+
+#include "../../vendor/stb/vorbis/stb_vorbis.c"

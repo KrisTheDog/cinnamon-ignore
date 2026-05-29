@@ -21,3 +21,7 @@ target_include_directories(n3ds-preprocess PRIVATE
 )
 
 target_compile_definitions(n3ds-preprocess PRIVATE IMAGE_DECODER_HAS_BZ2=0)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(n3ds-preprocess PRIVATE m)
+endif()

@@ -3,12 +3,19 @@
 #include "../utils.h"
 
 #include <3ds.h>
+#include <stb/ds/stb_ds.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
 #define N3DS_ENABLE_LOGGING 0
+#define N3DS_FILE_BUFFER_SIZE (32u * 1024u)
+
+typedef struct N3DSFileSystemResolvedPathEntry {
+    char* key;
+    char* value;
+} N3DSFileSystemResolvedPathEntry;
 
 static FILE* gN3DSSdIoLogFile = NULL;
 
@@ -79,6 +86,11 @@ static bool N3DSFileSystem_hasScheme(const char* path) {
     return path != NULL && strstr(path, ":/") != NULL;
 }
 
+static void N3DSFileSystem_configureFileBuffer(FILE* file) {
+    if (file == NULL) return;
+    setvbuf(file, NULL, _IOFBF, N3DS_FILE_BUFFER_SIZE);
+}
+
 static bool N3DSFileSystem_pathExists(const char* path) {
     u64 startTick = svcGetSystemTick();
     struct stat st;
@@ -103,16 +115,43 @@ static char* N3DSFileSystem_join(const char* base, const char* relativePath) {
     return result;
 }
 
+static char* N3DSFileSystem_getCachedResolvedPath(N3DSFileSystem* n3ds, const char* relativePath) {
+    if (n3ds == NULL || relativePath == NULL) return NULL;
+    ptrdiff_t idx = shgeti(n3ds->resolvedPathCache, relativePath);
+    if (idx < 0) return NULL;
+    return safeStrdup(n3ds->resolvedPathCache[idx].value);
+}
+
+static void N3DSFileSystem_setCachedResolvedPath(N3DSFileSystem* n3ds, const char* relativePath, const char* resolvedPath) {
+    if (n3ds == NULL || relativePath == NULL || resolvedPath == NULL) return;
+    ptrdiff_t idx = shgeti(n3ds->resolvedPathCache, relativePath);
+    if (idx >= 0) {
+        free(n3ds->resolvedPathCache[idx].value);
+        n3ds->resolvedPathCache[idx].value = safeStrdup(resolvedPath);
+        return;
+    }
+
+    shput(n3ds->resolvedPathCache, relativePath, safeStrdup(resolvedPath));
+}
+
 static char* N3DSFileSystem_resolvePath(FileSystem* fs, const char* relativePath) {
     N3DSFileSystem* n3ds = (N3DSFileSystem*) fs;
     if (relativePath == NULL) return NULL;
     if (N3DSFileSystem_hasScheme(relativePath)) return safeStrdup(relativePath);
 
-    char* savePath = N3DSFileSystem_join(n3ds->saveBasePath, relativePath);
-    if (N3DSFileSystem_pathExists(savePath)) return savePath;
-    free(savePath);
+    char* cachedPath = N3DSFileSystem_getCachedResolvedPath(n3ds, relativePath);
+    if (cachedPath != NULL) return cachedPath;
 
-    return N3DSFileSystem_join(n3ds->romfsBasePath, relativePath);
+    char* romfsPath = N3DSFileSystem_join(n3ds->romfsBasePath, relativePath);
+    if (N3DSFileSystem_pathExists(romfsPath)) {
+        N3DSFileSystem_setCachedResolvedPath(n3ds, relativePath, romfsPath);
+        return romfsPath;
+    }
+
+    char* savePath = N3DSFileSystem_join(n3ds->saveBasePath, relativePath);
+    N3DSFileSystem_setCachedResolvedPath(n3ds, relativePath, savePath);
+    free(romfsPath);
+    return savePath;
 }
 
 static bool N3DSFileSystem_fileExists(FileSystem* fs, const char* relativePath) {
@@ -136,6 +175,7 @@ static char* N3DSFileSystem_readFileText(FileSystem* fs, const char* relativePat
         free(path);
         return NULL;
     }
+    N3DSFileSystem_configureFileBuffer(file);
 
     fseek(file, 0, SEEK_END);
     long size = ftell(file);
@@ -166,11 +206,15 @@ static bool N3DSFileSystem_writeFileText(FileSystem* fs, const char* relativePat
         free(path);
         return false;
     }
+    N3DSFileSystem_configureFileBuffer(file);
 
     size_t length = strlen(contents);
     bool ok = fwrite(contents, 1, length, file) == length;
     fclose(file);
     N3DSFileSystem_logSdIo("writeText", path, N3DSFileSystem_ticksToMs(svcGetSystemTick() - startTick), (long) length, ok);
+    if (ok) {
+        N3DSFileSystem_setCachedResolvedPath(n3ds, relativePath, path);
+    }
     free(path);
     return ok;
 }
@@ -182,6 +226,11 @@ static bool N3DSFileSystem_deleteFile(FileSystem* fs, const char* relativePath) 
     if (path == NULL) return false;
     int rc = remove(path);
     N3DSFileSystem_logSdIo("delete", path, N3DSFileSystem_ticksToMs(svcGetSystemTick() - startTick), 0, rc == 0);
+    if (rc == 0) {
+        char* romfsPath = N3DSFileSystem_join(n3ds->romfsBasePath, relativePath);
+        N3DSFileSystem_setCachedResolvedPath(n3ds, relativePath, romfsPath);
+        free(romfsPath);
+    }
     free(path);
     return rc == 0;
 }
@@ -197,6 +246,7 @@ static bool N3DSFileSystem_readFileBinary(FileSystem* fs, const char* relativePa
         free(path);
         return false;
     }
+    N3DSFileSystem_configureFileBuffer(file);
 
     fseek(file, 0, SEEK_END);
     long size = ftell(file);
@@ -229,10 +279,14 @@ static bool N3DSFileSystem_writeFileBinary(FileSystem* fs, const char* relativeP
         free(path);
         return false;
     }
+    N3DSFileSystem_configureFileBuffer(file);
 
     bool ok = fwrite(data, 1, (size_t) size, file) == (size_t) size;
     fclose(file);
     N3DSFileSystem_logSdIo("writeBin", path, N3DSFileSystem_ticksToMs(svcGetSystemTick() - startTick), size, ok);
+    if (ok) {
+        N3DSFileSystem_setCachedResolvedPath(n3ds, relativePath, path);
+    }
     free(path);
     return ok;
 }
@@ -252,6 +306,8 @@ N3DSFileSystem* N3DSFileSystem_create(const char* romfsBasePath, const char* sav
     fs->base.vtable = &N3DSFileSystem_vtable;
     fs->romfsBasePath = safeStrdup(romfsBasePath != NULL ? romfsBasePath : "romfs:/");
     fs->saveBasePath = safeStrdup(saveBasePath != NULL ? saveBasePath : "sdmc:/3ds/cinnamon/");
+    fs->resolvedPathCache = NULL;
+    sh_new_strdup(fs->resolvedPathCache);
     return fs;
 }
 
@@ -265,5 +321,9 @@ void N3DSFileSystem_destroy(N3DSFileSystem* fs) {
 #endif
     free(fs->romfsBasePath);
     free(fs->saveBasePath);
+    repeat(shlen(fs->resolvedPathCache), i) {
+        free(fs->resolvedPathCache[i].value);
+    }
+    shfree(fs->resolvedPathCache);
     free(fs);
 }
