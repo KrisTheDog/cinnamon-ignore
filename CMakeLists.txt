@@ -445,11 +445,10 @@ elseif(PLATFORM STREQUAL "n3ds")
     )
 
     target_compile_options(butterscotch PRIVATE
+        -O3
         -fomit-frame-pointer
         -ffunction-sections
         -fdata-sections
-        $<$<CONFIG:Release>:-O3>
-        $<$<CONFIG:RelWithDebInfo>:-O3>
         $<$<CONFIG:MinSizeRel>:-Os>
     )
     target_link_options(butterscotch PRIVATE -Wl,--gc-sections)

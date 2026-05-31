@@ -43,6 +43,12 @@
 #define N3DS_PREPROCESS_MAYBE_UNUSED
 #endif
 
+#if N3DS_PREPROCESS_HOST_WINDOWS
+#define N3DS_PREPROCESS_PATH_SEP "\\"
+#else
+#define N3DS_PREPROCESS_PATH_SEP "/"
+#endif
+
 #define N3DS_ATLAS_MAGIC 0x5441334Eu /* N3AT */
 #define N3DS_ATLAS_VERSION_T3X 2u
 #define N3DS_ATLAS_VERSION_FRAGMENTED 3u
@@ -561,7 +567,10 @@ static bool syncDirectoryTree(const char* srcDir, const char* dstDir, uint32_t* 
     WIN32_FIND_DATAA findData;
     snprintf(searchPath, sizeof(searchPath), "%s\\*", srcDir);
     HANDLE findHandle = FindFirstFileA(searchPath, &findData);
-    if (findHandle == INVALID_HANDLE_VALUE) return true;
+    if (findHandle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Failed to enumerate staged directory: %s\n", srcDir);
+        return false;
+    }
 
     bool ok = true;
     do {
@@ -584,6 +593,7 @@ static bool syncDirectoryTree(const char* srcDir, const char* dstDir, uint32_t* 
         bool needsCopy = !fileExists(dstChild) || !filesAreIdentical(srcChild, dstChild);
         if (needsCopy) {
             if (!copyFileContents(srcChild, dstChild)) {
+                fprintf(stderr, "Failed to copy staged asset: %s -> %s\n", srcChild, dstChild);
                 ok = false;
                 break;
             }
@@ -621,6 +631,7 @@ static bool syncDirectoryTree(const char* srcDir, const char* dstDir, uint32_t* 
         bool needsCopy = !fileExists(dstChild) || !filesAreIdentical(srcChild, dstChild);
         if (needsCopy) {
             if (!copyFileContents(srcChild, dstChild)) {
+                fprintf(stderr, "Failed to copy staged asset: %s -> %s\n", srcChild, dstChild);
                 ok = false;
                 break;
             }
@@ -3613,6 +3624,18 @@ static bool buildSdOutputDir(const char* sdInputPath, char* outOutputDir, size_t
         temp[--len] = '\0';
     }
 
+    if (pathLooksLikeRootDrive(temp)) {
+        char driveRoot[4];
+        snprintf(driveRoot, sizeof(driveRoot), "%c:", temp[0]);
+        snprintf(
+            outOutputDir,
+            outOutputDirSize,
+            "%s" N3DS_PREPROCESS_PATH_SEP "3ds" N3DS_PREPROCESS_PATH_SEP "cinnamon",
+            driveRoot
+        );
+        return true;
+    }
+
     const char* lastSlash = strrchr(temp, '/');
     const char* lastBackslash = strrchr(temp, '\\');
     const char* base = lastSlash;
@@ -3628,11 +3651,11 @@ static bool buildSdOutputDir(const char* sdInputPath, char* outOutputDir, size_t
         return true;
     }
     if (strcmp(base, "3ds") == 0) {
-        snprintf(outOutputDir, outOutputDirSize, "%s/cinnamon", temp);
+        snprintf(outOutputDir, outOutputDirSize, "%s" N3DS_PREPROCESS_PATH_SEP "cinnamon", temp);
         return true;
     }
 
-    snprintf(outOutputDir, outOutputDirSize, "%s/3ds/cinnamon", temp);
+    snprintf(outOutputDir, outOutputDirSize, "%s" N3DS_PREPROCESS_PATH_SEP "3ds" N3DS_PREPROCESS_PATH_SEP "cinnamon", temp);
     return true;
 }
 
@@ -4261,13 +4284,17 @@ int main(int argc, char** argv) {
     if (ok) ok = convertAudio(&options, dataWin);
     DataWin_free(dataWin);
 
-    if (ok && options.stageOutputLocally) {
-        ok = syncStagedOutputToDestination(&options);
+    bool syncedStaging = true;
+    if (options.stageOutputLocally) {
+        syncedStaging = ok && syncStagedOutputToDestination(&options);
+        ok = syncedStaging;
     }
-    if (options.stageOutputLocally && options.stagingOutputDirStorage[0] != '\0' && directoryExists(options.stagingOutputDirStorage)) {
+    if (syncedStaging && options.stageOutputLocally && options.stagingOutputDirStorage[0] != '\0' && directoryExists(options.stagingOutputDirStorage)) {
         if (!deleteDirectoryRecursive(options.stagingOutputDirStorage)) {
             fprintf(stderr, "Warning: failed to remove staging directory: %s\n", options.stagingOutputDirStorage);
         }
+    } else if (options.stageOutputLocally && options.stagingOutputDirStorage[0] != '\0' && directoryExists(options.stagingOutputDirStorage)) {
+        fprintf(stderr, "Preserving staging directory after failure: %s\n", options.stagingOutputDirStorage);
     }
 
     if (!ok) return 1;
