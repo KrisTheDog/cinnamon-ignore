@@ -3,6 +3,7 @@
 #include "../../src/utils.h"
 
 #include <stb/ds/stb_ds.h>
+#include <stb/image/stb_image.h>
 #include <stb/image/stb_image_write.h>
 
 #include <ctype.h>
@@ -67,6 +68,12 @@
 #define N3DS_SMALL_TEXTURE_SIZE 256u
 #define N3DS_LARGE_TEXTURE_SIZE 512u
 #define GMS2_TILE_INDEX_MASK  0x0007FFFFu
+#define CWAV_VERSION 0x02010000u
+#define CWAV_REF_DSP_ADPCM_INFO 0x0300u
+#define CWAV_REF_SAMPLE_DATA 0x1F00u
+#define CWAV_REF_INFO_BLOCK 0x7000u
+#define CWAV_REF_DATA_BLOCK 0x7001u
+#define CWAV_REF_CHANNEL_INFO 0x7100u
 
 typedef enum {
     N3DS_ATLAS_PAGE_MODE_AUTO = 0,
@@ -138,6 +145,8 @@ typedef struct {
     const char* outputDir;
     const char* tex3dsExe;
     const char* cwavtoolExe;
+    const char* spriteReplacementDir;
+    const char* borderAssetDir;
     const char* pageFormatOverridesPath;
     bool keepPng;
     bool dumpPagePreviews;
@@ -153,8 +162,12 @@ typedef struct {
     char stagingOutputDirStorage[1024];
     char tex3dsExeStorage[1024];
     char cwavtoolExeStorage[1024];
+    char spriteReplacementDirStorage[1200];
+    char borderAssetDirStorage[1200];
     char toolDirStorage[1024];
     bool stageOutputLocally;
+    bool spriteReplacementDirAvailable;
+    bool borderAssetDirAvailable;
 } Options;
 
 typedef struct {
@@ -164,6 +177,7 @@ typedef struct {
     char path[1024];
     char previewLabel[128];
     char debugNames[2048];
+    bool containsSprite;
     bool containsFont;
     bool containsBackground;
     bool containsNonMonoContent;
@@ -201,7 +215,10 @@ static bool ensureDirRecursive(const char* path);
 static char* dupParentDir(const char* path);
 static bool getProgramDirPath(const char* argv0, char* outDir, size_t outDirSize);
 static bool configureStagedOutputDir(Options* options, const char* argv0);
+static bool configureSpriteReplacementDir(Options* options, const char* argv0);
+static bool configureBorderAssetDir(Options* options, const char* argv0);
 static bool syncStagedOutputToDestination(const Options* options);
+static bool convertBorderAssets(const Options* options);
 static void writeLe32(uint8_t* ptr, uint32_t value);
 
 static void setDefaultOptions(Options* out) {
@@ -211,7 +228,7 @@ static void setDefaultOptions(Options* out) {
     out->enableTargetedBattleDialogueMono = false;
     out->interactiveMode = false;
     out->atlasPageMode = N3DS_ATLAS_PAGE_MODE_AUTO;
-    out->textureFormat = N3DS_TEXFMT_ETC1A4;
+    out->textureFormat = N3DS_TEXFMT_HYBRID;
     out->stageOutputLocally = true;
 }
 
@@ -223,6 +240,8 @@ static void printUsage(const char* argv0) {
         "           [--l4-dialogue-battle-sprites]\n"
         "           [--dump-page-previews]\n"
         "           [--page-format-overrides <file>]\n"
+        "           [--sprite-replacements <dir>]\n"
+        "           [--borders <dir>]\n"
         "\n"
         "Running with no arguments on Windows starts an interactive setup.\n"
         "\n"
@@ -230,7 +249,6 @@ static void printUsage(const char* argv0) {
         "  <output-dir>/gfx/atlas.bin\n"
         "  <output-dir>/gfx/direct_assets.bin\n"
         "  <output-dir>/gfx/page_000.t3x ...\n"
-        "  <output-dir>/audio/sound_00000.bcwav ...\n"
         "  <output-dir>/audio/sound_bank.bin\n",
         argv0
     );
@@ -339,6 +357,14 @@ static bool parseArgs(int argc, char** argv, Options* out) {
             out->dumpPagePreviews = true;
             continue;
         }
+        if (strcmp(argv[i], "--sprite-replacements") == 0 && i + 1 < argc) {
+            out->spriteReplacementDir = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--borders") == 0 && i + 1 < argc) {
+            out->borderAssetDir = argv[++i];
+            continue;
+        }
         if (strcmp(argv[i], "--atlas-page-mode") == 0 && i + 1 < argc) {
             const char* mode = argv[++i];
             if (strcmp(mode, "auto") == 0) out->atlasPageMode = N3DS_ATLAS_PAGE_MODE_AUTO;
@@ -431,6 +457,13 @@ static bool ensureOutputDirs(const char* outputDir) {
     snprintf(backgroundsDir, sizeof(backgroundsDir), "%s/gfx/backgrounds", outputDir);
     if (!ensureDirRecursive(backgroundsDir)) {
         fprintf(stderr, "Failed to create backgrounds dir: %s\n", backgroundsDir);
+        return false;
+    }
+
+    char bordersDir[1024];
+    snprintf(bordersDir, sizeof(bordersDir), "%s/gfx/borders", outputDir);
+    if (!ensureDirRecursive(bordersDir)) {
+        fprintf(stderr, "Failed to create borders dir: %s\n", bordersDir);
         return false;
     }
 
@@ -665,6 +698,98 @@ static bool configureStagedOutputDir(Options* options, const char* argv0) {
     }
 
     options->outputDir = options->stagingOutputDirStorage;
+    return true;
+}
+
+static bool configureSpriteReplacementDir(Options* options, const char* argv0) {
+    if (options == NULL) return false;
+
+    if (options->spriteReplacementDir == NULL || options->spriteReplacementDir[0] == '\0') {
+        char programDir[1024];
+        if (options->toolDirStorage[0] != '\0') {
+            snprintf(programDir, sizeof(programDir), "%s", options->toolDirStorage);
+        } else if (!getProgramDirPath(argv0, programDir, sizeof(programDir))) {
+            return false;
+        }
+
+        snprintf(
+            options->spriteReplacementDirStorage,
+            sizeof(options->spriteReplacementDirStorage),
+            "%s/Sprite_replacements",
+            programDir
+        );
+#if defined(N3DS_PREPROCESS_SOURCE_DIR)
+        if (!directoryExists(options->spriteReplacementDirStorage)) {
+            char sourceReplacementDir[1200];
+            snprintf(
+                sourceReplacementDir,
+                sizeof(sourceReplacementDir),
+                "%s/Sprite_replacements",
+                N3DS_PREPROCESS_SOURCE_DIR
+            );
+            if (directoryExists(sourceReplacementDir)) {
+                snprintf(
+                    options->spriteReplacementDirStorage,
+                    sizeof(options->spriteReplacementDirStorage),
+                    "%s",
+                    sourceReplacementDir
+                );
+            }
+        }
+#endif
+        options->spriteReplacementDir = options->spriteReplacementDirStorage;
+    }
+
+    options->spriteReplacementDirAvailable = directoryExists(options->spriteReplacementDir);
+    if (options->spriteReplacementDirAvailable) {
+        fprintf(stderr, "Using sprite replacements from: %s\n", options->spriteReplacementDir);
+    }
+    return true;
+}
+
+static bool configureBorderAssetDir(Options* options, const char* argv0) {
+    if (options == NULL) return false;
+
+    if (options->borderAssetDir == NULL || options->borderAssetDir[0] == '\0') {
+        char programDir[1024];
+        if (options->toolDirStorage[0] != '\0') {
+            snprintf(programDir, sizeof(programDir), "%s", options->toolDirStorage);
+        } else if (!getProgramDirPath(argv0, programDir, sizeof(programDir))) {
+            return false;
+        }
+
+        snprintf(
+            options->borderAssetDirStorage,
+            sizeof(options->borderAssetDirStorage),
+            "%s/Borders",
+            programDir
+        );
+#if defined(N3DS_PREPROCESS_SOURCE_DIR)
+        if (!directoryExists(options->borderAssetDirStorage)) {
+            char sourceBorderDir[1200];
+            snprintf(
+                sourceBorderDir,
+                sizeof(sourceBorderDir),
+                "%s/Borders",
+                N3DS_PREPROCESS_SOURCE_DIR
+            );
+            if (directoryExists(sourceBorderDir)) {
+                snprintf(
+                    options->borderAssetDirStorage,
+                    sizeof(options->borderAssetDirStorage),
+                    "%s",
+                    sourceBorderDir
+                );
+            }
+        }
+#endif
+        options->borderAssetDir = options->borderAssetDirStorage;
+    }
+
+    options->borderAssetDirAvailable = directoryExists(options->borderAssetDir);
+    if (options->borderAssetDirAvailable) {
+        fprintf(stderr, "Using border assets from: %s\n", options->borderAssetDir);
+    }
     return true;
 }
 
@@ -1044,6 +1169,7 @@ static bool pageCanUseMonoFormat(const OutputPage* page) {
 
 static bool pageShouldForceRGBA5551(const OutputPage* page) {
     if (page == NULL) return false;
+    if (page->containsSprite) return true;
     if (page->containsBackground) return true;
     const char* names = page->debugNames;
     if (names == NULL || names[0] == '\0') return false;
@@ -1750,6 +1876,223 @@ static void blitRect(uint8_t* dst, uint32_t dstStride, uint32_t dstX, uint32_t d
     }
 }
 
+static void sanitizeSpriteReplacementStem(const char* value, char* out, size_t outSize) {
+    if (out == NULL || outSize == 0) return;
+    out[0] = '\0';
+    if (value == NULL || value[0] == '\0') return;
+
+    size_t writeIndex = 0;
+    for (size_t i = 0; value[i] != '\0' && writeIndex + 1 < outSize; ++i) {
+        unsigned char c = (unsigned char) value[i];
+        if (isalnum(c) || c == '_' || c == '-' || c == '.') {
+            out[writeIndex++] = (char) c;
+        } else {
+            out[writeIndex++] = '_';
+        }
+    }
+    out[writeIndex] = '\0';
+}
+
+static bool tryLoadSpriteReplacementCandidate(
+    const Options* options,
+    const char* filename,
+    const Sprite* sprite,
+    uint32_t spriteIndex,
+    uint32_t frameIndex,
+    uint32_t expectedWidth,
+    uint32_t expectedHeight,
+    uint8_t* outPixels
+) {
+    if (options == NULL || filename == NULL || outPixels == NULL) return false;
+    if (options->spriteReplacementDir == NULL || options->spriteReplacementDir[0] == '\0') return false;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", options->spriteReplacementDir, filename);
+    if (!fileExists(path)) return false;
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    uint8_t* pixels = stbi_load(path, &width, &height, &channels, 4);
+    if (pixels == NULL) {
+        fprintf(stderr, "Warning: failed to load sprite replacement PNG: %s\n", path);
+        return false;
+    }
+
+    if (width != (int) expectedWidth || height != (int) expectedHeight) {
+        fprintf(
+            stderr,
+            "Warning: ignoring sprite replacement %s for sprite %05lu/%05lu (%s): expected %lux%lu, got %dx%d\n",
+            path,
+            (unsigned long) spriteIndex,
+            (unsigned long) frameIndex,
+            sprite != NULL && sprite->name != NULL ? sprite->name : "<unnamed>",
+            (unsigned long) expectedWidth,
+            (unsigned long) expectedHeight,
+            width,
+            height
+        );
+        stbi_image_free(pixels);
+        return false;
+    }
+
+    memcpy(outPixels, pixels, (size_t) expectedWidth * expectedHeight * 4u);
+    stbi_image_free(pixels);
+    fprintf(
+        stderr,
+        "n3ds-preprocess: sprite replacement %05lu/%05lu <- %s\n",
+        (unsigned long) spriteIndex,
+        (unsigned long) frameIndex,
+        path
+    );
+    return true;
+}
+
+static bool tryApplySpriteReplacement(
+    const Options* options,
+    const Sprite* sprite,
+    uint32_t spriteIndex,
+    uint32_t frameIndex,
+    uint32_t expectedWidth,
+    uint32_t expectedHeight,
+    uint8_t* outPixels
+) {
+    if (options == NULL || sprite == NULL || outPixels == NULL) return false;
+    if (!options->spriteReplacementDirAvailable) return false;
+
+    char filename[320];
+    char spriteStem[192];
+    sanitizeSpriteReplacementStem(sprite->name, spriteStem, sizeof(spriteStem));
+
+    if (spriteStem[0] != '\0') {
+        snprintf(filename, sizeof(filename), "%s_frame_%lu.png", spriteStem, (unsigned long) frameIndex);
+        if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+
+        snprintf(filename, sizeof(filename), "%s_frame_%05lu.png", spriteStem, (unsigned long) frameIndex);
+        if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+
+        snprintf(filename, sizeof(filename), "%s_%lu.png", spriteStem, (unsigned long) frameIndex);
+        if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+
+        snprintf(filename, sizeof(filename), "%s_%05lu.png", spriteStem, (unsigned long) frameIndex);
+        if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+
+        if (sprite->textureCount <= 1) {
+            snprintf(filename, sizeof(filename), "%s.png", spriteStem);
+            if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+        }
+    }
+
+    snprintf(filename, sizeof(filename), "spr_%05lu_frame_%lu.png", (unsigned long) spriteIndex, (unsigned long) frameIndex);
+    if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+
+    snprintf(filename, sizeof(filename), "spr_%05lu_frame_%05lu.png", (unsigned long) spriteIndex, (unsigned long) frameIndex);
+    if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+
+    snprintf(filename, sizeof(filename), "spr_%05lu_%lu.png", (unsigned long) spriteIndex, (unsigned long) frameIndex);
+    if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+
+    snprintf(filename, sizeof(filename), "spr_%05lu_%05lu.png", (unsigned long) spriteIndex, (unsigned long) frameIndex);
+    if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+
+    if (sprite->textureCount <= 1) {
+        snprintf(filename, sizeof(filename), "spr_%05lu.png", (unsigned long) spriteIndex);
+        if (tryLoadSpriteReplacementCandidate(options, filename, sprite, spriteIndex, frameIndex, expectedWidth, expectedHeight, outPixels)) return true;
+    }
+
+    return false;
+}
+
+static bool filenameHasPngExtension(const char* filename) {
+    if (filename == NULL) return false;
+    size_t len = strlen(filename);
+    if (len < 5) return false;
+    const char* ext = filename + len - 4;
+    return tolower((unsigned char) ext[0]) == '.' &&
+        tolower((unsigned char) ext[1]) == 'p' &&
+        tolower((unsigned char) ext[2]) == 'n' &&
+        tolower((unsigned char) ext[3]) == 'g';
+}
+
+static bool copyPngStem(char* out, size_t outSize, const char* filename) {
+    if (out == NULL || outSize == 0 || !filenameHasPngExtension(filename)) return false;
+    size_t stemLen = strlen(filename) - 4u;
+    if (stemLen == 0 || stemLen >= outSize) return false;
+    memcpy(out, filename, stemLen);
+    out[stemLen] = '\0';
+    return true;
+}
+
+static bool convertBorderAssetPng(const Options* options, const char* filename, uint32_t* convertedCount) {
+    if (options == NULL || filename == NULL) return false;
+    if (!filenameHasPngExtension(filename)) return true;
+
+    char stem[256];
+    if (!copyPngStem(stem, sizeof(stem), filename)) return true;
+
+    char inputPath[1400];
+    char outputPath[1400];
+    snprintf(inputPath, sizeof(inputPath), "%s/%s", options->borderAssetDir, filename);
+    snprintf(outputPath, sizeof(outputPath), "%s/gfx/borders/%s.t3x", options->outputDir, stem);
+
+    fprintf(stderr, "n3ds-preprocess: border %s -> %s\n", inputPath, outputPath);
+    if (!runTex3ds(options->tex3dsExe, inputPath, outputPath, N3DS_TEXFMT_RGBA5551)) {
+        fprintf(stderr, "Failed to convert border asset: %s\n", inputPath);
+        return false;
+    }
+
+    if (convertedCount != NULL) (*convertedCount)++;
+    return true;
+}
+
+static bool convertBorderAssets(const Options* options) {
+    if (options == NULL) return false;
+    if (!options->borderAssetDirAvailable) return true;
+
+    uint32_t convertedCount = 0;
+    bool ok = true;
+
+#if N3DS_PREPROCESS_HOST_WINDOWS
+    char searchPath[1400];
+    WIN32_FIND_DATAA findData;
+    snprintf(searchPath, sizeof(searchPath), "%s\\*.png", options->borderAssetDir);
+    HANDLE findHandle = FindFirstFileA(searchPath, &findData);
+    if (findHandle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Border assets: converted=0\n");
+        return true;
+    }
+
+    do {
+        if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        if (!convertBorderAssetPng(options, findData.cFileName, &convertedCount)) {
+            ok = false;
+            break;
+        }
+    } while (FindNextFileA(findHandle, &findData));
+
+    FindClose(findHandle);
+#else
+    DIR* dir = opendir(options->borderAssetDir);
+    if (dir == NULL) {
+        fprintf(stderr, "Border assets: converted=0\n");
+        return true;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!convertBorderAssetPng(options, entry->d_name, &convertedCount)) {
+            ok = false;
+            break;
+        }
+    }
+
+    closedir(dir);
+#endif
+
+    if (ok) fprintf(stderr, "Border assets: converted=%u\n", convertedCount);
+    return ok;
+}
+
 static bool writeDirectTextureAsset(const Options* options, const char* relativePathNoExt, const uint8_t* rgba, uint32_t width, uint32_t height, N3DSTextureFormat format) {
     if (options == NULL || relativePathNoExt == NULL || rgba == NULL || width == 0 || height == 0) return false;
 
@@ -1815,13 +2158,29 @@ static bool emitDirectSpriteFrameAsset(
     if (logicalW > 1024 || logicalH > 1024) return true;
 
     uint8_t* framePixels = safeCalloc((size_t) logicalW * (size_t) logicalH, 4u);
-    if ((uint32_t) item->targetX < logicalW && (uint32_t) item->targetY < logicalH) {
-        uint32_t copyW = item->sourceWidth;
-        uint32_t copyH = item->sourceHeight;
-        if ((uint32_t) item->targetX + copyW > logicalW) copyW = logicalW - (uint32_t) item->targetX;
-        if ((uint32_t) item->targetY + copyH > logicalH) copyH = logicalH - (uint32_t) item->targetY;
-        blitRect(framePixels, logicalW, item->targetX, item->targetY, rgba, stride, item->sourceX, item->sourceY, copyW, copyH);
+    int32_t dstX = (int32_t) item->targetX;
+    int32_t dstY = (int32_t) item->targetY;
+    int32_t srcX = (int32_t) item->sourceX;
+    int32_t srcY = (int32_t) item->sourceY;
+    int32_t copyW = (int32_t) item->sourceWidth;
+    int32_t copyH = (int32_t) item->sourceHeight;
+    if (dstX < 0) {
+        srcX -= dstX;
+        copyW += dstX;
+        dstX = 0;
     }
+    if (dstY < 0) {
+        srcY -= dstY;
+        copyH += dstY;
+        dstY = 0;
+    }
+    if (dstX + copyW > (int32_t) logicalW) copyW = (int32_t) logicalW - dstX;
+    if (dstY + copyH > (int32_t) logicalH) copyH = (int32_t) logicalH - dstY;
+    if (copyW > 0 && copyH > 0 && dstX >= 0 && dstY >= 0 && srcX >= 0 && srcY >= 0) {
+        blitRect(framePixels, logicalW, (uint32_t) dstX, (uint32_t) dstY, rgba, stride, (uint32_t) srcX, (uint32_t) srcY, (uint32_t) copyW, (uint32_t) copyH);
+    }
+
+    tryApplySpriteReplacement(options, sprite, spriteIndex, frameIndex, logicalW, logicalH, framePixels);
 
     if (spriteFormatStates != NULL) {
         DirectSpriteFormatState* state = &spriteFormatStates[spriteIndex];
@@ -2393,6 +2752,7 @@ static bool convertTextures(const Options* options, DataWin* dataWin) {
                     if (tpagDebugNames != NULL && tpagDebugNames[itemIndex] != NULL) {
                         appendPageDebugName(outputPage, tpagDebugNames[itemIndex]);
                     }
+                    if (tpagToSpriteIndex != NULL && tpagToSpriteIndex[itemIndex] >= 0) outputPage->containsSprite = true;
                     if (fontTPAGs != NULL && fontTPAGs[itemIndex]) outputPage->containsFont = true;
                     if (backgroundTPAGs != NULL && backgroundTPAGs[itemIndex]) outputPage->containsBackground = true;
                     if (!itemMonoSafe) outputPage->containsNonMonoContent = true;
@@ -2803,6 +3163,7 @@ typedef struct {
 } EncodedContext;
 
 typedef struct {
+    uint32_t sampleRate;
     uint32_t sampleCount;
     uint32_t channelCount;
     int16_t* interleavedPcm;
@@ -2840,8 +3201,12 @@ typedef struct {
 } DspPredictorPair;
 
 static N3DS_PREPROCESS_MAYBE_UNUSED bool loadWavPcm16(const char* path, WavPcm16* out);
+static N3DS_PREPROCESS_MAYBE_UNUSED bool loadWavPcm16FromMemory(const uint8_t* data, uint32_t dataSize, WavPcm16* out);
 static N3DS_PREPROCESS_MAYBE_UNUSED bool loadVorbisPcm16(const char* path, WavPcm16* out);
+static N3DS_PREPROCESS_MAYBE_UNUSED bool loadVorbisPcm16FromMemory(const uint8_t* data, uint32_t dataSize, WavPcm16* out);
 static N3DS_PREPROCESS_MAYBE_UNUSED bool loadAudioPcm16(const char* path, WavPcm16* out);
+static N3DS_PREPROCESS_MAYBE_UNUSED bool loadAudioPcm16FromMemory(const uint8_t* data, uint32_t dataSize, WavPcm16* out);
+static N3DS_PREPROCESS_MAYBE_UNUSED bool resampleWavPcm16(WavPcm16* wav, uint32_t targetRate);
 static N3DS_PREPROCESS_MAYBE_UNUSED void freeWavPcm16(WavPcm16* wav);
 static N3DS_PREPROCESS_MAYBE_UNUSED bool writeBcwavFile(const char* path, const WavPcm16* wav);
 
@@ -2887,8 +3252,8 @@ static int signExtend4(int nibble) {
     return (nibble & 0x8) ? (nibble - 16) : nibble;
 }
 
-static uint32_t align4(uint32_t value) {
-    return (value + 3u) & ~3u;
+static uint32_t align32(uint32_t value) {
+    return (value + 31u) & ~31u;
 }
 
 static int clampNibble(int value) {
@@ -3030,13 +3395,13 @@ static bool pathHasExtension(const char* path, const char* extension) {
     return true;
 }
 
-static bool isBuiltinAudioInputPath(const char* path) {
+static N3DS_PREPROCESS_MAYBE_UNUSED bool isBuiltinAudioInputPath(const char* path) {
     return pathHasExtension(path, ".wav") ||
         pathHasExtension(path, ".ogg") ||
         pathHasExtension(path, ".oga");
 }
 
-static bool writeBcwavFromInputFile(const char* inputPath, const char* outputPath) {
+static N3DS_PREPROCESS_MAYBE_UNUSED bool writeBcwavFromInputFile(const char* inputPath, const char* outputPath) {
     WavPcm16 wav;
     if (!loadAudioPcm16(inputPath, &wav)) {
         fprintf(stderr, "Built-in BCWAV writer could not decode audio: %s\n", inputPath);
@@ -3064,51 +3429,38 @@ static const char* pickAudioTempExtension(const Sound* sound) {
 }
 
 static N3DS_PREPROCESS_MAYBE_UNUSED bool loadWavPcm16(const char* path, WavPcm16* out) {
+    uint8_t* blob = NULL;
+    uint32_t blobSize = 0;
+    bool ok = readBytesFromFile(path, &blob, &blobSize) &&
+        loadWavPcm16FromMemory(blob, blobSize, out);
+    free(blob);
+    return ok;
+}
+
+static N3DS_PREPROCESS_MAYBE_UNUSED bool loadWavPcm16FromMemory(const uint8_t* blob, uint32_t blobSize, WavPcm16* out) {
+    if (blob == NULL || out == NULL) return false;
     memset(out, 0, sizeof(*out));
 
-    FILE* file = fopen(path, "rb");
-    if (file == NULL) return false;
-
-    fseek(file, 0, SEEK_END);
-    long sizeLong = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    if (sizeLong <= 0) {
-        fclose(file);
-        return false;
-    }
-
-    uint8_t* blob = safeMalloc((size_t) sizeLong);
-    if (fread(blob, 1, (size_t) sizeLong, file) != (size_t) sizeLong) {
-        fclose(file);
-        free(blob);
-        return false;
-    }
-    fclose(file);
-
-    if (sizeLong < 44 || memcmp(blob, "RIFF", 4) != 0 || memcmp(blob + 8, "WAVE", 4) != 0) {
-        free(blob);
-        return false;
-    }
+    if (blobSize < 44 || memcmp(blob, "RIFF", 4) != 0 || memcmp(blob + 8, "WAVE", 4) != 0) return false;
 
     uint16_t formatTag = 0;
     uint16_t channels = 0;
     uint16_t bitsPerSample = 0;
+    uint32_t sampleRate = 0;
     const uint8_t* sampleData = NULL;
     uint32_t sampleDataSize = 0;
     size_t offset = 12;
-    while (offset + 8 <= (size_t) sizeLong) {
+    while (offset + 8 <= blobSize) {
         const uint8_t* chunk = blob + offset;
         uint32_t chunkSize = readLe32(chunk + 4);
         size_t payloadOffset = offset + 8;
         size_t nextOffset = payloadOffset + chunkSize + (chunkSize & 1u);
-        if (payloadOffset + chunkSize > (size_t) sizeLong) {
-            free(blob);
-            return false;
-        }
+        if (payloadOffset + chunkSize > blobSize) return false;
 
         if (memcmp(chunk, "fmt ", 4) == 0 && chunkSize >= 16) {
             formatTag = readLe16(blob + payloadOffset + 0);
             channels = readLe16(blob + payloadOffset + 2);
+            sampleRate = readLe32(blob + payloadOffset + 4);
             bitsPerSample = readLe16(blob + payloadOffset + 14);
         } else if (memcmp(chunk, "data", 4) == 0) {
             sampleData = blob + payloadOffset;
@@ -3118,43 +3470,102 @@ static N3DS_PREPROCESS_MAYBE_UNUSED bool loadWavPcm16(const char* path, WavPcm16
         offset = nextOffset;
     }
 
-    if (formatTag != 1 || channels == 0 || channels > 2 || bitsPerSample != 16 || sampleData == NULL || sampleDataSize == 0) {
-        free(blob);
+    if (formatTag != 1 || channels == 0 || channels > 2 || sampleRate == 0 || bitsPerSample != 16 || sampleData == NULL || sampleDataSize == 0) {
         return false;
     }
 
     size_t sampleCount = sampleDataSize / sizeof(int16_t);
     out->interleavedPcm = safeMalloc(sampleCount * sizeof(int16_t));
     memcpy(out->interleavedPcm, sampleData, sampleCount * sizeof(int16_t));
+    out->sampleRate = sampleRate;
     out->channelCount = channels;
     out->sampleCount = (uint32_t) (sampleCount / channels);
-    free(blob);
     return true;
 }
 
 static N3DS_PREPROCESS_MAYBE_UNUSED bool loadVorbisPcm16(const char* path, WavPcm16* out) {
-    if (path == NULL || out == NULL) return false;
+    uint8_t* blob = NULL;
+    uint32_t blobSize = 0;
+    bool ok = readBytesFromFile(path, &blob, &blobSize) &&
+        loadVorbisPcm16FromMemory(blob, blobSize, out);
+    free(blob);
+    return ok;
+}
+
+static N3DS_PREPROCESS_MAYBE_UNUSED bool loadVorbisPcm16FromMemory(const uint8_t* data, uint32_t dataSize, WavPcm16* out) {
+    if (data == NULL || out == NULL || dataSize > INT_MAX) return false;
     memset(out, 0, sizeof(*out));
 
     int channels = 0;
     int sampleRate = 0;
     short* decoded = NULL;
-    int sampleCount = stb_vorbis_decode_filename(path, &channels, &sampleRate, &decoded);
+    int sampleCount = stb_vorbis_decode_memory(data, (int) dataSize, &channels, &sampleRate, &decoded);
     if (sampleCount <= 0 || decoded == NULL || channels <= 0 || channels > 2 || sampleRate <= 0) {
         free(decoded);
         return false;
     }
 
     out->channelCount = (uint32_t) channels;
+    out->sampleRate = (uint32_t) sampleRate;
     out->sampleCount = (uint32_t) sampleCount;
     out->interleavedPcm = (int16_t*) decoded;
     return true;
 }
 
 static N3DS_PREPROCESS_MAYBE_UNUSED bool loadAudioPcm16(const char* path, WavPcm16* out) {
-    if (pathHasExtension(path, ".wav")) return loadWavPcm16(path, out);
-    if (pathHasExtension(path, ".ogg") || pathHasExtension(path, ".oga")) return loadVorbisPcm16(path, out);
-    return false;
+    uint8_t* blob = NULL;
+    uint32_t blobSize = 0;
+    bool ok = readBytesFromFile(path, &blob, &blobSize) &&
+        loadAudioPcm16FromMemory(blob, blobSize, out);
+    free(blob);
+    return ok;
+}
+
+static N3DS_PREPROCESS_MAYBE_UNUSED bool loadAudioPcm16FromMemory(const uint8_t* data, uint32_t dataSize, WavPcm16* out) {
+    if (data == NULL || out == NULL || dataSize < 4) return false;
+    if (dataSize >= 12 && memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "WAVE", 4) == 0) {
+        return loadWavPcm16FromMemory(data, dataSize, out);
+    }
+    if (memcmp(data, "OggS", 4) == 0) {
+        return loadVorbisPcm16FromMemory(data, dataSize, out);
+    }
+    return loadVorbisPcm16FromMemory(data, dataSize, out);
+}
+
+static N3DS_PREPROCESS_MAYBE_UNUSED bool resampleWavPcm16(WavPcm16* wav, uint32_t targetRate) {
+    if (wav == NULL || wav->interleavedPcm == NULL || wav->sampleCount == 0 || wav->channelCount == 0 || targetRate == 0) return false;
+    if (wav->sampleRate == 0) wav->sampleRate = targetRate;
+    if (wav->sampleRate == targetRate) return true;
+
+    uint64_t dstFrames64 = ((uint64_t) wav->sampleCount * targetRate + wav->sampleRate / 2u) / wav->sampleRate;
+    if (dstFrames64 == 0 || dstFrames64 > UINT32_MAX) return false;
+
+    uint32_t dstFrames = (uint32_t) dstFrames64;
+    size_t dstSamples = (size_t) dstFrames * wav->channelCount;
+    int16_t* dst = safeMalloc(dstSamples * sizeof(int16_t));
+
+    repeat(dstFrames, dstFrame) {
+        uint64_t srcPos = (uint64_t) dstFrame * wav->sampleRate;
+        uint32_t srcFrame = (uint32_t) (srcPos / targetRate);
+        uint32_t frac = (uint32_t) (srcPos % targetRate);
+        if (srcFrame >= wav->sampleCount) srcFrame = wav->sampleCount - 1u;
+        uint32_t nextFrame = srcFrame + 1u < wav->sampleCount ? srcFrame + 1u : srcFrame;
+
+        repeat(wav->channelCount, channel) {
+            int a = wav->interleavedPcm[(size_t) srcFrame * wav->channelCount + channel];
+            int b = wav->interleavedPcm[(size_t) nextFrame * wav->channelCount + channel];
+            int value = a + (int) (((int64_t) (b - a) * frac + targetRate / 2u) / targetRate);
+            if (value < -32768) value = -32768;
+            if (value > 32767) value = 32767;
+            dst[(size_t) dstFrame * wav->channelCount + channel] = (int16_t) value;
+        }
+    }
+
+    free(wav->interleavedPcm);
+    wav->interleavedPcm = dst;
+    wav->sampleCount = dstFrames;
+    wav->sampleRate = targetRate;
+    return true;
 }
 
 static N3DS_PREPROCESS_MAYBE_UNUSED void freeWavPcm16(WavPcm16* wav) {
@@ -3287,6 +3698,7 @@ static N3DS_PREPROCESS_MAYBE_UNUSED bool decodeBcwavToPcm(const uint8_t* fileDat
         sampleCursor += samplesThisFrame;
     }
 
+    out->sampleRate = bcwav->sampleRate;
     out->sampleCount = bcwav->sampleCount;
     out->channelCount = bcwav->channelCount;
     out->interleavedPcm = pcm;
@@ -3312,25 +3724,49 @@ static bool stringContainsIgnoreCase(const char* haystack, const char* needle) {
     return false;
 }
 
+static bool nameLooksLikeSfx(const char* value) {
+    if (value == NULL || value[0] == '\0') return false;
+    const char* base = strrchr(value, '/');
+    const char* backslash = strrchr(value, '\\');
+    if (backslash != NULL && (base == NULL || backslash > base)) base = backslash;
+    base = (base != NULL) ? base + 1 : value;
+
+    return strncmp(base, "mus_sfx", 7) == 0 ||
+        strncmp(base, "sfx_", 4) == 0 ||
+        strncmp(base, "snd_", 4) == 0 ||
+        stringContainsIgnoreCase(base, "_sfx") ||
+        stringContainsIgnoreCase(base, "sfx_");
+}
+
 static bool nameLooksLikeMusic(const char* value) {
     if (value == NULL || value[0] == '\0') return false;
     const char* base = strrchr(value, '/');
     const char* backslash = strrchr(value, '\\');
     if (backslash != NULL && (base == NULL || backslash > base)) base = backslash;
     base = (base != NULL) ? base + 1 : value;
+    if (nameLooksLikeSfx(base)) return false;
     if (strncmp(base, "mus_", 4) == 0 || strncmp(base, "bgm_", 4) == 0) return true;
     return stringContainsIgnoreCase(base, "music");
 }
 
-static bool soundLooksLikeMusic(const Sound* sound) {
+static bool soundLooksLikeSfx(const Sound* sound) {
     if (sound == NULL) return false;
+    return nameLooksLikeSfx(sound->name) ||
+        nameLooksLikeSfx(sound->file) ||
+        stringContainsIgnoreCase(sound->type, "sfx") ||
+        stringContainsIgnoreCase(sound->type, "effect");
+}
+
+static N3DS_PREPROCESS_MAYBE_UNUSED bool soundLooksLikeMusic(const Sound* sound) {
+    if (sound == NULL) return false;
+    if (soundLooksLikeSfx(sound)) return false;
     return nameLooksLikeMusic(sound->name) ||
         nameLooksLikeMusic(sound->file) ||
         stringContainsIgnoreCase(sound->type, "music") ||
         stringContainsIgnoreCase(sound->type, "stream");
 }
 
-static bool extractBaseNameNoExt(const char* value, char* out, size_t outSize) {
+static N3DS_PREPROCESS_MAYBE_UNUSED bool extractBaseNameNoExt(const char* value, char* out, size_t outSize) {
     if (out == NULL || outSize == 0) return false;
     out[0] = '\0';
     if (value == NULL || value[0] == '\0') return false;
@@ -3821,6 +4257,10 @@ static bool encodeChannelDspAdpcm(const int16_t* channelSamples, uint32_t sample
 
         if (!found) return false;
         memcpy(out->data + (size_t) frameIndex * 8u, bestFrame, 8u);
+        if (frameIndex == 0) {
+            out->startContext.predictorScale = bestFrame[0];
+            out->loopContext = out->startContext;
+        }
         hist1 = bestHist1;
         hist2 = bestHist2;
     }
@@ -3837,49 +4277,59 @@ static N3DS_PREPROCESS_MAYBE_UNUSED bool writeBcwavFile(const char* path, const 
     EncodedBcwavChannel channels[2];
     memset(channels, 0, sizeof(channels));
     bool ok = false;
+    uint32_t encodedSampleCount = ((wav->sampleCount + 13u) / 14u) * 14u;
+    if (encodedSampleCount == 0) return false;
 
     repeat(wav->channelCount, channelIndex) {
-        int16_t* mono = safeMalloc((size_t) wav->sampleCount * sizeof(int16_t));
+        int16_t* mono = safeCalloc(encodedSampleCount, sizeof(int16_t));
         repeat(wav->sampleCount, sampleIndex) {
             mono[sampleIndex] = wav->interleavedPcm[(size_t) sampleIndex * wav->channelCount + channelIndex];
         }
-        if (!encodeChannelDspAdpcm(mono, wav->sampleCount, &channels[channelIndex])) {
+        if (!encodeChannelDspAdpcm(mono, encodedSampleCount, &channels[channelIndex])) {
             free(mono);
             goto cleanup;
         }
         free(mono);
     }
 
-    uint32_t infoOffset = 0x40u;
+    uint32_t headerSize = 0x40u;
+    uint32_t infoOffset = headerSize;
     uint32_t channelInfoOffset = 0x20u + wav->channelCount * 8u;
     uint32_t adpcmInfoOffset = channelInfoOffset + wav->channelCount * 0x14u;
-    uint32_t infoSize = align4(adpcmInfoOffset + wav->channelCount * 0x2Eu);
+    uint32_t infoSize = align32(adpcmInfoOffset + wav->channelCount * 0x2Eu);
     uint32_t sampleDataSize = 0;
     repeat(wav->channelCount, i) {
         sampleDataSize += channels[i].dataSize;
     }
     uint32_t dataOffset = infoOffset + infoSize;
-    uint32_t fileSize = dataOffset + 8u + sampleDataSize;
+    uint32_t dataPayloadOffset = align32(dataOffset + 8u);
+    uint32_t dataPayloadPadding = dataPayloadOffset - (dataOffset + 8u);
+    uint32_t dataSize = 8u + dataPayloadPadding + sampleDataSize;
+    uint32_t fileSize = dataOffset + dataSize;
+    uint32_t sampleRate = wav->sampleRate != 0 ? wav->sampleRate : N3DS_AUDIO_SAMPLE_RATE;
 
     uint8_t* blob = safeCalloc(1, fileSize);
     memcpy(blob, "CWAV", 4);
     writeLe16(blob + 4, 0xFEFFu);
-    writeLe16(blob + 6, 0x40u);
-    writeLe32(blob + 8, fileSize);
-    writeLe16(blob + 0x0C, 2u);
+    writeLe16(blob + 6, (uint16_t) headerSize);
+    writeLe32(blob + 8, CWAV_VERSION);
+    writeLe32(blob + 0x0C, fileSize);
+    writeLe16(blob + 0x10, 2u);
+    writeLe16(blob + 0x14, CWAV_REF_INFO_BLOCK);
     writeLe32(blob + 0x18, infoOffset);
     writeLe32(blob + 0x1C, infoSize);
+    writeLe16(blob + 0x20, CWAV_REF_DATA_BLOCK);
     writeLe32(blob + 0x24, dataOffset);
-    writeLe32(blob + 0x28, 8u + sampleDataSize);
+    writeLe32(blob + 0x28, dataSize);
 
     uint8_t* info = blob + infoOffset;
     memcpy(info, "INFO", 4);
     writeLe32(info + 4, infoSize);
     info[0x08] = 2;
     info[0x09] = 0;
-    writeLe32(info + 0x0C, N3DS_AUDIO_SAMPLE_RATE);
+    writeLe32(info + 0x0C, sampleRate);
     writeLe32(info + 0x10, 0);
-    writeLe32(info + 0x14, wav->sampleCount);
+    writeLe32(info + 0x14, encodedSampleCount);
     writeLe32(info + 0x1C, wav->channelCount);
 
     uint32_t sampleOffset = 0;
@@ -3887,10 +4337,13 @@ static N3DS_PREPROCESS_MAYBE_UNUSED bool writeBcwavFile(const char* path, const 
         uint8_t* ref = info + 0x20u + channelIndex * 8u;
         uint32_t channelInfoPos = channelInfoOffset + channelIndex * 0x14u;
         uint32_t adpcmInfoPos = adpcmInfoOffset + channelIndex * 0x2Eu;
+        writeLe16(ref + 0, CWAV_REF_CHANNEL_INFO);
         writeLe32(ref + 4, channelInfoPos - 0x1Cu);
 
         uint8_t* channelInfo = info + channelInfoPos;
-        writeLe32(channelInfo + 4, sampleOffset);
+        writeLe16(channelInfo + 0, CWAV_REF_SAMPLE_DATA);
+        writeLe32(channelInfo + 4, dataPayloadPadding + sampleOffset);
+        writeLe16(channelInfo + 8, CWAV_REF_DSP_ADPCM_INFO);
         writeLe32(channelInfo + 12, adpcmInfoPos - channelInfoPos);
 
         uint8_t* adpcmInfo = info + adpcmInfoPos;
@@ -3909,10 +4362,10 @@ static N3DS_PREPROCESS_MAYBE_UNUSED bool writeBcwavFile(const char* path, const 
 
     uint8_t* dataBlock = blob + dataOffset;
     memcpy(dataBlock, "DATA", 4);
-    writeLe32(dataBlock + 4, 8u + sampleDataSize);
-    uint32_t dataCursor = 8u;
+    writeLe32(dataBlock + 4, dataSize);
+    uint32_t dataCursor = dataPayloadOffset;
     repeat(wav->channelCount, channelIndex) {
-        memcpy(dataBlock + dataCursor, channels[channelIndex].data, channels[channelIndex].dataSize);
+        memcpy(blob + dataCursor, channels[channelIndex].data, channels[channelIndex].dataSize);
         dataCursor += channels[channelIndex].dataSize;
     }
 
@@ -3976,6 +4429,11 @@ static bool loadPcmForSoundBank(
     bool wroteTempInput = false;
 
     if (inputPath == NULL && embeddedData != NULL && embeddedDataSize > 0) {
+        if (loadAudioPcm16FromMemory(embeddedData, embeddedDataSize, outPcm)) {
+            free(externalSourcePath);
+            return true;
+        }
+
         const char* tempExt = pickAudioTempExtension(sound);
         snprintf(tempInputPath, sizeof(tempInputPath), "%s/audio/__tmp_bank_input_%05zu%s", options->outputDir, soundIndex, tempExt);
         remove(tempInputPath);
@@ -4069,6 +4527,15 @@ static bool buildPackedSoundBank(Options* options, DataWin* dataWin, bool haveCw
             continue;
         }
 
+        if (!resampleWavPcm16(&pcm, N3DS_AUDIO_SAMPLE_RATE)) {
+            fprintf(stderr, "Skipping sound bank entry %zu (%s): failed to resample audio to %u Hz\n", soundIndex, sound->name != NULL ? sound->name : "<unnamed>", N3DS_AUDIO_SAMPLE_RATE);
+            freeWavPcm16(&pcm);
+            continue;
+        }
+
+        uint32_t sampleRate = pcm.sampleRate != 0 ? pcm.sampleRate : N3DS_AUDIO_SAMPLE_RATE;
+        uint32_t sampleCount = pcm.sampleCount;
+        uint32_t channelCount = pcm.channelCount;
         uint32_t pcmBytes = (uint32_t) ((size_t) pcm.sampleCount * pcm.channelCount * sizeof(int16_t));
         if (fwrite(pcm.interleavedPcm, 1, pcmBytes, bankFile) != pcmBytes) {
             freeWavPcm16(&pcm);
@@ -4078,10 +4545,10 @@ static bool buildPackedSoundBank(Options* options, DataWin* dataWin, bool haveCw
 
         offsets[soundIndex] = cursor;
         sizes[soundIndex] = pcmBytes;
-        sampleRates[soundIndex] = N3DS_AUDIO_SAMPLE_RATE;
-        sampleCounts[soundIndex] = pcm.sampleCount;
+        sampleRates[soundIndex] = sampleRate;
+        sampleCounts[soundIndex] = sampleCount;
         flags[soundIndex] =
-            (uint32_t) pcm.channelCount |
+            channelCount |
             N3DS_SOUND_BANK_ENTRY_FLAG_PCM16 |
             0u;
         cursor += pcmBytes;
@@ -4125,104 +4592,89 @@ cleanup:
     return ok;
 }
 
-static bool convertAudio(Options* options, DataWin* dataWin) {
+static bool convertStreamedMusicBcwavs(Options* options, DataWin* dataWin, bool haveCwavtool) {
+    if (options == NULL || dataWin == NULL) return false;
+
     bool allOk = true;
-    uint32_t convertedMusicCount = 0;
+    uint32_t convertedCount = 0;
+    uint32_t preservedCount = 0;
+    uint32_t skippedCount = 0;
+
+    repeat(dataWin->sond.count, soundIndex) {
+        const Sound* sound = &dataWin->sond.sounds[soundIndex];
+        if (!soundLooksLikeMusic(sound)) continue;
+
+        char baseName[256];
+        bool haveBaseName = extractBaseNameNoExt(sound->file, baseName, sizeof(baseName));
+        if (!haveBaseName) haveBaseName = extractBaseNameNoExt(sound->name, baseName, sizeof(baseName));
+        if (!haveBaseName) snprintf(baseName, sizeof(baseName), "sound_%05zu", soundIndex);
+
+        char outPath[1024];
+        snprintf(outPath, sizeof(outPath), "%s/%s.bcwav", options->outputDir, baseName);
+
+        char* externalSourcePath = resolveExternalSoundPath(options, sound);
+        if (externalSourcePath == NULL) {
+            if (fileExists(outPath)) {
+                preservedCount++;
+                continue;
+            }
+            if (sound->name != NULL && sound->name[0] != '\0') {
+                fprintf(stderr, "Skipping streamed music %zu (%s): no external audio source found\n", soundIndex, sound->name);
+            }
+            skippedCount++;
+            continue;
+        }
+
+        remove(outPath);
+        fprintf(
+            stderr,
+            "n3ds-preprocess: music %05zu -> %s [%s]\n",
+            soundIndex,
+            outPath,
+            externalSourcePath
+        );
+
+        bool ok = writeBcwavFromInputFile(externalSourcePath, outPath);
+        if (!ok && haveCwavtool) {
+            ok = runCwavtoolFromInput(options->cwavtoolExe, externalSourcePath, outPath);
+        }
+        free(externalSourcePath);
+
+        if (!ok) {
+            fprintf(stderr, "Failed to write streamed music BCWAV for sound %zu\n", soundIndex);
+            allOk = false;
+            continue;
+        }
+
+        convertedCount++;
+    }
+
+    fprintf(
+        stderr,
+        "Streamed music BCWAVs: converted=%u preserved=%u skipped=%u\n",
+        convertedCount,
+        preservedCount,
+        skippedCount
+    );
+    return allOk;
+}
+
+static bool convertAudio(Options* options, DataWin* dataWin) {
     bool haveCwavtool = false;
 
     fprintf(stderr, "n3ds-preprocess: processing audio\n");
 
     haveCwavtool = cwavtoolAvailable(options);
     if (!haveCwavtool) {
-        fprintf(stderr, "Using built-in BCWAV writer (WAV and Ogg Vorbis supported in-process; other codecs unavailable).\n");
+        fprintf(stderr, "Using PCM16 sound bank writer (WAV and Ogg Vorbis supported in-process; other codecs unavailable).\n");
     } else {
-        fprintf(stderr, "Using built-in BCWAV writer (WAV/Ogg Vorbis in-process, cwavtool fallback for other codecs).\n");
+        fprintf(stderr, "Using PCM16 sound bank writer (WAV/Ogg Vorbis in-process, cwavtool fallback for other codecs).\n");
     }
 
-    repeat(dataWin->sond.count, soundIndex) {
-        Sound* sound = &dataWin->sond.sounds[soundIndex];
-        char tempInputPath[1024];
-        char outPath[1024];
-        bool isMusic = soundLooksLikeMusic(sound);
-        if (!isMusic) continue;
-        const uint8_t* sourceData = NULL;
-        uint32_t sourceSize = 0;
-        char* externalSourcePath = NULL;
-        char baseName[256];
-        bool haveBaseName = extractBaseNameNoExt(sound->file, baseName, sizeof(baseName));
-        if (!haveBaseName) haveBaseName = extractBaseNameNoExt(sound->name, baseName, sizeof(baseName));
-        if (!haveBaseName) snprintf(baseName, sizeof(baseName), "sound_%05zu", soundIndex);
-        snprintf(outPath, sizeof(outPath), "%s/%s.bcwav", options->outputDir, baseName);
-
-        externalSourcePath = resolveExternalSoundPath(options, sound);
-        if (externalSourcePath == NULL && fileExists(outPath)) {
-            fprintf(
-                stderr,
-                "Preserving existing music BCWAV for sound %zu -> %s\n",
-                soundIndex,
-                outPath
-            );
-            continue;
-        }
-
-        remove(outPath);
-
-        if (externalSourcePath == NULL && sound->audioFile >= 0 && (uint32_t) sound->audioFile < dataWin->audo.count) {
-            AudioEntry* entry = &dataWin->audo.entries[sound->audioFile];
-            sourceData = entry->data;
-            sourceSize = entry->dataSize;
-        }
-
-        if ((sourceData == NULL || sourceSize == 0) && externalSourcePath == NULL) {
-            if (sound->name != NULL && sound->name[0] != '\0') {
-                fprintf(stderr, "Skipping sound %zu (%s): no embedded or external source found\n", soundIndex, sound->name);
-            }
-            continue;
-        }
-
-        const char* audioInputPath = externalSourcePath;
-        if (sourceData != NULL && sourceSize > 0) {
-            const char* tempExt = pickAudioTempExtension(sound);
-            snprintf(tempInputPath, sizeof(tempInputPath), "%s/audio/__tmp_sound_%05zu%s", options->outputDir, soundIndex, tempExt);
-            if (!writeBytesToFile(tempInputPath, sourceData, sourceSize)) {
-                fprintf(stderr, "Failed to write temporary audio input for sound %zu\n", soundIndex);
-                free(externalSourcePath);
-                allOk = false;
-                continue;
-            }
-            audioInputPath = tempInputPath;
-        }
-
-        fprintf(
-            stderr,
-            "n3ds-preprocess: audio %05zu -> %s [%s, %s]\n",
-            soundIndex,
-            outPath,
-            externalSourcePath != NULL ? "external" : "embedded",
-            isBuiltinAudioInputPath(audioInputPath)
-                ? "builtin"
-                : (haveCwavtool ? "cwavtool" : "unavailable")
-        );
-
-        bool ok = writeBcwavFromInputFile(audioInputPath, outPath);
-        if (!ok && haveCwavtool) {
-            ok = runCwavtoolFromInput(options->cwavtoolExe, audioInputPath, outPath);
-        }
-        if (sourceData != NULL && sourceSize > 0) remove(tempInputPath);
-        free(externalSourcePath);
-        if (!ok) {
-            fprintf(stderr, "Failed to write BCWAV for music sound %zu\n", soundIndex);
-            allOk = false;
-            continue;
-        }
-
-        convertedMusicCount++;
-        fprintf(stderr, "Converted music sound %zu -> %s\n", soundIndex, outPath);
-    }
-
-    if (allOk) allOk = buildPackedSoundBank(options, dataWin, haveCwavtool);
-    fprintf(stderr, "Converted %u music tracks to BCWAV (SFX packed directly into sound_bank.bin)\n", convertedMusicCount);
-    return allOk;
+    bool ok = convertStreamedMusicBcwavs(options, dataWin, haveCwavtool);
+    if (ok) ok = buildPackedSoundBank(options, dataWin, haveCwavtool);
+    if (ok) fprintf(stderr, "Packed SFX audio into PCM16 sound_bank.bin at %u Hz\n", N3DS_AUDIO_SAMPLE_RATE);
+    return ok;
 }
 
 int main(int argc, char** argv) {
@@ -4252,12 +4704,21 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to configure local staging output directory.\n");
         return 1;
     }
+    if (!configureSpriteReplacementDir(&options, argv[0])) {
+        fprintf(stderr, "Failed to configure sprite replacement directory.\n");
+        return 1;
+    }
+    if (!configureBorderAssetDir(&options, argv[0])) {
+        fprintf(stderr, "Failed to configure border asset directory.\n");
+        return 1;
+    }
     if (options.stageOutputLocally) {
         fprintf(stderr, "Staging generated assets in: %s\n", options.outputDir);
         fprintf(stderr, "Final destination: %s\n", options.finalOutputDirStorage);
     }
 
     if (!ensureOutputDirs(options.outputDir)) return 1;
+    if (!convertBorderAssets(&options)) return 1;
 
     DataWin* dataWin = DataWin_parse(
         options.inputPath,
@@ -4299,6 +4760,6 @@ int main(int argc, char** argv) {
 
     if (!ok) return 1;
     const char* finalOutputDir = options.stageOutputLocally ? options.finalOutputDirStorage : options.outputDir;
-    fprintf(stderr, "Wrote 3DS assets to %s/gfx, %s/audio, and ROMFS root music files\n", finalOutputDir, finalOutputDir);
+    fprintf(stderr, "Wrote 3DS assets to %s/gfx and %s/audio\n", finalOutputDir, finalOutputDir);
     return 0;
 }

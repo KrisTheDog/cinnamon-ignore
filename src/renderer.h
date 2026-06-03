@@ -700,11 +700,31 @@ static int32_t Renderer_normalizeCirclePrecision(int32_t precision) {
     return precision & 0x7C;
 }
 
+static int32_t Renderer_getAdaptiveCircleSegments(int32_t precision, float radius, bool outline) {
+    int32_t segments = Renderer_normalizeCirclePrecision(precision);
+#if defined(__3DS__)
+    float absRadius = fabsf(radius);
+    int32_t radiusCap = 32;
+
+    if (absRadius <= 3.0f) radiusCap = 8;
+    else if (absRadius <= 6.0f) radiusCap = 12;
+    else if (absRadius <= 12.0f) radiusCap = 16;
+    else if (absRadius <= 24.0f) radiusCap = 24;
+    else if (!outline && absRadius <= 48.0f) radiusCap = 28;
+
+    if (segments > radiusCap) segments = radiusCap;
+#else
+    (void) radius;
+    (void) outline;
+#endif
+    if (4 > segments) segments = 4;
+    return segments;
+}
+
 // draw_circle helper: approximates a circle as a polygon with "circlePrecision" segments.
 // Filled: triangle fan from center. Outline: line strip around the perimeter.
 static void Renderer_drawCircle(Renderer* renderer, float cx, float cy, float radius, bool outline) {
-    int32_t segments = Renderer_normalizeCirclePrecision(renderer->circlePrecision);
-    if (4 > segments) segments = 4;
+    int32_t segments = Renderer_getAdaptiveCircleSegments(renderer->circlePrecision, radius, outline);
 
     float step = 6.2831853f / (float) segments;
     float prevX = cx + radius;

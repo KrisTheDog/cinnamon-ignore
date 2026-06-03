@@ -664,6 +664,21 @@ static bool N3DSAudio_stringContainsIgnoreCase(const char* haystack, const char*
     return false;
 }
 
+static bool N3DSAudio_nameLooksLikeSfx(const char* value) {
+    if (value == NULL || value[0] == '\0') return false;
+
+    const char* base = strrchr(value, '/');
+    const char* backslash = strrchr(value, '\\');
+    if (backslash != NULL && (base == NULL || backslash > base)) base = backslash;
+    base = base != NULL ? base + 1 : value;
+
+    return strncmp(base, "mus_sfx", 7) == 0 ||
+        strncmp(base, "sfx_", 4) == 0 ||
+        strncmp(base, "snd_", 4) == 0 ||
+        N3DSAudio_stringContainsIgnoreCase(base, "_sfx") ||
+        N3DSAudio_stringContainsIgnoreCase(base, "sfx_");
+}
+
 static bool N3DSAudio_nameLooksLikeMusic(const char* value) {
     if (value == NULL || value[0] == '\0') return false;
 
@@ -671,12 +686,22 @@ static bool N3DSAudio_nameLooksLikeMusic(const char* value) {
     const char* backslash = strrchr(value, '\\');
     if (backslash != NULL && (base == NULL || backslash > base)) base = backslash;
     base = base != NULL ? base + 1 : value;
+    if (N3DSAudio_nameLooksLikeSfx(base)) return false;
     if (strncmp(base, "mus_", 4) == 0 || strncmp(base, "bgm_", 4) == 0) return true;
     return N3DSAudio_stringContainsIgnoreCase(base, "music");
 }
 
+static bool N3DSAudio_soundLooksLikeSfx(const Sound* sound) {
+    if (sound == NULL) return false;
+    return N3DSAudio_nameLooksLikeSfx(sound->name) ||
+        N3DSAudio_nameLooksLikeSfx(sound->file) ||
+        N3DSAudio_stringContainsIgnoreCase(sound->type, "sfx") ||
+        N3DSAudio_stringContainsIgnoreCase(sound->type, "effect");
+}
+
 static bool N3DSAudio_soundLooksLikeMusic(const Sound* sound) {
     if (sound == NULL) return false;
+    if (N3DSAudio_soundLooksLikeSfx(sound)) return false;
     return N3DSAudio_nameLooksLikeMusic(sound->name) ||
         N3DSAudio_nameLooksLikeMusic(sound->file) ||
         N3DSAudio_stringContainsIgnoreCase(sound->type, "music") ||

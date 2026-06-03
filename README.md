@@ -123,6 +123,12 @@ cmake -S . -B build/n3ds -DPLATFORM=n3ds \
 cmake --build build/n3ds
 ```
 
+To build without bottom screen features, pass the disable flag like so:
+
+```bash
+cmake -S . -B build/n3ds -DN3DS_DISABLE_BOTTOM_SCREEN=ON
+```
+
 The main output is `build/n3ds/cinnamon.3dsx`.
 
 The 3DS build will package `resources/3ds/romfs` into the `.3dsx` if that directory exists. The runner also checks `sdmc:/3ds/cinnamon` at runtime, so you can either bundle preprocessed assets into `romfs` or copy them onto the SD card.
@@ -141,8 +147,7 @@ cmake --build build/n3ds-preprocess
 The preprocessor uses:
 
 * `tex3ds` from devkitPro for texture conversion
-* a built-in BCWAV encoder for audio output
-* built-in `stb_vorbis` decoding for Ogg Vorbis audio before encoding
+* `stb_vorbis` for decoding OGG vorbis audio files for converting to BCWAV 4-bit ADPCM
 
 On Linux:
 
@@ -168,6 +173,8 @@ Command line usage:
 n3ds-preprocess <path-to-data.win> <output-dir> [options]
 ```
 
+By default the preprocessor uses hybrid atlas formatting: sprite/background pages stay `rgba5551` for cleaner edges, while safer non-sprite pages may still use `etc1a4`. Use `--texture-format etc1a4`, `--texture-format rgba5551`, or `--page-format-overrides <file>` if you need to force a specific format.
+
 Useful output directory choices:
 
 * `resources/3ds/romfs` to bundle the generated assets into the next 3DS build
@@ -189,8 +196,12 @@ The preprocessor writes:
 
 * `gfx/atlas.bin` and converted texture pages to `gfx/`
 * `gfx/direct_assets.bin`, containing packed direct sprite/background/font `.t3x` data with seek metadata
-* packed sound effects directly in `audio/sound_bank.bin` (no per-SFX `.bcwav` output)
+* SOND data packed directly in `audio/sound_bank.bin` 
 * streamed music `.bcwav` files at the output root
+
+Optional sprite replacements can be placed in a `Sprite_replacements` folder next to the `n3ds-preprocess` executable or in `tools/n3ds-preprocess/Sprite_replacements`. The preprocessor accepts PNGs named by sprite name or sprite index, such as `spr_battlebutton_0.png`, `spr_battlebutton_0_frame_00000.png`, `spr_00042.png`, or `spr_00042_frame_00000.png`. Replacement PNGs must match the logical sprite frame size.
+
+Optional room border PNGs can be placed in a `Borders` folder next to the `n3ds-preprocess` executable or in `tools/n3ds-preprocess/Borders`. Every top-level `*.png` in that folder is converted to `gfx/borders/<name>.t3x`; useful names include `border_none.png`, `room_ruins.png`, `room_tundra.png`, `room_water.png`, `room_fire.png`, `room_castle.png`, `room_truelab.png`, and `room_gaster.png`.
 
 At runtime, direct textures are loaded from `gfx/direct_assets.bin` when present, with loose-file fallback for overrides/custom files.
 Generated direct sprite/background/font `.t3x` files are removed after packing to keep output size down.

@@ -43,6 +43,8 @@
 #define N3DS_ROMFS_ASSET_BASE "romfs:/gfx"
 #define N3DS_RENDERER_FILE_BUFFER_SIZE (32u * 1024u)
 #define N3DS_TILE_LAYER_CHUNK_SIZE 256u
+#define N3DS_TILE_LAYER_CHUNK_TEXTURE_BYTES (N3DS_TILE_LAYER_CHUNK_SIZE * N3DS_TILE_LAYER_CHUNK_SIZE * 2u)
+#define N3DS_TILE_LAYER_CHUNK_VRAM_BUDGET (512u * 1024u)
 #define N3DS_MAX_RESIDENT_ATLAS_PAGES_OLD3DS 16u
 #define N3DS_MAX_RESIDENT_ATLAS_PAGES_NEW3DS 32u
 #define N3DS_MAX_RESIDENT_ATLAS_PAGES_OLD3DS_ETC1A4 40u
@@ -64,6 +66,7 @@
 // battle screen offset
 #define N3DS_TOP_BATTLE_SCENE_Y_OFFSET 200.0f
 #define N3DS_TOP_BATTLE_ENEMY_Y_OFFSET 200.0f
+#define N3DS_C2D_FLUSH_DRAW_BUDGET 192u
 #define N3DS_PERF_LOG_INTERVAL_FRAMES 30u
 #define N3DS_ATLAS_TRACE_LOG_PATH "sdmc:/3ds/cinnamon/atlas_trace.log"
 
@@ -156,8 +159,6 @@ typedef struct {
     uint32_t sheetFrameCount;
     bool sheetLoadAttempted;
     bool useFrameFallback;
-    bool battleFramesPinned;
-    bool battlePrewarmInProgress;
     C2D_Image* sheetFrameImages;
     N3DSDirectTextureAsset sheetAsset;
     N3DSDirectTextureAsset* frameAssets;
@@ -178,6 +179,7 @@ typedef struct {
 typedef struct {
     bool used;
     uint32_t chunkCount;
+    uint32_t vramBytes;
     N3DSTileLayerChunk* chunks;
 } N3DSTileLayerChunkCache;
 
@@ -197,6 +199,16 @@ typedef struct {
     uint32_t lastUsedStamp;
     uint32_t lastUsedFrame;
 } N3DSLoadedAtlasPage;
+
+typedef struct {
+    bool used;
+    int32_t ownerSpriteIndex;
+    uint16_t logicalWidth;
+    uint16_t logicalHeight;
+    C3D_Tex texture;
+    Tex3DS_SubTexture subtex;
+    C2D_Image image;
+} N3DSDynamicCaptureTPAG;
 
 typedef struct {
     float localX;
@@ -296,6 +308,7 @@ typedef struct {
     uint32_t cachedT3xBytes;
     uint32_t cachedDirectT3xByteLimit;
     uint32_t cachedDirectT3xBytes;
+    uint32_t tileLayerChunkVRAMBytes;
     uint32_t frameBlobReads;
     uint32_t frameDirectBlobReads;
     uint32_t framePageImports;
@@ -309,6 +322,7 @@ typedef struct {
     uint32_t frameTextureSwitches;
     uint32_t frameTextGlyphDraws;
     uint32_t frameTextTenthsMs;
+    uint32_t pendingC2DDraws;
     bool atlasLoaded;
     char startupError[160];
     int32_t lastDirectTPAGIndex;
@@ -326,10 +340,13 @@ typedef struct {
     N3DSCachedTextLayout cachedTextLayout;
     N3DSResolvedAssetPathEntry* resolvedAssetPathCache;
     N3DSPackedDirectAssetMapEntry* packedDirectAssetMap;
+    N3DSDynamicCaptureTPAG* dynamicCaptureTPAGs;
     uint8_t* atlasTraceMask;
     FILE* atlasTraceFile;
     FILE* packedAtlasFile;
     FILE* packedDirectAssetFile;
+    uint32_t baseTPAGCount;
+    uint32_t dynamicCaptureTPAGCount;
     bool bottomScreenGuiActive;
     bool topScreenGuiActive;
     bool topScreenGui2xActive;
@@ -349,7 +366,6 @@ typedef struct {
     float savedViewScaleY;
     bool isNew3DS;
     bool pendingOld3DSAtlasFlush;
-    bool directOnlyBattleAssets;
 } N3DSRenderer;
 
 enum {
@@ -373,7 +389,6 @@ static void N3DSRenderer_prewarmTileEntryBlobOnly(N3DSRenderer* renderer, bool* 
 static void N3DSRenderer_prewarmRoomBlobCache(N3DSRenderer* renderer, Runner* runner);
 static void N3DSRenderer_preloadFontPages(N3DSRenderer* renderer);
 static bool N3DSRenderer_ensurePageBlobLoaded(N3DSRenderer* renderer, uint32_t pageIndex);
-static void N3DSRenderer_prewarmDirectSpriteFrames(N3DSRenderer* renderer, int32_t spriteIndex);
 static void N3DSRenderer_prewarmRoom(Renderer* base, Runner* runner);
 static void N3DSRenderer_freeCachedTextLayout(N3DSCachedTextLayout* layout);
 static void N3DSRenderer_appendCachedTextLayoutSuffix(N3DSCachedTextLayout* layout, Font* font, const char* suffix, int32_t suffixLen);
@@ -383,7 +398,7 @@ static bool N3DSRenderer_isFragmentedAtlasVersion(uint16_t atlasVersion);
 static bool N3DSRenderer_isPackedAtlasVersion(uint16_t atlasVersion);
 static const char* N3DSRenderer_getTextureFormatName(uint32_t textureFormat);
 static void N3DSRenderer_sceneBeginTarget(N3DSRenderer* renderer, uint8_t targetKind, bool force);
-static void N3DSRenderer_freeTileLayerChunkCache(N3DSTileLayerChunkCache* cache);
+static void N3DSRenderer_freeTileLayerChunkCache(N3DSRenderer* renderer, N3DSTileLayerChunkCache* cache);
 static void N3DSRenderer_freeDirectTextureAsset(N3DSDirectTextureAsset* asset, N3DSRenderer* renderer);
 static void N3DSRenderer_unloadDirectTextureBlob(N3DSDirectTextureAsset* asset, N3DSRenderer* renderer);
 static bool N3DSRenderer_evictLRUDirectAsset(N3DSRenderer* renderer, const N3DSDirectTextureAsset* excludeAsset);
@@ -397,6 +412,9 @@ static bool N3DSRenderer_isScreenRectOffscreen(const N3DSRenderer* renderer, flo
 static bool N3DSRenderer_isScreenRotatedRectOffscreen(const N3DSRenderer* renderer, float x, float y, float w, float h, float angleDeg);
 static bool N3DSRenderer_loadPackedDirectAssets(N3DSRenderer* renderer);
 static bool N3DSRenderer_tryLoadPackedDirectTextureBlob(N3DSRenderer* renderer, N3DSDirectTextureAsset* asset, const char* relativePath);
+static N3DSDynamicCaptureTPAG* N3DSRenderer_getDynamicCaptureTPAG(N3DSRenderer* renderer, int32_t tpagIndex);
+static void N3DSRenderer_freeDynamicCaptureTPAG(N3DSRenderer* renderer, N3DSDynamicCaptureTPAG* capture);
+static int32_t N3DSRenderer_allocDynamicCaptureTPAG(N3DSRenderer* renderer);
 
 enum {
     N3DS_TRACE_KIND_SPRITE = 1u << 0,
@@ -563,6 +581,7 @@ static void N3DSRenderer_resetFramePerfCounters(N3DSRenderer* renderer) {
     renderer->frameTextureSwitches = 0;
     renderer->frameTextGlyphDraws = 0;
     renderer->frameTextTenthsMs = 0;
+    renderer->pendingC2DDraws = 0;
     renderer->lastDrawTexture = NULL;
     renderer->lastDirectTPAGIndex = -1;
     renderer->lastDirectTPAGImage = NULL;
@@ -783,8 +802,6 @@ static void N3DSRenderer_clearDirectAssetPins(N3DSRenderer* renderer) {
 
     repeat(renderer->directSpriteAssetCount, spriteIndex) {
         N3DSDirectSpriteAsset* spriteAsset = &renderer->directSpriteAssets[spriteIndex];
-        spriteAsset->battleFramesPinned = false;
-        spriteAsset->battlePrewarmInProgress = false;
         spriteAsset->sheetAsset.pinned = false;
         repeat(spriteAsset->frameCount, frameIndex) {
             spriteAsset->frameAssets[frameIndex].pinned = false;
@@ -1100,6 +1117,8 @@ static void N3DSRenderer_unloadPage(N3DSRenderer* renderer, uint32_t pageIndex) 
     N3DSLoadedAtlasPage* page = &renderer->atlasPages[pageIndex];
     if (!page->ready) return;
     C2D_Flush();
+    renderer->pendingC2DDraws = 0;
+    renderer->lastDrawTexture = NULL;
 
     uint32_t pageBytes = N3DSRenderer_getPageVRAMBytes(renderer, page);
 
@@ -1650,9 +1669,38 @@ static void N3DSRenderer_applyAlphaState(N3DSRenderer* renderer) {
     }
 }
 
+static void N3DSRenderer_setDefaultGPUState(N3DSRenderer* renderer) {
+    if (renderer == NULL) return;
+    renderer->blendEnabled = true;
+    renderer->blendEquation = bm_normal;
+    renderer->blendSrcFactor = bm_src_alpha;
+    renderer->blendDstFactor = bm_inv_src_alpha;
+    renderer->alphaTestEnabled = false;
+    renderer->alphaTestRef = 0;
+    N3DSRenderer_applyBlendState(renderer);
+    N3DSRenderer_applyAlphaState(renderer);
+}
+
+static void N3DSRenderer_flushC2DQueue(N3DSRenderer* renderer) {
+    if (renderer == NULL || renderer->pendingC2DDraws == 0) return;
+    C2D_Flush();
+    renderer->pendingC2DDraws = 0;
+    renderer->lastDrawTexture = NULL;
+}
+
+static void N3DSRenderer_noteC2DDraws(N3DSRenderer* renderer, uint32_t drawCount) {
+    if (renderer == NULL || drawCount == 0) return;
+    renderer->pendingC2DDraws += drawCount;
+    if (renderer->pendingC2DDraws >= N3DS_C2D_FLUSH_DRAW_BUDGET) {
+        N3DSRenderer_flushC2DQueue(renderer);
+    }
+}
+
 static void N3DSRenderer_sceneBeginTarget(N3DSRenderer* renderer, uint8_t targetKind, bool force) {
     if (renderer == NULL) return;
     if (!force && renderer->activeSceneTarget == targetKind) return;
+
+    N3DSRenderer_flushC2DQueue(renderer);
 
     if (targetKind == N3DS_SCENE_TARGET_TOP) {
         if (renderer->topTarget == NULL) return;
@@ -1671,7 +1719,7 @@ static void N3DSRenderer_sceneBeginTarget(N3DSRenderer* renderer, uint8_t target
     renderer->activeSceneTarget = N3DS_SCENE_TARGET_NONE;
 }
 
-static void N3DSRenderer_freeTileLayerChunkCache(N3DSTileLayerChunkCache* cache) {
+static void N3DSRenderer_freeTileLayerChunkCache(N3DSRenderer* renderer, N3DSTileLayerChunkCache* cache) {
     if (cache == NULL || cache->chunks == NULL) return;
 
     repeat(cache->chunkCount, i) {
@@ -1690,6 +1738,11 @@ static void N3DSRenderer_freeTileLayerChunkCache(N3DSTileLayerChunkCache* cache)
     free(cache->chunks);
     cache->chunks = NULL;
     cache->chunkCount = 0;
+    if (renderer != NULL) {
+        if (renderer->tileLayerChunkVRAMBytes >= cache->vramBytes) renderer->tileLayerChunkVRAMBytes -= cache->vramBytes;
+        else renderer->tileLayerChunkVRAMBytes = 0;
+    }
+    cache->vramBytes = 0;
     cache->used = false;
 }
 
@@ -1800,6 +1853,7 @@ static void N3DSRenderer_drawImageFast(Renderer* base, C2D_Image* image, float l
         C2D_PlainImageTint(&tint, N3DSRenderer_makeColor(color, alpha), 1.0f);
         C2D_DrawImageAt(*image, screenX, screenY, 0.5f, &tint, screenScaleX, screenScaleY);
     }
+    N3DSRenderer_noteC2DDraws(renderer, 1u);
 }
 
 static bool N3DSRenderer_getSourceCropRect(
@@ -1874,18 +1928,62 @@ static bool N3DSRenderer_resolveFragmentImage(N3DSRenderer* renderer, const N3DS
     return true;
 }
 
+static N3DSDynamicCaptureTPAG* N3DSRenderer_getDynamicCaptureTPAG(N3DSRenderer* renderer, int32_t tpagIndex) {
+    if (renderer == NULL) return NULL;
+    if (tpagIndex < 0 || (uint32_t) tpagIndex < renderer->baseTPAGCount) return NULL;
+
+    uint32_t dynamicIndex = (uint32_t) tpagIndex - renderer->baseTPAGCount;
+    if (dynamicIndex >= renderer->dynamicCaptureTPAGCount) return NULL;
+    N3DSDynamicCaptureTPAG* capture = &renderer->dynamicCaptureTPAGs[dynamicIndex];
+    if (!capture->used || capture->image.tex == NULL || capture->image.subtex == NULL) return NULL;
+    return capture;
+}
+
+static void N3DSRenderer_freeDynamicCaptureTPAG(N3DSRenderer* renderer, N3DSDynamicCaptureTPAG* capture) {
+    if (renderer == NULL || capture == NULL || !capture->used) return;
+
+    C2D_Flush();
+    renderer->pendingC2DDraws = 0;
+    renderer->lastDrawTexture = NULL;
+    C3D_TexDelete(&capture->texture);
+    memset(capture, 0, sizeof(*capture));
+    capture->ownerSpriteIndex = -1;
+}
+
+static int32_t N3DSRenderer_allocDynamicCaptureTPAG(N3DSRenderer* renderer) {
+    if (renderer == NULL || renderer->base.dataWin == NULL) return -1;
+
+    repeat(renderer->dynamicCaptureTPAGCount, i) {
+        if (!renderer->dynamicCaptureTPAGs[i].used) {
+            renderer->dynamicCaptureTPAGs[i].ownerSpriteIndex = -1;
+            return (int32_t) (renderer->baseTPAGCount + (uint32_t) i);
+        }
+    }
+
+    uint32_t dynamicIndex = renderer->dynamicCaptureTPAGCount;
+    uint32_t newDynamicCount = dynamicIndex + 1u;
+    renderer->dynamicCaptureTPAGs = safeRealloc(
+        renderer->dynamicCaptureTPAGs,
+        (size_t) newDynamicCount * sizeof(N3DSDynamicCaptureTPAG)
+    );
+    memset(&renderer->dynamicCaptureTPAGs[dynamicIndex], 0, sizeof(renderer->dynamicCaptureTPAGs[dynamicIndex]));
+    renderer->dynamicCaptureTPAGs[dynamicIndex].ownerSpriteIndex = -1;
+    renderer->dynamicCaptureTPAGCount = newDynamicCount;
+
+    DataWin* dw = renderer->base.dataWin;
+    uint32_t newTPAGCount = renderer->baseTPAGCount + renderer->dynamicCaptureTPAGCount;
+    dw->tpag.items = safeRealloc(dw->tpag.items, (size_t) newTPAGCount * sizeof(TexturePageItem));
+    memset(&dw->tpag.items[newTPAGCount - 1u], 0, sizeof(TexturePageItem));
+    dw->tpag.count = newTPAGCount;
+    return (int32_t) (newTPAGCount - 1u);
+}
+
 static bool N3DSRenderer_tryLoadDirectSpriteImage(N3DSRenderer* renderer, int32_t spriteIndex, int32_t frameIndex, C2D_Image** outImage) {
     if (renderer == NULL || outImage == NULL) return false;
     if (spriteIndex < 0 || (uint32_t) spriteIndex >= renderer->directSpriteAssetCount) return false;
 
     N3DSDirectSpriteAsset* spriteAsset = &renderer->directSpriteAssets[spriteIndex];
     if (frameIndex < 0 || (uint32_t) frameIndex >= spriteAsset->frameCount) return false;
-
-    if (renderer->directOnlyBattleAssets &&
-        !spriteAsset->battleFramesPinned &&
-        !spriteAsset->battlePrewarmInProgress) {
-        N3DSRenderer_prewarmDirectSpriteFrames(renderer, spriteIndex);
-    }
 
     N3DSDirectTextureAsset* sheetAsset = &spriteAsset->sheetAsset;
     bool preferFrameFallback = (spriteIndex == 24);
@@ -1917,7 +2015,7 @@ static bool N3DSRenderer_tryLoadDirectSpriteImage(N3DSRenderer* renderer, int32_
         N3DSDirectTextureAsset* existingFrameAsset = &spriteAsset->frameAssets[frameIndex];
         hasLoadedDirectFrame = existingFrameAsset->ready || (existingFrameAsset->blobData != NULL && existingFrameAsset->blobSize > 0);
     }
-    bool allowColdDirectLoad = preferNamedButtonOverride || renderer->directOnlyBattleAssets;
+    bool allowColdDirectLoad = preferNamedButtonOverride;
     if (!allowColdDirectLoad && !hasLoadedDirectSheet && !hasLoadedDirectFrame) {
         return false;
     }
@@ -2058,6 +2156,69 @@ static bool N3DSRenderer_tryResolveDirectFontImage(N3DSRenderer* renderer, int32
     return true;
 }
 
+static bool N3DSRenderer_cropDirectSpriteImage(
+    const C2D_Image* directImage,
+    const TexturePageItem* tpag,
+    C2D_Image* outImage,
+    Tex3DS_SubTexture* outSubtex,
+    float* outDrawX,
+    float* outDrawY,
+    float x,
+    float y,
+    float originX,
+    float originY,
+    float xscale,
+    float yscale
+) {
+    if (directImage == NULL || directImage->tex == NULL || directImage->subtex == NULL ||
+        tpag == NULL || outImage == NULL || outSubtex == NULL || outDrawX == NULL || outDrawY == NULL) {
+        return false;
+    }
+
+    int32_t frameW = (int32_t) directImage->subtex->width;
+    int32_t frameH = (int32_t) directImage->subtex->height;
+    int32_t cropX = (int32_t) tpag->targetX;
+    int32_t cropY = (int32_t) tpag->targetY;
+    int32_t cropW = (int32_t) tpag->sourceWidth;
+    int32_t cropH = (int32_t) tpag->sourceHeight;
+    if (frameW <= 0 || frameH <= 0 || cropW <= 0 || cropH <= 0) return false;
+
+    int32_t drawTargetX = cropX;
+    int32_t drawTargetY = cropY;
+    if (cropX < 0) {
+        cropW += cropX;
+        cropX = 0;
+        drawTargetX = 0;
+    }
+    if (cropY < 0) {
+        cropH += cropY;
+        cropY = 0;
+        drawTargetY = 0;
+    }
+    if (cropX + cropW > frameW) cropW = frameW - cropX;
+    if (cropY + cropH > frameH) cropH = frameH - cropY;
+    if (cropW <= 0 || cropH <= 0) return false;
+
+    const Tex3DS_SubTexture* baseSubtex = directImage->subtex;
+    float baseW = (float) baseSubtex->width;
+    float baseH = (float) baseSubtex->height;
+    if (baseW <= 0.0f || baseH <= 0.0f) return false;
+
+    *outSubtex = *baseSubtex;
+    outSubtex->width = (uint16_t) cropW;
+    outSubtex->height = (uint16_t) cropH;
+    outSubtex->left = baseSubtex->left + (baseSubtex->right - baseSubtex->left) * ((float) cropX / baseW);
+    outSubtex->right = baseSubtex->left + (baseSubtex->right - baseSubtex->left) * ((float) (cropX + cropW) / baseW);
+    outSubtex->top = baseSubtex->top + (baseSubtex->bottom - baseSubtex->top) * ((float) cropY / baseH);
+    outSubtex->bottom = baseSubtex->top + (baseSubtex->bottom - baseSubtex->top) * ((float) (cropY + cropH) / baseH);
+
+    *outImage = *directImage;
+    outImage->subtex = outSubtex;
+    *outDrawX = x + ((float) drawTargetX - originX) * xscale;
+    *outDrawY = y + ((float) drawTargetY - originY) * yscale;
+    return true;
+}
+
 static bool N3DSRenderer_tryDrawDirectMappedSprite(Renderer* base, int32_t tpagIndex, float x, float y, float originX, float originY, float xscale, float yscale, float angleDeg, uint32_t color, float alpha) {
 #if !N3DS_ENABLE_DIRECT_ASSETS
     (void) base;
@@ -2119,21 +2280,45 @@ static bool N3DSRenderer_tryDrawDirectMappedSprite(Renderer* base, int32_t tpagI
         isBackgroundImage = true;
     }
 
+    C2D_Image croppedImage;
+    Tex3DS_SubTexture croppedSubtex;
+    C2D_Image* drawImage = directImage;
     float drawX = x - originX * xscale;
     float drawY = y - originY * yscale;
+    if (!isBackgroundImage && tpagIndex >= 0 && (uint32_t) tpagIndex < renderer->base.dataWin->tpag.count) {
+        TexturePageItem* tpag = &renderer->base.dataWin->tpag.items[tpagIndex];
+        if (N3DSRenderer_cropDirectSpriteImage(
+                directImage,
+                tpag,
+                &croppedImage,
+                &croppedSubtex,
+                &drawX,
+                &drawY,
+                x,
+                y,
+                originX,
+                originY,
+                xscale,
+                yscale)) {
+            drawImage = &croppedImage;
+        }
+    }
+
     renderer->frameDirectSpriteHits++;
     if (fabsf(angleDeg) < 0.001f && xscale > 0.0f && yscale > 0.0f) {
-        N3DSRenderer_drawImageFast(base, directImage, drawX, drawY, xscale, yscale, color, alpha);
+        N3DSRenderer_drawImageFast(base, drawImage, drawX, drawY, xscale, yscale, color, alpha);
     } else {
+        float pivotX = x - drawX;
+        float pivotY = y - drawY;
         N3DSRenderer_drawImage(
             base,
-            directImage,
+            drawImage,
             drawX,
             drawY,
-            (float) directImage->subtex->width * xscale,
-            (float) directImage->subtex->height * yscale,
-            originX * xscale,
-            originY * yscale,
+            (float) drawImage->subtex->width * xscale,
+            (float) drawImage->subtex->height * yscale,
+            pivotX,
+            pivotY,
             angleDeg,
             color,
             alpha
@@ -2545,34 +2730,6 @@ static void N3DSRenderer_prewarmTPAG(N3DSRenderer* renderer, bool* seenPages, in
     N3DSRenderer_prewarmPage(renderer, seenPages, renderer->atlasItems[tpagIndex].atlasId);
 }
 
-static void N3DSRenderer_prewarmDirectSpriteFrames(N3DSRenderer* renderer, int32_t spriteIndex) {
-#if !N3DS_ENABLE_DIRECT_ASSETS
-    (void) renderer;
-    (void) spriteIndex;
-#else
-    if (renderer == NULL) return;
-    if (spriteIndex < 0 || (uint32_t) spriteIndex >= renderer->directSpriteAssetCount) return;
-
-    N3DSDirectSpriteAsset* spriteAsset = &renderer->directSpriteAssets[spriteIndex];
-    if (spriteAsset->frameCount == 0) return;
-    if (spriteAsset->battlePrewarmInProgress) return;
-
-    spriteAsset->battlePrewarmInProgress = true;
-
-    repeat(spriteAsset->frameCount, frameIndex) {
-        C2D_Image* directImage = NULL;
-        (void) N3DSRenderer_tryLoadDirectSpriteImage(renderer, spriteIndex, frameIndex, &directImage);
-        if (spriteAsset->frameAssets != NULL) {
-            spriteAsset->frameAssets[frameIndex].pinned = spriteAsset->frameAssets[frameIndex].ready;
-        }
-    }
-
-    spriteAsset->sheetAsset.pinned = spriteAsset->sheetAsset.ready;
-    spriteAsset->battleFramesPinned = true;
-    spriteAsset->battlePrewarmInProgress = false;
-#endif
-}
-
 static void N3DSRenderer_freeCachedTextLayout(N3DSCachedTextLayout* layout) {
     free(layout->text);
     free(layout->glyphs);
@@ -2844,7 +3001,6 @@ static void N3DSRenderer_prewarmRoom(Renderer* base, Runner* runner) {
     N3DSRenderer* renderer = (N3DSRenderer*) base;
     Room* room = runner->currentRoom;
     bool roomChanged = renderer->lastPrewarmedRoom != room;
-    bool battleRoom = room->name != NULL && strstr(room->name, "battle") != NULL;
 
     N3DSRenderer_clearDirectAssetPins(renderer);
     if (roomChanged) {
@@ -2853,7 +3009,6 @@ static void N3DSRenderer_prewarmRoom(Renderer* base, Runner* runner) {
     if (roomChanged && !renderer->isNew3DS) {
         renderer->pendingOld3DSAtlasFlush = true;
     }
-    renderer->directOnlyBattleAssets = battleRoom;
     renderer->lastPrewarmedRoom = room;
     N3DSRenderer_prewarmRoomBlobCache(renderer, runner);
 }
@@ -2866,8 +3021,11 @@ static void N3DSRenderer_init(Renderer* base, DataWin* dataWin) {
     N3DSRenderer* renderer = (N3DSRenderer*) base;
     bool isNew3DS = false;
     base->dataWin = dataWin;
+    renderer->baseTPAGCount = dataWin != NULL ? dataWin->tpag.count : 0u;
     renderer->topTarget = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+#ifndef N3DS_DISABLE_BOTTOM_SCREEN
     renderer->bottomTarget = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+#endif
     renderer->blendEnabled = true;
     renderer->blendEquation = bm_normal;
     renderer->blendSrcFactor = bm_src_alpha;
@@ -2951,6 +3109,12 @@ static void N3DSRenderer_destroy(Renderer* base) {
     free(renderer->directSpriteAssets);
     free(renderer->directBackgroundAssets);
     free(renderer->directFontAssets);
+    if (renderer->dynamicCaptureTPAGs != NULL) {
+        repeat(renderer->dynamicCaptureTPAGCount, i) {
+            N3DSRenderer_freeDynamicCaptureTPAG(renderer, &renderer->dynamicCaptureTPAGs[i]);
+        }
+        free(renderer->dynamicCaptureTPAGs);
+    }
     free(renderer->tpagToSpriteIndex);
     free(renderer->tpagToSpriteFrameIndex);
     free(renderer->tpagToBackgroundIndex);
@@ -2963,7 +3127,7 @@ static void N3DSRenderer_destroy(Renderer* base) {
     if (renderer->tileLayerChunkCaches != NULL) {
         size_t chunkCacheCount = arrlenu(renderer->tileLayerChunkCaches);
         repeat(chunkCacheCount, i) {
-            N3DSRenderer_freeTileLayerChunkCache(&renderer->tileLayerChunkCaches[i]);
+            N3DSRenderer_freeTileLayerChunkCache(renderer, &renderer->tileLayerChunkCaches[i]);
         }
         arrfree(renderer->tileLayerChunkCaches);
         renderer->tileLayerChunkCaches = NULL;
@@ -2991,8 +3155,7 @@ static void N3DSRenderer_beginFrame(Renderer* base, int32_t gameW, int32_t gameH
         N3DSRenderer_flushRoomAtlasResidencyOld3DS(renderer);
     }
 
-    N3DSRenderer_applyBlendState(renderer);
-    N3DSRenderer_applyAlphaState(renderer);
+    N3DSRenderer_setDefaultGPUState(renderer);
     if (renderer->bottomTarget != NULL) {
         N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_BOTTOM, true);
         C2D_TargetClear(renderer->bottomTarget, C2D_Color32(0, 0, 0, 255));
@@ -3004,19 +3167,32 @@ static void N3DSRenderer_beginFrame(Renderer* base, int32_t gameW, int32_t gameH
 static void N3DSRenderer_endFrame(MAYBE_UNUSED Renderer* base) {
     N3DSRenderer* renderer = (N3DSRenderer*) base;
     N3DSRenderer_logPerfWindowIfNeeded(renderer);
+    N3DSRenderer_flushC2DQueue(renderer);
     C2D_Flush();
+    renderer->pendingC2DDraws = 0;
+    renderer->lastDrawTexture = NULL;
 }
 
 void N3DSRenderer_beginOverlay(Renderer* base) {
     if (base == NULL) return;
 
     N3DSRenderer* renderer = (N3DSRenderer*) base;
-    N3DSRenderer_applyBlendState(renderer);
-    N3DSRenderer_applyAlphaState(renderer);
+    N3DSRenderer_flushC2DQueue(renderer);
+    N3DSRenderer_setDefaultGPUState(renderer);
     N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_TOP, false);
 }
 
 void N3DSRenderer_beginBottomScreenGUIEx(Renderer* base, int32_t guiW, int32_t guiH, float scaleX, float scaleY, float offsetX, float offsetY) {
+#ifdef N3DS_DISABLE_BOTTOM_SCREEN
+    (void) base;
+    (void) guiW;
+    (void) guiH;
+    (void) scaleX;
+    (void) scaleY;
+    (void) offsetX;
+    (void) offsetY;
+    return;
+#endif
     if (base == NULL) return;
 
     N3DSRenderer* renderer = (N3DSRenderer*) base;
@@ -3042,8 +3218,8 @@ void N3DSRenderer_beginBottomScreenGUIEx(Renderer* base, int32_t guiW, int32_t g
     renderer->portOffsetY = ((float) guiH * (renderer->frameScaleY - renderer->viewScaleY) * 0.5f) + offsetY;
     renderer->bottomScreenGuiActive = true;
 
-    N3DSRenderer_applyBlendState(renderer);
-    N3DSRenderer_applyAlphaState(renderer);
+    N3DSRenderer_flushC2DQueue(renderer);
+    N3DSRenderer_setDefaultGPUState(renderer);
     N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_BOTTOM, false);
 }
 
@@ -3069,6 +3245,7 @@ void N3DSRenderer_endBottomScreenGUI(Renderer* base) {
     renderer->viewScaleY = renderer->savedViewScaleY;
     renderer->bottomScreenGuiActive = false;
 
+    N3DSRenderer_flushC2DQueue(renderer);
     N3DSRenderer_applyBlendState(renderer);
     N3DSRenderer_applyAlphaState(renderer);
     N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_TOP, false);
@@ -3103,8 +3280,8 @@ void N3DSRenderer_beginTopScreenGUI(Renderer* base, int32_t guiW, int32_t guiH) 
     renderer->topScreenGuiActive = true;
     renderer->topScreenGui2xActive = false;
 
-    N3DSRenderer_applyBlendState(renderer);
-    N3DSRenderer_applyAlphaState(renderer);
+    N3DSRenderer_flushC2DQueue(renderer);
+    N3DSRenderer_setDefaultGPUState(renderer);
     N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_TOP, false);
 }
 
@@ -3127,6 +3304,7 @@ void N3DSRenderer_endTopScreenGUI(Renderer* base) {
     renderer->topScreenGuiActive = false;
     renderer->topScreenGui2xActive = false;
 
+    N3DSRenderer_flushC2DQueue(renderer);
     N3DSRenderer_applyBlendState(renderer);
     N3DSRenderer_applyAlphaState(renderer);
     N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_TOP, false);
@@ -3155,8 +3333,8 @@ void N3DSRenderer_beginTopScreenGUI2x(Renderer* base, int32_t guiW, int32_t guiH
     renderer->topScreenGuiActive = true;
     renderer->topScreenGui2xActive = true;
 
-    N3DSRenderer_applyBlendState(renderer);
-    N3DSRenderer_applyAlphaState(renderer);
+    N3DSRenderer_flushC2DQueue(renderer);
+    N3DSRenderer_setDefaultGPUState(renderer);
     N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_TOP, false);
 }
 
@@ -3179,6 +3357,7 @@ void N3DSRenderer_endTopScreenGUI2x(Renderer* base) {
     renderer->topScreenGuiActive = false;
     renderer->topScreenGui2xActive = false;
 
+    N3DSRenderer_flushC2DQueue(renderer);
     N3DSRenderer_applyBlendState(renderer);
     N3DSRenderer_applyAlphaState(renderer);
     N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_TOP, false);
@@ -3305,6 +3484,7 @@ static void N3DSRenderer_drawImage(Renderer* base, C2D_Image* image, float local
         C2D_PlainImageTint(&tint, N3DSRenderer_makeColor(color, alpha), 1.0f);
         C2D_DrawImage(drawImage, &params, &tint);
     }
+    N3DSRenderer_noteC2DDraws(renderer, 1u);
 }
 
 static bool N3DSRenderer_tryResolveSingleFragmentFontPage(N3DSRenderer* renderer, int32_t tpagIndex, const N3DSAtlasFragment** outFragment, N3DSLoadedAtlasPage** outPage) {
@@ -3340,8 +3520,29 @@ static void N3DSRenderer_drawSprite(Renderer* base, int32_t tpagIndex, float x, 
     TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
 
     N3DSRenderer* renderer = (N3DSRenderer*) base;
+    N3DSDynamicCaptureTPAG* dynamicCapture = N3DSRenderer_getDynamicCaptureTPAG(renderer, tpagIndex);
     N3DSRenderer_traceTPAGUsage(renderer, N3DS_TRACE_KIND_SPRITE, tpagIndex);
     renderer->frameSpriteDrawCalls++;
+    if (dynamicCapture != NULL) {
+        float localX = ((float) tpag->targetX - originX) * xscale;
+        float localY = ((float) tpag->targetY - originY) * yscale;
+        float drawX = x + localX;
+        float drawY = y + localY;
+        N3DSRenderer_drawImage(
+            base,
+            &dynamicCapture->image,
+            drawX,
+            drawY,
+            (float) tpag->sourceWidth * xscale,
+            (float) tpag->sourceHeight * yscale,
+            -localX,
+            -localY,
+            angleDeg,
+            color,
+            alpha
+        );
+        return;
+    }
     if (N3DSRenderer_tryDrawDirectMappedSprite(base, tpagIndex, x, y, originX, originY, xscale, yscale, angleDeg, color, alpha)) {
         return;
     }
@@ -3409,8 +3610,61 @@ static void N3DSRenderer_drawSpritePart(Renderer* base, int32_t tpagIndex, int32
     }
 
     N3DSRenderer* renderer = (N3DSRenderer*) base;
+    N3DSDynamicCaptureTPAG* dynamicCapture = N3DSRenderer_getDynamicCaptureTPAG(renderer, tpagIndex);
     N3DSRenderer_traceTPAGUsage(renderer, N3DS_TRACE_KIND_SPRITE_PART, tpagIndex);
     renderer->frameSpritePartDrawCalls++;
+    if (dynamicCapture != NULL) {
+        DataWin* dw = base->dataWin;
+        if (tpagIndex < 0 || (uint32_t) tpagIndex >= dw->tpag.count) return;
+        TexturePageItem* tpag = &dw->tpag.items[tpagIndex];
+        float logicalW = (float) (tpag->sourceWidth > 0 ? tpag->sourceWidth : dynamicCapture->logicalWidth);
+        float logicalH = (float) (tpag->sourceHeight > 0 ? tpag->sourceHeight : dynamicCapture->logicalHeight);
+        float texW = (float) dynamicCapture->subtex.width;
+        float texH = (float) dynamicCapture->subtex.height;
+        if (logicalW <= 0.0f || logicalH <= 0.0f || texW <= 0.0f || texH <= 0.0f) return;
+
+        Tex3DS_SubTexture subtex = dynamicCapture->subtex;
+        float u0 = (float) srcOffX / logicalW;
+        float v0 = (float) srcOffY / logicalH;
+        float u1 = (float) (srcOffX + srcW) / logicalW;
+        float v1 = (float) (srcOffY + srcH) / logicalH;
+        if (u0 < 0.0f) u0 = 0.0f;
+        if (v0 < 0.0f) v0 = 0.0f;
+        if (u1 > 1.0f) u1 = 1.0f;
+        if (v1 > 1.0f) v1 = 1.0f;
+        if (u0 >= u1 || v0 >= v1) return;
+
+        float left = dynamicCapture->subtex.left;
+        float right = dynamicCapture->subtex.right;
+        float top = dynamicCapture->subtex.top;
+        float bottom = dynamicCapture->subtex.bottom;
+        subtex.left = left + (right - left) * u0;
+        subtex.right = left + (right - left) * u1;
+        subtex.top = top + (bottom - top) * v0;
+        subtex.bottom = top + (bottom - top) * v1;
+        subtex.width = (uint16_t) lroundf((u1 - u0) * texW);
+        subtex.height = (uint16_t) lroundf((v1 - v0) * texH);
+        if (subtex.width == 0 || subtex.height == 0) return;
+
+        C2D_Image image = {
+            .tex = dynamicCapture->image.tex,
+            .subtex = &subtex,
+        };
+        N3DSRenderer_drawImage(
+            base,
+            &image,
+            x,
+            y,
+            (float) srcW * xscale,
+            (float) srcH * yscale,
+            pivotX - x,
+            pivotY - y,
+            angleDeg,
+            color,
+            alpha
+        );
+        return;
+    }
 
     C2D_Image* directImage = NULL;
     if (renderer->tpagToSpriteIndex != NULL && renderer->tpagToSpriteFrameIndex != NULL &&
@@ -4042,8 +4296,10 @@ static void N3DSRenderer_drawRectangle(Renderer* base, float x1, float y1, float
         C2D_DrawLine(sx + sw, sy, rgba, sx + sw, sy + sh, rgba, 1.0f, 0.5f);
         C2D_DrawLine(sx + sw, sy + sh, rgba, sx, sy + sh, rgba, 1.0f, 0.5f);
         C2D_DrawLine(sx, sy + sh, rgba, sx, sy, rgba, 1.0f, 0.5f);
+        N3DSRenderer_noteC2DDraws(renderer, 4u);
     } else {
         C2D_DrawRectSolid(sx, sy, 0.5f, sw, sh, rgba);
+        N3DSRenderer_noteC2DDraws(renderer, 1u);
     }
 }
 
@@ -4071,6 +4327,7 @@ static void N3DSRenderer_drawLine(Renderer* base, float x1, float y1, float x2, 
     float dy = sy2 - sy1;
     if ((dx * dx + dy * dy) <= 0.0001f) {
         C2D_DrawRectSolid(sx1, sy1, 0.5f, width, width, N3DSRenderer_makeColor(color, alpha));
+        N3DSRenderer_noteC2DDraws(renderer, 1u);
         return;
     }
 
@@ -4085,6 +4342,7 @@ static void N3DSRenderer_drawLine(Renderer* base, float x1, float y1, float x2, 
         width,
         0.5f
     );
+    N3DSRenderer_noteC2DDraws(renderer, 1u);
 }
 
 static void N3DSRenderer_drawTriangle(Renderer* base, float x1, float y1, float x2, float y2, float x3, float y3, bool outline) {
@@ -4102,19 +4360,53 @@ static void N3DSRenderer_drawTriangle(Renderer* base, float x1, float y1, float 
     }
 
     N3DSRenderer* renderer = (N3DSRenderer*) base;
+    float sx1 = N3DSRenderer_transformScreenX(renderer, x1);
+    float sy1 = N3DSRenderer_transformScreenY(renderer, y1);
+    float sx2 = N3DSRenderer_transformScreenX(renderer, x2);
+    float sy2 = N3DSRenderer_transformScreenY(renderer, y2);
+    float sx3 = N3DSRenderer_transformScreenX(renderer, x3);
+    float sy3 = N3DSRenderer_transformScreenY(renderer, y3);
+    if (!Renderer_isFiniteFloat(sx1) || !Renderer_isFiniteFloat(sy1) ||
+        !Renderer_isFiniteFloat(sx2) || !Renderer_isFiniteFloat(sy2) ||
+        !Renderer_isFiniteFloat(sx3) || !Renderer_isFiniteFloat(sy3)) {
+        return;
+    }
+
+    float minX = sx1 < sx2 ? sx1 : sx2;
+    if (sx3 < minX) minX = sx3;
+    float maxX = sx1 > sx2 ? sx1 : sx2;
+    if (sx3 > maxX) maxX = sx3;
+    float minY = sy1 < sy2 ? sy1 : sy2;
+    if (sy3 < minY) minY = sy3;
+    float maxY = sy1 > sy2 ? sy1 : sy2;
+    if (sy3 > maxY) maxY = sy3;
+    if (N3DSRenderer_isScreenRectOffscreen(renderer, minX, minY, maxX - minX, maxY - minY)) {
+        return;
+    }
+
+    // Tiny circles and snapped coordinates can collapse adjacent fan triangles to zero area.
+    // Citro2D appears to dislike those degenerate cases, so skip them before issuing the draw.
+    float doubledArea =
+        ((sx2 - sx1) * (sy3 - sy1)) -
+        ((sy2 - sy1) * (sx3 - sx1));
+    if (fabsf(doubledArea) < 0.01f) {
+        return;
+    }
+
     u32 rgba = N3DSRenderer_makeColor(base->drawColor, base->drawAlpha);
     C2D_DrawTriangle(
-        N3DSRenderer_transformScreenX(renderer, x1),
-        N3DSRenderer_transformScreenY(renderer, y1),
+        sx1,
+        sy1,
         rgba,
-        N3DSRenderer_transformScreenX(renderer, x2),
-        N3DSRenderer_transformScreenY(renderer, y2),
+        sx2,
+        sy2,
         rgba,
-        N3DSRenderer_transformScreenX(renderer, x3),
-        N3DSRenderer_transformScreenY(renderer, y3),
+        sx3,
+        sy3,
         rgba,
         0.5f
     );
+    N3DSRenderer_noteC2DDraws(renderer, 1u);
 }
 
 static void N3DSRenderer_drawLineColor(Renderer* base, float x1, float y1, float x2, float y2, float width, uint32_t color1, uint32_t color2, float alpha) {
@@ -4141,6 +4433,7 @@ static void N3DSRenderer_drawLineColor(Renderer* base, float x1, float y1, float
     float dy = sy2 - sy1;
     if ((dx * dx + dy * dy) <= 0.0001f) {
         C2D_DrawRectSolid(sx1, sy1, 0.5f, width, width, N3DSRenderer_makeColor(color1, alpha));
+        N3DSRenderer_noteC2DDraws(renderer, 1u);
         return;
     }
 
@@ -4154,6 +4447,7 @@ static void N3DSRenderer_drawLineColor(Renderer* base, float x1, float y1, float
         width,
         0.5f
     );
+    N3DSRenderer_noteC2DDraws(renderer, 1u);
 }
 
 static void N3DSRenderer_drawTextCommon(Renderer* base, const char* text, float x, float y, float xscale, float yscale, float angleDeg, bool gradient, int32_t c1, int32_t c2, int32_t c3, int32_t c4, float alpha) {
@@ -4323,8 +4617,9 @@ static void N3DSRenderer_drawTextColor(Renderer* base, const char* text, float x
     N3DSRenderer_drawTextCommon(base, text, x, y, xscale, yscale, angleDeg, true, c1, c2, c3, c4, alpha);
 }
 
-static void N3DSRenderer_flush(MAYBE_UNUSED Renderer* base) {
-    C2D_Flush();
+static void N3DSRenderer_flush(Renderer* base) {
+    if (base == NULL) return;
+    N3DSRenderer_flushC2DQueue((N3DSRenderer*) base);
 }
 
 static void N3DSRenderer_clearScreen(Renderer* base, uint32_t color, float alpha) {
@@ -4334,11 +4629,153 @@ static void N3DSRenderer_clearScreen(Renderer* base, uint32_t color, float alpha
     C2D_TargetClear(renderer->topTarget, N3DSRenderer_makeColor(color, alpha));
 }
 
-static int32_t N3DSRenderer_createSpriteFromSurface(MAYBE_UNUSED Renderer* base, MAYBE_UNUSED int32_t surfaceID, MAYBE_UNUSED int32_t x, MAYBE_UNUSED int32_t y, MAYBE_UNUSED int32_t w, MAYBE_UNUSED int32_t h, MAYBE_UNUSED bool removeback, MAYBE_UNUSED bool smooth, MAYBE_UNUSED int32_t xorig, MAYBE_UNUSED int32_t yorig) {
-    return -1;
+static int32_t N3DSRenderer_createSpriteFromSurface(Renderer* base, int32_t surfaceID, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, bool smooth, int32_t xorig, int32_t yorig) {
+    if (base == NULL || base->dataWin == NULL || surfaceID != -1 || w <= 0 || h <= 0) return -1;
+
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    if (renderer->activeSceneTarget != N3DS_SCENE_TARGET_TOP) return -1;
+
+    float screenRectX = 0.0f;
+    float screenRectY = 0.0f;
+    float screenRectW = 0.0f;
+    float screenRectH = 0.0f;
+    N3DSRenderer_transformScreenRect(renderer, (float) x, (float) y, (float) w, (float) h, &screenRectX, &screenRectY, &screenRectW, &screenRectH);
+
+    int32_t screenLeft = (int32_t) floorf(screenRectX);
+    int32_t screenTop = (int32_t) floorf(screenRectY);
+    int32_t screenRight = (int32_t) ceilf(screenRectX + screenRectW);
+    int32_t screenBottom = (int32_t) ceilf(screenRectY + screenRectH);
+    if (screenLeft < 0) screenLeft = 0;
+    if (screenTop < 0) screenTop = 0;
+    if (screenRight > N3DS_TOP_WIDTH) screenRight = N3DS_TOP_WIDTH;
+    if (screenBottom > N3DS_TOP_HEIGHT) screenBottom = N3DS_TOP_HEIGHT;
+    if (screenLeft >= screenRight || screenTop >= screenBottom) return -1;
+
+    uint16_t captureWidth = (uint16_t) (screenRight - screenLeft);
+    uint16_t captureHeight = (uint16_t) (screenBottom - screenTop);
+    size_t pixelCount = (size_t) captureWidth * (size_t) captureHeight;
+    uint16_t* pixels = (uint16_t*) linearAlloc(pixelCount * sizeof(uint16_t));
+    if (pixels == NULL) return -1;
+
+    N3DSRenderer_flushC2DQueue(renderer);
+    C2D_Flush();
+    uint8_t* framebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
+    if (framebuffer == NULL) {
+        linearFree(pixels);
+        return -1;
+    }
+
+    uint16_t transparentKey = 0;
+    bool haveTransparentKey = false;
+    repeat(captureHeight, row) {
+        int32_t screenY = screenTop + (int32_t) row;
+        repeat(captureWidth, col) {
+            int32_t screenX = screenLeft + (int32_t) col;
+            size_t fbOffset = ((size_t) screenX * (size_t) N3DS_TOP_HEIGHT + (size_t) ((N3DS_TOP_HEIGHT - 1) - screenY)) * 3u;
+            uint8_t r = framebuffer[fbOffset + 0u];
+            uint8_t g = framebuffer[fbOffset + 1u];
+            uint8_t b = framebuffer[fbOffset + 2u];
+            uint16_t rgba5551 = (uint16_t) ((((uint16_t) r >> 3) << 11) | (((uint16_t) g >> 3) << 6) | (((uint16_t) b >> 3) << 1) | 1u);
+            if (!haveTransparentKey) {
+                transparentKey = rgba5551;
+                haveTransparentKey = true;
+            }
+            if (removeback && rgba5551 == transparentKey) {
+                rgba5551 &= (uint16_t) ~1u;
+            }
+            pixels[(size_t) row * (size_t) captureWidth + (size_t) col] = rgba5551;
+        }
+    }
+
+    int32_t spriteIndex = (int32_t) DataWin_allocSpriteSlot(base->dataWin, base->dataWin->sprt.parsedCount);
+    int32_t tpagIndex = N3DSRenderer_allocDynamicCaptureTPAG(renderer);
+    if (spriteIndex < 0 || tpagIndex < 0) {
+        linearFree(pixels);
+        return -1;
+    }
+
+    N3DSDynamicCaptureTPAG* capture = &renderer->dynamicCaptureTPAGs[(uint32_t) tpagIndex - renderer->baseTPAGCount];
+    if (!C3D_TexInit(&capture->texture, captureWidth, captureHeight, GPU_RGBA5551)) {
+        linearFree(pixels);
+        return -1;
+    }
+
+    C3D_TexSetFilter(&capture->texture, smooth ? GPU_LINEAR : GPU_NEAREST, smooth ? GPU_LINEAR : GPU_NEAREST);
+    C3D_TexSetWrap(&capture->texture, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    C3D_TexUpload(&capture->texture, pixels);
+    C3D_TexFlush(&capture->texture);
+    linearFree(pixels);
+
+    capture->used = true;
+    capture->ownerSpriteIndex = spriteIndex;
+    capture->logicalWidth = (uint16_t) w;
+    capture->logicalHeight = (uint16_t) h;
+    capture->subtex.width = captureWidth;
+    capture->subtex.height = captureHeight;
+    capture->subtex.left = 0.0f;
+    capture->subtex.top = 1.0f;
+    capture->subtex.right = 1.0f;
+    capture->subtex.bottom = 0.0f;
+    capture->image.tex = &capture->texture;
+    capture->image.subtex = &capture->subtex;
+
+    Sprite* sprite = &base->dataWin->sprt.sprites[spriteIndex];
+    const char* preservedName = sprite->name;
+    TexturePageItem* tpag = &base->dataWin->tpag.items[tpagIndex];
+    memset(sprite, 0, sizeof(*sprite));
+    sprite->name = preservedName;
+    sprite->width = (uint32_t) w;
+    sprite->height = (uint32_t) h;
+    sprite->transparent = removeback;
+    sprite->smooth = smooth;
+    sprite->originX = xorig;
+    sprite->originY = yorig;
+    sprite->textureCount = 1u;
+    sprite->tpagIndices = safeMalloc(sizeof(int32_t));
+    sprite->tpagIndices[0] = tpagIndex;
+
+    memset(tpag, 0, sizeof(*tpag));
+    tpag->sourceWidth = (uint16_t) w;
+    tpag->sourceHeight = (uint16_t) h;
+    tpag->targetWidth = (uint16_t) w;
+    tpag->targetHeight = (uint16_t) h;
+    tpag->boundingWidth = (uint16_t) w;
+    tpag->boundingHeight = (uint16_t) h;
+    tpag->texturePageId = -1;
+    return spriteIndex;
 }
 
-static void N3DSRenderer_deleteSprite(MAYBE_UNUSED Renderer* base, MAYBE_UNUSED int32_t spriteIndex) {}
+static void N3DSRenderer_deleteSprite(Renderer* base, int32_t spriteIndex) {
+    if (base == NULL || base->dataWin == NULL) return;
+    DataWin* dw = base->dataWin;
+    if (spriteIndex < 0 || (uint32_t) spriteIndex >= dw->sprt.count) return;
+
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    Sprite* sprite = &dw->sprt.sprites[spriteIndex];
+    if (sprite->textureCount == 0) return;
+
+    bool releasedDynamicCapture = false;
+    repeat(renderer->dynamicCaptureTPAGCount, i) {
+        N3DSDynamicCaptureTPAG* capture = &renderer->dynamicCaptureTPAGs[i];
+        if (!capture->used || capture->ownerSpriteIndex != spriteIndex) continue;
+        N3DSRenderer_freeDynamicCaptureTPAG(renderer, capture);
+        TexturePageItem* tpag = &dw->tpag.items[renderer->baseTPAGCount + (uint32_t) i];
+        memset(tpag, 0, sizeof(*tpag));
+        tpag->texturePageId = -1;
+        releasedDynamicCapture = true;
+    }
+    if (!releasedDynamicCapture) return;
+
+    const char* preservedName = sprite->name;
+    free(sprite->tpagIndices);
+    sprite->tpagIndices = NULL;
+    repeat(sprite->maskCount, maskIndex) {
+        free(sprite->masks[maskIndex]);
+    }
+    free(sprite->masks);
+    memset(sprite, 0, sizeof(*sprite));
+    sprite->name = preservedName;
+}
 
 static void N3DSRenderer_gpuSetBlendMode(Renderer* base, int32_t mode) {
     N3DSRenderer* renderer = (N3DSRenderer*) base;
@@ -4380,7 +4817,7 @@ static void N3DSRenderer_gpuSetColorWriteEnable(MAYBE_UNUSED Renderer* base, MAY
 static void N3DSRenderer_gpuSetFog(MAYBE_UNUSED Renderer* base, MAYBE_UNUSED bool enable, MAYBE_UNUSED uint32_t color) {}
 
 static int32_t N3DSRenderer_createSurface(MAYBE_UNUSED Renderer* base, MAYBE_UNUSED int32_t width, MAYBE_UNUSED int32_t height) { return -1; }
-static bool N3DSRenderer_surfaceExists(MAYBE_UNUSED Renderer* base, MAYBE_UNUSED int32_t surfaceID) { return false; }
+static bool N3DSRenderer_surfaceExists(MAYBE_UNUSED Renderer* base, MAYBE_UNUSED int32_t surfaceID) { return surfaceID == -1; }
 static bool N3DSRenderer_setSurfaceTarget(MAYBE_UNUSED Renderer* base, MAYBE_UNUSED int32_t surfaceID) { return false; }
 static bool N3DSRenderer_resetSurfaceTarget(MAYBE_UNUSED Renderer* base) { return false; }
 static float N3DSRenderer_getSurfaceWidth(MAYBE_UNUSED Renderer* base, MAYBE_UNUSED int32_t surfaceID) { return 0.0f; }
@@ -4567,6 +5004,12 @@ int32_t N3DSRenderer_createTileLayerChunkCache(Renderer* base, int32_t roomWidth
     uint32_t chunkCount = chunkCols * chunkRows;
     if (chunkCount == 0) return -1;
 
+    uint64_t estimatedBytes = (uint64_t) chunkCount * (uint64_t) N3DS_TILE_LAYER_CHUNK_TEXTURE_BYTES;
+    if (estimatedBytes > (uint64_t) N3DS_TILE_LAYER_CHUNK_VRAM_BUDGET ||
+        (uint64_t) renderer->tileLayerChunkVRAMBytes + estimatedBytes > (uint64_t) N3DS_TILE_LAYER_CHUNK_VRAM_BUDGET) {
+        return -1;
+    }
+
     int32_t cacheIndex = -1;
     size_t existingCount = arrlenu(renderer->tileLayerChunkCaches);
     repeat(existingCount, i) {
@@ -4582,9 +5025,10 @@ int32_t N3DSRenderer_createTileLayerChunkCache(Renderer* base, int32_t roomWidth
     }
 
     N3DSTileLayerChunkCache* chunkCache = &renderer->tileLayerChunkCaches[cacheIndex];
-    N3DSRenderer_freeTileLayerChunkCache(chunkCache);
+    N3DSRenderer_freeTileLayerChunkCache(renderer, chunkCache);
     chunkCache->used = true;
     chunkCache->chunkCount = chunkCount;
+    chunkCache->vramBytes = 0;
     chunkCache->chunks = safeCalloc(chunkCount, sizeof(N3DSTileLayerChunk));
 
     float savedFrameScaleX = renderer->frameScaleX;
@@ -4600,6 +5044,8 @@ int32_t N3DSRenderer_createTileLayerChunkCache(Renderer* base, int32_t roomWidth
     uint8_t savedSceneTarget = renderer->activeSceneTarget;
 
     C2D_Flush();
+    renderer->pendingC2DDraws = 0;
+    renderer->lastDrawTexture = NULL;
     renderer->frameScaleX = 1.0f;
     renderer->frameScaleY = 1.0f;
     renderer->frameOffsetX = 0.0f;
@@ -4713,6 +5159,8 @@ int32_t N3DSRenderer_createTileLayerChunkCache(Renderer* base, int32_t roomWidth
             }
 
             C2D_Flush();
+            renderer->pendingC2DDraws = 0;
+            renderer->lastDrawTexture = NULL;
             if (!drewAny) {
                 if (chunk->target != NULL) {
                     C3D_RenderTargetDelete(chunk->target);
@@ -4721,9 +5169,13 @@ int32_t N3DSRenderer_createTileLayerChunkCache(Renderer* base, int32_t roomWidth
                 C3D_TexDelete(&chunk->texture);
                 memset(&chunk->texture, 0, sizeof(chunk->texture));
                 chunk->allocated = false;
+            } else {
+                chunkCache->vramBytes += N3DS_TILE_LAYER_CHUNK_TEXTURE_BYTES;
             }
         }
     }
+
+    renderer->tileLayerChunkVRAMBytes += chunkCache->vramBytes;
 
     renderer->frameScaleX = savedFrameScaleX;
     renderer->frameScaleY = savedFrameScaleY;
@@ -4784,5 +5236,5 @@ void N3DSRenderer_destroyTileLayerChunkCache(Renderer* base, int32_t cacheId) {
 
     N3DSRenderer* renderer = (N3DSRenderer*) base;
     if (cacheId < 0 || (size_t) cacheId >= arrlenu(renderer->tileLayerChunkCaches)) return;
-    N3DSRenderer_freeTileLayerChunkCache(&renderer->tileLayerChunkCaches[cacheId]);
+    N3DSRenderer_freeTileLayerChunkCache(renderer, &renderer->tileLayerChunkCaches[cacheId]);
 }

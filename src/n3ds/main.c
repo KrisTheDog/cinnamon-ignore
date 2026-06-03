@@ -19,13 +19,11 @@
 #include <sys/stat.h>
 
 #define N3DS_LOADING_TEXT_SCALE 0.42f
-#define N3DS_DEBUG_TEXT_SCALE 0.40f
 #define N3DS_BOOT_LOG_MAX_LINES 6
 #define N3DS_BOOT_LOG_LINE_CHARS 88
 #define N3DS_TOTAL_VRAM_BYTES (6u * 1024u * 1024u)
 #define N3DS_DEBUG_ASRIEL_ROOM 330
 
-void N3DS_getAsrielLedDebugState(int32_t* outInitRc, int32_t* outSetRc, bool* outTriggered, int32_t* outRoomIndex);
 void N3DS_tryTriggerAsrielLed(Runner* runner);
 
 typedef struct {
@@ -93,40 +91,140 @@ static void N3DSDebugMonitor_tickFrame(N3DSDebugMonitor* monitor) {
     monitor->sampleStartMs = nowMs;
 }
 
-static void N3DSDebugMonitor_drawLedStatus(N3DSDebugMonitor* monitor, Runner* runner, Renderer* renderer) {
-    if (monitor == NULL || runner == NULL || renderer == NULL || monitor->textBuf == NULL) return;
+//font used in godmode9 that's easy to read. got lazy and just embedded the pbm bytes directly here 
 
-    int32_t initRc = 0;
-    int32_t setRc = 0;
-    int32_t roomIndex = -1;
-    bool triggered = false;
-    N3DS_getAsrielLedDebugState(&initRc, &setRc, &triggered, &roomIndex);
+static uint8_t N3DSDebugTinyFont_getRow(char c, uint32_t row) {
+    static const uint8_t font[95][10] = {
+        { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        { 0x00, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04, 0x00, 0x00 },
+        { 0x00, 0x0A, 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        { 0x00, 0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A, 0x00, 0x00 },
+        { 0x00, 0x04, 0x0E, 0x15, 0x0C, 0x06, 0x15, 0x0E, 0x04, 0x00 },
+        { 0x00, 0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13, 0x00, 0x00 },
+        { 0x00, 0x04, 0x0A, 0x04, 0x09, 0x15, 0x12, 0x0D, 0x00, 0x00 },
+        { 0x00, 0x04, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        { 0x00, 0x02, 0x04, 0x04, 0x04, 0x04, 0x04, 0x02, 0x00, 0x00 },
+        { 0x00, 0x08, 0x04, 0x04, 0x04, 0x04, 0x04, 0x08, 0x00, 0x00 },
+        { 0x00, 0x00, 0x04, 0x15, 0x0E, 0x15, 0x04, 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x18, 0x00 },
+        { 0x00, 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00, 0x00 },
+        { 0x00, 0x02, 0x02, 0x04, 0x04, 0x08, 0x08, 0x10, 0x10, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x1F, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02, 0x00, 0x00 },
+        { 0x00, 0x1F, 0x10, 0x10, 0x1E, 0x01, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x1F, 0x01, 0x02, 0x02, 0x04, 0x04, 0x04, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x18, 0x00 },
+        { 0x00, 0x01, 0x02, 0x04, 0x08, 0x04, 0x02, 0x01, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x00 },
+        { 0x00, 0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x13, 0x15, 0x17, 0x10, 0x0F, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00, 0x00 },
+        { 0x00, 0x1E, 0x09, 0x09, 0x0E, 0x09, 0x09, 0x1E, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x1E, 0x09, 0x09, 0x09, 0x09, 0x09, 0x1E, 0x00, 0x00 },
+        { 0x00, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00, 0x00 },
+        { 0x00, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10, 0x00, 0x00 },
+        { 0x00, 0x0F, 0x10, 0x10, 0x13, 0x11, 0x11, 0x0F, 0x00, 0x00 },
+        { 0x00, 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00, 0x00 },
+        { 0x00, 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F, 0x00, 0x00 },
+        { 0x00, 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x18, 0x00, 0x00 },
+        { 0x00, 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11, 0x00, 0x00 },
+        { 0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F, 0x00, 0x00 },
+        { 0x00, 0x11, 0x1B, 0x15, 0x11, 0x11, 0x11, 0x11, 0x00, 0x00 },
+        { 0x00, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D, 0x00, 0x00 },
+        { 0x00, 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x11, 0x00, 0x00 },
+        { 0x00, 0x0E, 0x11, 0x10, 0x0E, 0x01, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00 },
+        { 0x00, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04, 0x00, 0x00 },
+        { 0x00, 0x11, 0x11, 0x11, 0x11, 0x15, 0x15, 0x0A, 0x00, 0x00 },
+        { 0x00, 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11, 0x00, 0x00 },
+        { 0x00, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00 },
+        { 0x00, 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F, 0x00, 0x00 },
+        { 0x00, 0x06, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x00, 0x00 },
+        { 0x00, 0x10, 0x10, 0x08, 0x08, 0x04, 0x04, 0x02, 0x02, 0x00 },
+        { 0x00, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0C, 0x00, 0x00 },
+        { 0x00, 0x04, 0x0A, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x00 },
+        { 0x00, 0x08, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00, 0x00 },
+        { 0x00, 0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x1E, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x0E, 0x11, 0x10, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x01, 0x01, 0x0F, 0x11, 0x11, 0x13, 0x0D, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0F, 0x00, 0x00 },
+        { 0x00, 0x06, 0x09, 0x08, 0x1E, 0x08, 0x08, 0x08, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x0D, 0x13, 0x11, 0x11, 0x0F, 0x01, 0x1E },
+        { 0x00, 0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11, 0x00, 0x00 },
+        { 0x00, 0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x1F, 0x00, 0x00 },
+        { 0x00, 0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x18 },
+        { 0x00, 0x10, 0x10, 0x12, 0x14, 0x1C, 0x12, 0x11, 0x00, 0x00 },
+        { 0x00, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x1A, 0x15, 0x15, 0x15, 0x15, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x1E, 0x10, 0x10 },
+        { 0x00, 0x00, 0x00, 0x0F, 0x11, 0x11, 0x13, 0x0D, 0x01, 0x01 },
+        { 0x00, 0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E, 0x00, 0x00 },
+        { 0x00, 0x04, 0x04, 0x0E, 0x04, 0x04, 0x04, 0x02, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0D, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x0A, 0x04, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x1E },
+        { 0x00, 0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F, 0x00, 0x00 },
+        { 0x00, 0x02, 0x04, 0x04, 0x08, 0x04, 0x04, 0x02, 0x00, 0x00 },
+        { 0x00, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
+        { 0x00, 0x08, 0x04, 0x04, 0x02, 0x04, 0x04, 0x08, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00, 0x00, 0x00 },
+    };
 
-    char ledLine1[96];
-    char ledLine2[128];
-    snprintf(ledLine1, sizeof(ledLine1), "LED triggered=%s room=%d", triggered ? "yes" : "no", roomIndex);
-    snprintf(ledLine2, sizeof(ledLine2), "mcuHwcInit=0x%08lX  SetPattern=0x%08lX",
-        (unsigned long) (uint32_t) initRc,
-        (unsigned long) (uint32_t) setRc);
+    if (row >= 10u || c < 32 || c > 126) return 0;
+    return font[(uint8_t) c - 32u][row];
+}
 
-    N3DSRenderer_beginBottomScreenGUI(renderer, 320, 240);
-    C2D_DrawRectSolid(10.0f, 176.0f, 0.0f, 300.0f, 46.0f, C2D_Color32(10, 12, 18, 230));
-    C2D_DrawRectSolid(10.0f, 176.0f, 0.0f, 300.0f, 2.0f, C2D_Color32(255, 166, 77, 255));
+static void N3DSDebugTinyFont_drawText(const char* text, float x, float y, uint32_t color) {
+    if (text == NULL) return;
 
-    C2D_Text ledText1;
-    C2D_Text ledText2;
-    C2D_TextBufClear(monitor->textBuf);
-    C2D_TextParse(&ledText1, monitor->textBuf, ledLine1);
-    C2D_TextParse(&ledText2, monitor->textBuf, ledLine2);
-    C2D_TextOptimize(&ledText1);
-    C2D_TextOptimize(&ledText2);
+    const float pixel = 1.0f;
+    const float charAdvance = 6.0f;
+    for (const char* cursor = text; *cursor != '\0'; ++cursor) {
+        if (*cursor == ' ') {
+            x += charAdvance;
+            continue;
+        }
 
-    C2D_DrawText(&ledText1, C2D_WithColor, 18.0f, 186.0f, 0.0f, 0.34f, 0.34f, C2D_Color32(255, 240, 200, 255));
-    C2D_DrawText(&ledText2, C2D_WithColor, 18.0f, 202.0f, 0.0f, 0.29f, 0.29f, C2D_Color32(255, 220, 180, 255));
-    N3DSRenderer_endBottomScreenGUI(renderer);
+        repeat(10u, row) {
+            uint8_t bits = N3DSDebugTinyFont_getRow(*cursor, (uint32_t) row);
+            repeat(6u, col) {
+                if ((bits & (uint8_t) (1u << (5u - col))) == 0u) continue;
+                C2D_DrawRectSolid(x + (float) col * pixel, y + (float) row * pixel, 0.0f, pixel, pixel, color);
+            }
+        }
+        x += charAdvance;
+    }
 }
 
 static void N3DSDebugMonitor_draw(N3DSDebugMonitor* monitor, Runner* runner, Renderer* renderer) {
+#ifdef N3DS_DISABLE_BOTTOM_SCREEN
+    (void) monitor;
+    (void) runner;
+    (void) renderer;
+    return;
+#endif
     if (monitor == NULL || runner == NULL || renderer == NULL || monitor->textBuf == NULL) return;
 
     const char* roomName = "(none)";
@@ -139,7 +237,6 @@ static void N3DSDebugMonitor_draw(N3DSDebugMonitor* monitor, Runner* runner, Ren
     uint32_t atlasPageCount = N3DSRenderer_getResidentAtlasPageCount(renderer);
     uint32_t atlasPageLimit = N3DSRenderer_getResidentAtlasPageLimit(renderer);
     uint32_t directVRAMBytes = N3DSRenderer_getResidentDirectAssetVRAMBytes(renderer);
-    uint32_t directVRAMLimitBytes = N3DSRenderer_getResidentDirectAssetVRAMLimitBytes(renderer);
     uint32_t trackedVRAMBytes = atlasVRAMBytes + directVRAMBytes;
     uint32_t ramFreeBytes = osGetMemRegionFree(MEMREGION_APPLICATION);
     uint32_t ramTotalBytes = osGetMemRegionSize(MEMREGION_APPLICATION);
@@ -147,7 +244,7 @@ static void N3DSDebugMonitor_draw(N3DSDebugMonitor* monitor, Runner* runner, Ren
 
     char fpsLine[64];
     char vramLine[64];
-    char vramDetailLine[128];
+    char atlasLine[96];
     char ramLine[96];
     char audioLine[96];
     char roomLine[96];
@@ -156,7 +253,6 @@ static void N3DSDebugMonitor_draw(N3DSDebugMonitor* monitor, Runner* runner, Ren
     char atlasUsed[24];
     char atlasLimit[24];
     char directUsed[24];
-    char directLimit[24];
     char ramFree[24];
     char ramTotal[24];
     char linearFree[24];
@@ -169,74 +265,52 @@ static void N3DSDebugMonitor_draw(N3DSDebugMonitor* monitor, Runner* runner, Ren
 
     N3DSAudioSystem_getCacheStats(runner->audioSystem, &cachedSounds, &totalSounds, &cachedSoundBytes, &cacheLimitBytes);
 
-    snprintf(fpsLine, sizeof(fpsLine), "FPS  %.1f", monitor->displayedFps > 0.0 ? monitor->displayedFps : 0.0);
+    snprintf(fpsLine, sizeof(fpsLine), "FPS %.1f", monitor->displayedFps > 0.0 ? monitor->displayedFps : 0.0);
     N3DS_formatDebugSize(vramUsed, sizeof(vramUsed), trackedVRAMBytes);
     N3DS_formatDebugSize(vramTotal, sizeof(vramTotal), N3DS_TOTAL_VRAM_BYTES);
     N3DS_formatDebugSize(atlasUsed, sizeof(atlasUsed), atlasVRAMBytes);
     N3DS_formatDebugSize(atlasLimit, sizeof(atlasLimit), atlasVRAMLimitBytes);
     N3DS_formatDebugSize(directUsed, sizeof(directUsed), directVRAMBytes);
-    N3DS_formatDebugSize(directLimit, sizeof(directLimit), directVRAMLimitBytes);
-    snprintf(vramLine, sizeof(vramLine), "VRAM %s / %s",
-        vramUsed,
-        vramTotal);
-    snprintf(vramDetailLine, sizeof(vramDetailLine), "ATLAS %s/%s (%lu/%lu)  DIRECT %s/%s",
-        atlasUsed,
-        atlasLimit,
-        (unsigned long) atlasPageCount,
-        (unsigned long) atlasPageLimit,
-        directUsed,
-        directLimit);
     N3DS_formatDebugSize(ramFree, sizeof(ramFree), ramFreeBytes);
     N3DS_formatDebugSize(ramTotal, sizeof(ramTotal), ramTotalBytes);
     N3DS_formatDebugSize(linearFree, sizeof(linearFree), linearFreeBytes);
     N3DS_formatDebugSize(audioCached, sizeof(audioCached), cachedSoundBytes);
     N3DS_formatDebugSize(audioLimit, sizeof(audioLimit), cacheLimitBytes);
-    snprintf(ramLine, sizeof(ramLine), "RAM  %s free / %s   Linear %s free",
+    snprintf(vramLine, sizeof(vramLine), "VRAM %s/%s",
+        vramUsed,
+        vramTotal);
+    snprintf(atlasLine, sizeof(atlasLine), "AT %lu/%lu %s  DR %s",
+        (unsigned long) atlasPageCount,
+        (unsigned long) atlasPageLimit,
+        atlasUsed,
+        directUsed);
+    snprintf(ramLine, sizeof(ramLine), "RAM %s/%s  L %s",
         ramFree,
         ramTotal,
         linearFree);
-    snprintf(audioLine, sizeof(audioLine), "AUDIO %lu/%lu prewarmed   Cache %s/%s",
+    snprintf(audioLine, sizeof(audioLine), "AUD %lu/%lu %s/%s",
         (unsigned long) cachedSounds,
         (unsigned long) totalSounds,
         audioCached,
         audioLimit);
-    snprintf(roomLine, sizeof(roomLine), "ROOM %s", roomName);
+    snprintf(roomLine, sizeof(roomLine), "R %.28s", roomName);
 
     N3DSRenderer_beginBottomScreenGUI(renderer, 320, 240);
-    C2D_DrawRectSolid(0.0f, 0.0f, 0.0f, 320.0f, 240.0f, C2D_Color32(8, 10, 16, 245));
-    C2D_DrawRectSolid(16.0f, 20.0f, 0.0f, 288.0f, 2.0f, C2D_Color32(77, 118, 255, 255));
-
-    C2D_Text title;
-    C2D_Text fpsText;
-    C2D_Text vramText;
-    C2D_Text vramDetailText;
-    C2D_Text ramText;
-    C2D_Text audioText;
-    C2D_Text roomText;
-
-    C2D_TextBufClear(monitor->textBuf);
-    C2D_TextParse(&title, monitor->textBuf, "Debug Monitor");
-    C2D_TextParse(&fpsText, monitor->textBuf, fpsLine);
-    C2D_TextParse(&vramText, monitor->textBuf, vramLine);
-    C2D_TextParse(&vramDetailText, monitor->textBuf, vramDetailLine);
-    C2D_TextParse(&ramText, monitor->textBuf, ramLine);
-    C2D_TextParse(&audioText, monitor->textBuf, audioLine);
-    C2D_TextParse(&roomText, monitor->textBuf, roomLine);
-    C2D_TextOptimize(&title);
-    C2D_TextOptimize(&fpsText);
-    C2D_TextOptimize(&vramText);
-    C2D_TextOptimize(&vramDetailText);
-    C2D_TextOptimize(&ramText);
-    C2D_TextOptimize(&audioText);
-    C2D_TextOptimize(&roomText);
-
-    C2D_DrawText(&title, C2D_WithColor, 16.0f, 28.0f, 0.0f, 0.58f, 0.58f, C2D_Color32(255, 255, 255, 255));
-    C2D_DrawText(&fpsText, C2D_WithColor, 16.0f, 66.0f, 0.0f, N3DS_DEBUG_TEXT_SCALE, N3DS_DEBUG_TEXT_SCALE, C2D_Color32(196, 230, 255, 255));
-    C2D_DrawText(&vramText, C2D_WithColor, 16.0f, 100.0f, 0.0f, N3DS_DEBUG_TEXT_SCALE, N3DS_DEBUG_TEXT_SCALE, C2D_Color32(196, 230, 255, 255));
-    C2D_DrawText(&vramDetailText, C2D_WithColor, 16.0f, 124.0f, 0.0f, 0.28f, 0.28f, C2D_Color32(146, 188, 236, 255));
-    C2D_DrawText(&ramText, C2D_WithColor, 16.0f, 152.0f, 0.0f, 0.33f, 0.33f, C2D_Color32(196, 230, 255, 255));
-    C2D_DrawText(&audioText, C2D_WithColor, 16.0f, 176.0f, 0.0f, 0.31f, 0.31f, C2D_Color32(196, 255, 196, 255));
-    C2D_DrawText(&roomText, C2D_WithColor, 16.0f, 200.0f, 0.0f, 0.34f, 0.34f, C2D_Color32(255, 230, 163, 255));
+    const float boxX = 92.0f;
+    const float boxY = 8.0f;
+    const float boxW = 220.0f;
+    const float boxH = 110.0f;
+    const float textX = boxX + 7.0f;
+    C2D_DrawRectSolid(boxX, boxY, 0.0f, boxW, boxH, C2D_Color32(8, 10, 16, 218));
+    C2D_DrawRectSolid(boxX, boxY, 0.0f, boxW, 2.0f, C2D_Color32(77, 118, 255, 245));
+    C2D_DrawRectSolid(boxX, boxY + boxH - 1.0f, 0.0f, boxW, 1.0f, C2D_Color32(32, 46, 78, 230));
+    N3DSDebugTinyFont_drawText("DBG", textX, boxY + 7.0f, C2D_Color32(255, 255, 255, 255));
+    N3DSDebugTinyFont_drawText(fpsLine, boxX + 42.0f, boxY + 7.0f, C2D_Color32(196, 230, 255, 255));
+    N3DSDebugTinyFont_drawText(vramLine, textX, boxY + 25.0f, C2D_Color32(196, 230, 255, 255));
+    N3DSDebugTinyFont_drawText(atlasLine, textX, boxY + 42.0f, C2D_Color32(146, 188, 236, 255));
+    N3DSDebugTinyFont_drawText(ramLine, textX, boxY + 59.0f, C2D_Color32(196, 230, 255, 255));
+    N3DSDebugTinyFont_drawText(audioLine, textX, boxY + 76.0f, C2D_Color32(196, 255, 196, 255));
+    N3DSDebugTinyFont_drawText(roomLine, textX, boxY + 93.0f, C2D_Color32(255, 230, 163, 255));
     N3DSRenderer_endBottomScreenGUI(renderer);
 }
 
@@ -291,8 +365,8 @@ static bool N3DS_tryLoadRoomBorderSprite(const char* assetName, C2D_Sprite* outS
     if (assetName == NULL || outSprite == NULL || outSheet == NULL) return false;
 
     char candidatePaths[2][256];
-    snprintf(candidatePaths[0], sizeof(candidatePaths[0]), "romfs:/gfx/borders/%s.t3x", assetName);
-    snprintf(candidatePaths[1], sizeof(candidatePaths[1]), "sdmc:/3ds/cinnamon/gfx/borders/%s.t3x", assetName);
+    snprintf(candidatePaths[0], sizeof(candidatePaths[0]), "sdmc:/3ds/cinnamon/gfx/borders/%s.t3x", assetName);
+    snprintf(candidatePaths[1], sizeof(candidatePaths[1]), "romfs:/gfx/borders/%s.t3x", assetName);
 
     repeat(2, i) {
         const char* path = candidatePaths[i];
@@ -668,7 +742,7 @@ int main(int argc, char** argv) {
 
     bool leftHeld = false, rightHeld = false, upHeld = false, downHeld = false;
     bool aHeld = false, bHeld = false, yHeld = false;
-    bool selectHeld = false, lHeld = false, rHeld = false;
+    bool lHeld = false, rHeld = false;
 
     Gen8* gen8 = &dataWin->gen8;
     int32_t gameW = (int32_t) gen8->defaultWindowWidth;
@@ -700,7 +774,6 @@ int main(int argc, char** argv) {
         syncKey(runner->keyboard, &aHeld, 'Z', (held & KEY_A));
         syncKey(runner->keyboard, &bHeld, 'X', (held & KEY_B));
         syncKey(runner->keyboard, &yHeld, 'C', (held & KEY_Y) || (held & KEY_X));
-        syncKey(runner->keyboard, &selectHeld, VK_ENTER, (held & KEY_SELECT));
         syncKey(runner->keyboard, &lHeld, VK_PAGEDOWN, (held & KEY_L) && !debugWarpToAsriel);
         syncKey(runner->keyboard, &rHeld, VK_PAGEUP, (held & KEY_R));
 
@@ -719,7 +792,6 @@ int main(int argc, char** argv) {
         N3DSRenderer_beginOverlay(renderer);
         if (haveRoomBorder) C2D_DrawSprite(&roomBorder);
         else N3DS_drawFallbackRoomBorder();
-        N3DSDebugMonitor_drawLedStatus(&debugMonitor, runner, renderer);
         if (debugMonitorVisible) {
             N3DSDebugMonitor_draw(&debugMonitor, runner, renderer);
         }

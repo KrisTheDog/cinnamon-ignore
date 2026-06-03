@@ -18,6 +18,10 @@
 #include "n3ds/n3ds_platform_config.h"
 #endif
 
+#ifndef N3DS_ENABLE_TILE_LAYER_CHUNK_CACHE
+#define N3DS_ENABLE_TILE_LAYER_CHUNK_CACHE 0
+#endif
+
 #include "debug_overlay.h"
 // #include "stb_ds.h"
 
@@ -642,6 +646,15 @@ static N3DSResolvedDrawEvent* Runner_prepare3DSTopScreenGUIResponderList(Runner*
 
 static void Runner_draw3DSBottomBattleUI(Runner* runner, Drawable* drawables, int32_t drawableCount, int32_t subtype, bool drawBattleFieldOnly, float scale, float yOffset) {
     if (runner == NULL || runner->renderer == NULL) return;
+#ifdef N3DS_DISABLE_BOTTOM_SCREEN
+    (void) drawables;
+    (void) drawableCount;
+    (void) subtype;
+    (void) drawBattleFieldOnly;
+    (void) scale;
+    (void) yOffset;
+    return;
+#endif
     int32_t slot = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_DRAW, subtype);
     if (subtype != DRAW_NORMAL && slot < 0) return;
     if (Runner_is3DSAsrielBattle(runner)) return;
@@ -1424,7 +1437,7 @@ void Runner_drawTileLayer(Runner* runner, uint32_t layerIndex, RoomLayerTilesDat
         useCachedPath = cache->built && cache->cells != NULL && cache->rows != NULL;
     }
 
-#ifdef __3DS__
+#if defined(__3DS__) && N3DS_ENABLE_TILE_LAYER_CHUNK_CACHE
     if (useCachedPath && runner->renderer != NULL && runner->osType == OS_3DS) {
         if (cache->n3dsChunkCacheId < 0 && runner->currentRoom != NULL) {
             cache->n3dsChunkCacheId = N3DSRenderer_createTileLayerChunkCache(

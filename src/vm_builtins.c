@@ -2687,6 +2687,9 @@ static RValue builtinN3DSRenderBottomScreen(VMContext* ctx, RValue* args, int32_
     if (g_n3dsDisableBottomScreenOverrides) {
         return RValue_makeUndefined();
     }
+#ifdef N3DS_DISABLE_BOTTOM_SCREEN
+    return RValue_makeUndefined();
+#endif
 
     if (!battleDraw_is3DSBattleActive(ctx, runner)) {
         return RValue_makeUndefined();
@@ -2820,6 +2823,80 @@ static GMLReal battleDraw_getInstReal(VMContext* ctx, Instance* inst, const char
     int32_t varID = ctx->selfVarNameMap[slot].value;
     RValue v = Instance_getSelfVar(inst, varID);
     return RValue_toReal(v);
+}
+
+static GMLReal nativeOverride_getInstReal(VMContext* ctx, Instance* inst, const char* varName) {
+    if (ctx == NULL || inst == NULL || varName == NULL) return 0.0;
+
+    int16_t builtinId = VMBuiltins_resolveBuiltinVarId(varName);
+    if (builtinId != BUILTIN_VAR_UNKNOWN) {
+        Instance* savedSelf = ctx->currentInstance;
+        ctx->currentInstance = inst;
+        RValue v = VMBuiltins_getVariable(ctx, builtinId, varName, 0);
+        ctx->currentInstance = savedSelf;
+        return RValue_toReal(v);
+    }
+
+    ptrdiff_t slot = shgeti(ctx->selfVarNameMap, (char*) varName);
+    if (slot < 0) return 0.0;
+    return RValue_toReal(Instance_getSelfVar(inst, ctx->selfVarNameMap[slot].value));
+}
+
+static GMLArray* nativeOverride_ensureSelfArray(VMContext* ctx, Instance* inst, const char* varName) {
+    if (ctx == NULL || inst == NULL || varName == NULL) return NULL;
+
+    ptrdiff_t slot = shgeti(ctx->selfVarNameMap, (char*) varName);
+    if (slot < 0) return NULL;
+
+    int32_t varID = ctx->selfVarNameMap[slot].value;
+    RValue* valueSlot = IntRValueHashMap_getOrInsertUndefined(&inst->selfVars, varID);
+    if (valueSlot == NULL) return NULL;
+    if (valueSlot->type == RVALUE_ARRAY && valueSlot->array != NULL) return valueSlot->array;
+
+    RValue_free(valueSlot);
+    *valueSlot = VM_createArray(ctx);
+    return valueSlot->array;
+}
+
+static GMLArray* nativeOverride_ensureGlobalArray(VMContext* ctx, const char* varName) {
+    if (ctx == NULL || varName == NULL) return NULL;
+
+    ptrdiff_t slot = shgeti(ctx->globalVarNameMap, (char*) varName);
+    if (slot < 0) return NULL;
+
+    int32_t varID = ctx->globalVarNameMap[slot].value;
+    if (varID < 0 || (uint32_t) varID >= ctx->globalVarCount) return NULL;
+
+    RValue* valueSlot = &ctx->globalVars[varID];
+    if (valueSlot->type == RVALUE_ARRAY && valueSlot->array != NULL) return valueSlot->array;
+
+    RValue_free(valueSlot);
+    *valueSlot = VM_createArray(ctx);
+    return valueSlot->array;
+}
+
+static GMLReal nativeOverride_getArrayElemReal(const GMLArray* arr, int32_t index, GMLReal defaultValue) {
+    if (arr == NULL || index < 0) return defaultValue;
+    RValue* slot = GMLArray_slot((GMLArray*) arr, index);
+    if (slot == NULL) return defaultValue;
+    return RValue_toReal(*slot);
+}
+
+static void nativeOverride_setArrayElemReal(GMLArray* arr, int32_t index, GMLReal value) {
+    if (arr == NULL || index < 0) return;
+    GMLArray_growTo(arr, index + 1);
+    RValue* slot = GMLArray_slot(arr, index);
+    if (slot == NULL) return;
+    RValue_free(slot);
+    *slot = RValue_makeReal(value);
+}
+
+static void nativeOverride_drawSnowDot3DS(Renderer* rend, GMLReal dotX, GMLReal dotY) {
+    // Approximate the tiny filled circle with three thin bands.
+    // This stays much cheaper than the generic circle path on 3DS, but looks rounder than a square.
+    rend->vtable->drawRectangle(rend, (float) (dotX - 2.0), (float) (dotY - 2.5), (float) (dotX + 2.0), (float) (dotY - 1.5), rend->drawColor, rend->drawAlpha, false);
+    rend->vtable->drawRectangle(rend, (float) (dotX - 2.5), (float) (dotY - 1.5), (float) (dotX + 2.5), (float) (dotY + 1.5), rend->drawColor, rend->drawAlpha, false);
+    rend->vtable->drawRectangle(rend, (float) (dotX - 2.0), (float) (dotY + 1.5), (float) (dotX + 2.0), (float) (dotY + 2.5), rend->drawColor, rend->drawAlpha, false);
 }
 
 static bool battleDraw_isValidObjectIndex(VMContext* ctx, int32_t objectIndex) {
@@ -3198,6 +3275,86 @@ static RValue builtinBlackBordererDraw(VMContext* ctx, MAYBE_UNUSED RValue* args
     return RValue_makeUndefined();
 }
 
+// Native replacement for gml_Object_obj_snowfloor_Draw_0.
+static RValue builtinSnowfloorDraw(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    if (ctx == NULL || ctx->runner == NULL || ctx->runner->renderer == NULL) return RValue_makeUndefined();
+
+    Runner* runner = (Runner*) ctx->runner;
+    Renderer* rend = runner->renderer;
+    Instance* self = (Instance*) ctx->currentInstance;
+    if (self == NULL) return RValue_makeUndefined();
+
+    GMLArray* dodraw = nativeOverride_ensureSelfArray(ctx, self, "dodraw");
+    GMLArray* snowx = nativeOverride_ensureSelfArray(ctx, self, "snowx");
+    GMLArray* snowy = nativeOverride_ensureSelfArray(ctx, self, "snowy");
+    GMLArray* moveme = nativeOverride_ensureSelfArray(ctx, self, "moveme");
+    if (dodraw == NULL || snowx == NULL || snowy == NULL || moveme == NULL) {
+        return RValue_makeUndefined();
+    }
+
+    Instance* mainChara = battleDraw_getFirstInstance(ctx, runner, "obj_mainchara");
+    bool mainCharaMoving = mainChara != NULL && (int32_t) nativeOverride_getInstReal(ctx, mainChara, "moving") == 1;
+    GMLReal bboxLeft = mainChara != NULL ? nativeOverride_getInstReal(ctx, mainChara, "bbox_left") : 0.0;
+    GMLReal bboxRight = mainChara != NULL ? nativeOverride_getInstReal(ctx, mainChara, "bbox_right") : 0.0;
+    GMLReal bboxTop = mainChara != NULL ? nativeOverride_getInstReal(ctx, mainChara, "bbox_top") : 0.0;
+    GMLReal bboxBottom = mainChara != NULL ? nativeOverride_getInstReal(ctx, mainChara, "bbox_bottom") : 0.0;
+    bool isSnowPuzzleRoom =
+        runner->currentRoom != NULL &&
+        runner->currentRoom->name != NULL &&
+        strcmp(runner->currentRoom->name, "room_tundra_snowpuzz") == 0;
+
+    rend->drawColor = 0xFFFFFFu; // c_white
+
+    for (int32_t yy = 0; yy < 5; ++yy) {
+        for (int32_t xx = 0; xx < 5; ++xx) {
+            int32_t packedIndex = yy * GML_ARRAY_STRIDE + xx;
+            GMLReal dotX = nativeOverride_getArrayElemReal(snowx, packedIndex, 0.0);
+            GMLReal dotY = nativeOverride_getArrayElemReal(snowy, packedIndex, 0.0);
+            GMLReal move = nativeOverride_getArrayElemReal(moveme, packedIndex, 0.0);
+
+            if ((int32_t) nativeOverride_getArrayElemReal(dodraw, packedIndex, 0.0) == 1) {
+                if (runner->osType == OS_3DS) {
+                    nativeOverride_drawSnowDot3DS(rend, dotX, dotY);
+                } else {
+                    Renderer_drawCircle(rend, (float) dotX, (float) dotY, 2.8f, false);
+                }
+            }
+
+            if (mainChara != NULL && Collision_circleOverlapsInstance(ctx->dataWin, mainChara, dotX, dotY, 2.0)) {
+                move = GMLReal_floor((((GMLReal) rand() / (GMLReal) RAND_MAX) * 4.0)) + 2.0;
+                nativeOverride_setArrayElemReal(moveme, packedIndex, move);
+            }
+
+            if (move > 1.0) {
+                if (mainCharaMoving) {
+                    if (isSnowPuzzleRoom) {
+                        GMLArray* globalFlag = nativeOverride_ensureGlobalArray(ctx, "flag");
+                        if (globalFlag != NULL && (int32_t) nativeOverride_getArrayElemReal(globalFlag, 64, 0.0) == 0) {
+                            nativeOverride_setArrayElemReal(globalFlag, 64, -1.0);
+                        }
+                    }
+
+                    if (bboxLeft > dotX) dotX -= move;
+                    if (bboxRight < dotX) dotX += move;
+                    if (bboxTop > dotY) dotY -= move;
+                    if (bboxBottom < dotY) dotY += move;
+
+                    dotX += ((((GMLReal) rand() / (GMLReal) RAND_MAX) * move) - (move / 2.0)) / 2.0;
+                    dotY += ((((GMLReal) rand() / (GMLReal) RAND_MAX) * move) - (move / 2.0)) / 2.0;
+
+                    nativeOverride_setArrayElemReal(snowx, packedIndex, dotX);
+                    nativeOverride_setArrayElemReal(snowy, packedIndex, dotY);
+                }
+
+                move -= 1.0;
+                nativeOverride_setArrayElemReal(moveme, packedIndex, move);
+            }
+        }
+    }
+
+    return RValue_makeUndefined();
+}
+
 // Native replacement for gml_Object_obj_lastruins_bg_Step_0.
 static RValue builtinLastruinsBgStep(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = (Runner*) ctx->runner;
@@ -3362,6 +3519,10 @@ static RValue builtinN3DSRenderBattleScene(VMContext* ctx, RValue* args, int32_t
         if (callArgs != localBuf) free(callArgs);
         return RValue_makeUndefined();
     }
+#ifdef N3DS_DISABLE_BOTTOM_SCREEN
+    if (callArgs != localBuf) free(callArgs);
+    return RValue_makeUndefined();
+#endif
     N3DSRenderer_beginBottomScreenGUI(runner->renderer, guiW, guiH);
     callArgs[0] = args[0];
     builtinScriptExecute(ctx, callArgs, scriptCallArgCount);
@@ -10166,6 +10327,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     // Intercept entire GML event bodies without patching data.win.
     VM_registerCodeOverride(ctx, "gml_Object_obj_battlecontroller_Draw_0", builtinBattleControllerDraw);
     VM_registerCodeOverride(ctx, "gml_Object_obj_blackborderer_Draw_0", builtinBlackBordererDraw);
+    VM_registerCodeOverride(ctx, "gml_Object_obj_snowfloor_Draw_0", builtinSnowfloorDraw);
     VM_registerCodeOverride(ctx, "gml_Object_obj_lastruins_bg_Step_0", builtinLastruinsBgStep);
     VM_registerCodeOverride(ctx, "gml_Object_obj_backgrounder_lastruins_Other_10", builtinBackgrounderLastruinsOther10);
 #if IS_BC17_OR_HIGHER_ENABLED

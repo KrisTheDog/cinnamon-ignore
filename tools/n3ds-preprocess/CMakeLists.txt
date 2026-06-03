@@ -20,7 +20,10 @@ target_include_directories(n3ds-preprocess PRIVATE
     ../../vendor/stb/image
 )
 
-target_compile_definitions(n3ds-preprocess PRIVATE IMAGE_DECODER_HAS_BZ2=0)
+target_compile_definitions(n3ds-preprocess PRIVATE
+    IMAGE_DECODER_HAS_BZ2=0
+    N3DS_PREPROCESS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(n3ds-preprocess PRIVATE m)
