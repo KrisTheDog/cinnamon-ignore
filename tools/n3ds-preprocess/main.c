@@ -705,38 +705,52 @@ static bool configureSpriteReplacementDir(Options* options, const char* argv0) {
     if (options == NULL) return false;
 
     if (options->spriteReplacementDir == NULL || options->spriteReplacementDir[0] == '\0') {
-        char programDir[1024];
-        if (options->toolDirStorage[0] != '\0') {
-            snprintf(programDir, sizeof(programDir), "%s", options->toolDirStorage);
-        } else if (!getProgramDirPath(argv0, programDir, sizeof(programDir))) {
-            return false;
-        }
+        bool foundDefaultDir = false;
 
+#if defined(N3DS_PREPROCESS_TEXTURE_OVERRIDE_DIR)
         snprintf(
             options->spriteReplacementDirStorage,
             sizeof(options->spriteReplacementDirStorage),
-            "%s/Sprite_replacements",
-            programDir
+            "%s",
+            N3DS_PREPROCESS_TEXTURE_OVERRIDE_DIR
         );
-#if defined(N3DS_PREPROCESS_SOURCE_DIR)
-        if (!directoryExists(options->spriteReplacementDirStorage)) {
-            char sourceReplacementDir[1200];
-            snprintf(
-                sourceReplacementDir,
-                sizeof(sourceReplacementDir),
-                "%s/Sprite_replacements",
-                N3DS_PREPROCESS_SOURCE_DIR
-            );
-            if (directoryExists(sourceReplacementDir)) {
-                snprintf(
-                    options->spriteReplacementDirStorage,
-                    sizeof(options->spriteReplacementDirStorage),
-                    "%s",
-                    sourceReplacementDir
-                );
-            }
-        }
+        foundDefaultDir = directoryExists(options->spriteReplacementDirStorage);
 #endif
+
+        if (!foundDefaultDir) {
+            char programDir[1024];
+            if (options->toolDirStorage[0] != '\0') {
+                snprintf(programDir, sizeof(programDir), "%s", options->toolDirStorage);
+            } else if (!getProgramDirPath(argv0, programDir, sizeof(programDir))) {
+                return false;
+            }
+
+            snprintf(
+                options->spriteReplacementDirStorage,
+                sizeof(options->spriteReplacementDirStorage),
+                "%s/Sprite_replacements",
+                programDir
+            );
+#if defined(N3DS_PREPROCESS_SOURCE_DIR)
+            if (!directoryExists(options->spriteReplacementDirStorage)) {
+                char sourceReplacementDir[1200];
+                snprintf(
+                    sourceReplacementDir,
+                    sizeof(sourceReplacementDir),
+                    "%s/Sprite_replacements",
+                    N3DS_PREPROCESS_SOURCE_DIR
+                );
+                if (directoryExists(sourceReplacementDir)) {
+                    snprintf(
+                        options->spriteReplacementDirStorage,
+                        sizeof(options->spriteReplacementDirStorage),
+                        "%s",
+                        sourceReplacementDir
+                    );
+                }
+            }
+#endif
+        }
         options->spriteReplacementDir = options->spriteReplacementDirStorage;
     }
 

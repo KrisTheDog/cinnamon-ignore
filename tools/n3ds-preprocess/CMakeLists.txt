@@ -23,6 +23,7 @@ target_include_directories(n3ds-preprocess PRIVATE
 target_compile_definitions(n3ds-preprocess PRIVATE
     IMAGE_DECODER_HAS_BZ2=0
     N3DS_PREPROCESS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    N3DS_PREPROCESS_TEXTURE_OVERRIDE_DIR="${CMAKE_SOURCE_DIR}/resources/3ds/textureOverrides"
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
