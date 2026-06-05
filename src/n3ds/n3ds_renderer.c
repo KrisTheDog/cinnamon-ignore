@@ -34,6 +34,8 @@
 #define N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED 8u
 #define N3DS_DIRECT_ASSET_MAGIC 0x3152444Eu /* NDR1 */
 #define N3DS_DIRECT_ASSET_VERSION 1u
+#define N3DS_ROOM_MANIFEST_MAGIC 0x4D52334Eu /* N3RM */
+#define N3DS_ROOM_MANIFEST_VERSION 1u
 #define N3DS_DIRECT_ASSET_ENTRY_SIZE 16u
 #define N3DS_TOP_WIDTH 400
 #define N3DS_TOP_HEIGHT 240
@@ -250,6 +252,22 @@ typedef struct {
 } N3DSPackedDirectAssetMapEntry;
 
 typedef struct {
+    uint32_t roomIndex;
+    uint32_t pageStart;
+    uint32_t pageCount;
+    uint32_t directSpriteStart;
+    uint32_t directSpriteCount;
+    uint32_t directBackgroundStart;
+    uint32_t directBackgroundCount;
+} N3DSRoomManifestEntry;
+
+typedef struct {
+    uint16_t pageIndex;
+    uint8_t flags;
+    uint8_t reserved;
+} N3DSRoomManifestPageRef;
+
+typedef struct {
     Renderer base;
     C3D_RenderTarget* topTarget;
     C3D_RenderTarget* bottomTarget;
@@ -340,11 +358,16 @@ typedef struct {
     N3DSCachedTextLayout cachedTextLayout;
     N3DSResolvedAssetPathEntry* resolvedAssetPathCache;
     N3DSPackedDirectAssetMapEntry* packedDirectAssetMap;
+    N3DSRoomManifestEntry* roomManifestEntries;
+    N3DSRoomManifestPageRef* roomManifestPageRefs;
     N3DSDynamicCaptureTPAG* dynamicCaptureTPAGs;
     uint8_t* atlasTraceMask;
     FILE* atlasTraceFile;
     FILE* packedAtlasFile;
     FILE* packedDirectAssetFile;
+    uint32_t roomManifestEntryCount;
+    uint32_t roomManifestPageRefCount;
+    uint32_t roomManifestRoomCount;
     uint32_t baseTPAGCount;
     uint32_t dynamicCaptureTPAGCount;
     bool bottomScreenGuiActive;
@@ -393,6 +416,26 @@ static void N3DSRenderer_prewarmRoom(Renderer* base, Runner* runner);
 static void N3DSRenderer_freeCachedTextLayout(N3DSCachedTextLayout* layout);
 static void N3DSRenderer_appendCachedTextLayoutSuffix(N3DSCachedTextLayout* layout, Font* font, const char* suffix, int32_t suffixLen);
 static const N3DSCachedTextLayout* N3DSRenderer_getCachedTextLayout(N3DSRenderer* renderer, Font* font, int32_t fontIndex, const char* text);
+static bool N3DSRenderer_tryDrawSingleGlyphTextFast(
+    Renderer* base,
+    N3DSRenderer* renderer,
+    Font* font,
+    const char* text,
+    int32_t len,
+    float x,
+    float y,
+    float effectiveXScale,
+    float effectiveYScale,
+    float angleDeg,
+    bool gradient,
+    int32_t c1,
+    float alpha,
+    bool useDirectFontAsset,
+    const C2D_Image* directFontImage,
+    const Tex3DS_SubTexture* directFontBaseSubtex,
+    const N3DSAtlasFragment* fontFragment,
+    N3DSLoadedAtlasPage* fontPage
+);
 static bool N3DSRenderer_drawPackedTileEntry(Renderer* base, N3DSRenderer* renderer, const N3DSTileAtlasEntry* tileEntry, float drawX, float drawY, float xscale, float yscale, uint32_t color, float alpha);
 static bool N3DSRenderer_isFragmentedAtlasVersion(uint16_t atlasVersion);
 static bool N3DSRenderer_isPackedAtlasVersion(uint16_t atlasVersion);
@@ -411,6 +454,9 @@ static void N3DSRenderer_getActiveTargetSize(const N3DSRenderer* renderer, float
 static bool N3DSRenderer_isScreenRectOffscreen(const N3DSRenderer* renderer, float x, float y, float w, float h);
 static bool N3DSRenderer_isScreenRotatedRectOffscreen(const N3DSRenderer* renderer, float x, float y, float w, float h, float angleDeg);
 static bool N3DSRenderer_loadPackedDirectAssets(N3DSRenderer* renderer);
+static bool N3DSRenderer_loadRoomManifest(N3DSRenderer* renderer);
+static const N3DSRoomManifestEntry* N3DSRenderer_findRoomManifestEntry(const N3DSRenderer* renderer, uint32_t roomIndex);
+static void N3DSRenderer_prewarmRoomManifestBlobCache(N3DSRenderer* renderer, uint32_t roomIndex, bool* seenPages, uint32_t* remainingBlobBytes);
 static bool N3DSRenderer_tryLoadPackedDirectTextureBlob(N3DSRenderer* renderer, N3DSDirectTextureAsset* asset, const char* relativePath);
 static N3DSDynamicCaptureTPAG* N3DSRenderer_getDynamicCaptureTPAG(N3DSRenderer* renderer, int32_t tpagIndex);
 static void N3DSRenderer_freeDynamicCaptureTPAG(N3DSRenderer* renderer, N3DSDynamicCaptureTPAG* capture);
@@ -1076,6 +1122,109 @@ static bool N3DSRenderer_loadPackedDirectAssets(N3DSRenderer* renderer) {
     renderer->packedDirectAssetFile = file;
     fprintf(stderr, "N3DS: loaded packed direct texture blob (%u entries)\n", (unsigned int) entryCount);
     return true;
+}
+
+static bool N3DSRenderer_loadRoomManifest(N3DSRenderer* renderer) {
+    if (renderer == NULL) return false;
+    if (renderer->roomManifestEntries != NULL) return true;
+
+    char resolvedPath[512];
+    FILE* file = N3DSRenderer_openAssetFile(renderer, "room_manifest.bin", resolvedPath, sizeof(resolvedPath));
+    if (file == NULL) return false;
+
+    uint8_t header[20];
+    if (fread(header, 1, sizeof(header), file) != sizeof(header)) {
+        fclose(file);
+        return false;
+    }
+
+    uint32_t magic = N3DS_readU32(header + 0);
+    uint32_t version = N3DS_readU32(header + 4);
+    uint32_t entryCount = N3DS_readU32(header + 8);
+    uint32_t pageRefCount = N3DS_readU32(header + 12);
+    uint32_t roomCount = N3DS_readU32(header + 16);
+    if (magic != N3DS_ROOM_MANIFEST_MAGIC || version != N3DS_ROOM_MANIFEST_VERSION) {
+        fclose(file);
+        return false;
+    }
+
+    uint64_t requiredBytes =
+        sizeof(header) +
+        (uint64_t) entryCount * sizeof(N3DSRoomManifestEntry) +
+        (uint64_t) pageRefCount * sizeof(N3DSRoomManifestPageRef);
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return false;
+    }
+    long fileSize = ftell(file);
+    if (fileSize < 0 || requiredBytes > (uint64_t) fileSize) {
+        fclose(file);
+        return false;
+    }
+    if (fseek(file, (long) sizeof(header), SEEK_SET) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    renderer->roomManifestEntries = safeCalloc(entryCount > 0 ? entryCount : 1u, sizeof(N3DSRoomManifestEntry));
+    renderer->roomManifestPageRefs = safeCalloc(pageRefCount > 0 ? pageRefCount : 1u, sizeof(N3DSRoomManifestPageRef));
+    renderer->roomManifestEntryCount = entryCount;
+    renderer->roomManifestPageRefCount = pageRefCount;
+    renderer->roomManifestRoomCount = roomCount;
+
+    bool ok = true;
+    if (entryCount > 0) {
+        ok = fread(renderer->roomManifestEntries, sizeof(N3DSRoomManifestEntry), entryCount, file) == entryCount;
+    }
+    if (ok && pageRefCount > 0) {
+        ok = fread(renderer->roomManifestPageRefs, sizeof(N3DSRoomManifestPageRef), pageRefCount, file) == pageRefCount;
+    }
+    fclose(file);
+
+    if (!ok) {
+        free(renderer->roomManifestEntries);
+        free(renderer->roomManifestPageRefs);
+        renderer->roomManifestEntries = NULL;
+        renderer->roomManifestPageRefs = NULL;
+        renderer->roomManifestEntryCount = 0;
+        renderer->roomManifestPageRefCount = 0;
+        renderer->roomManifestRoomCount = 0;
+        return false;
+    }
+
+    fprintf(
+        stderr,
+        "N3DS: loaded room manifest (%u rooms, %u entries, %u page refs)\n",
+        roomCount,
+        entryCount,
+        pageRefCount
+    );
+    return true;
+}
+
+static const N3DSRoomManifestEntry* N3DSRenderer_findRoomManifestEntry(const N3DSRenderer* renderer, uint32_t roomIndex) {
+    if (renderer == NULL || renderer->roomManifestEntries == NULL) return NULL;
+
+    repeat(renderer->roomManifestEntryCount, i) {
+        const N3DSRoomManifestEntry* entry = &renderer->roomManifestEntries[i];
+        if (entry->roomIndex == roomIndex) return entry;
+    }
+    return NULL;
+}
+
+static void N3DSRenderer_prewarmRoomManifestBlobCache(N3DSRenderer* renderer, uint32_t roomIndex, bool* seenPages, uint32_t* remainingBlobBytes) {
+    if (renderer == NULL || seenPages == NULL || remainingBlobBytes == NULL || *remainingBlobBytes == 0) return;
+
+    const N3DSRoomManifestEntry* entry = N3DSRenderer_findRoomManifestEntry(renderer, roomIndex);
+    if (entry == NULL || entry->pageCount == 0) return;
+    if (entry->pageStart > renderer->roomManifestPageRefCount) return;
+    if (entry->pageCount > renderer->roomManifestPageRefCount - entry->pageStart) return;
+
+    repeat(entry->pageCount, i) {
+        const N3DSRoomManifestPageRef* pageRef = &renderer->roomManifestPageRefs[entry->pageStart + (uint32_t) i];
+        (void) N3DSRenderer_prewarmPageBlobOnly(renderer, seenPages, pageRef->pageIndex, remainingBlobBytes);
+        if (*remainingBlobBytes == 0) break;
+    }
 }
 
 static bool N3DSRenderer_tryLoadPackedDirectTextureBlob(N3DSRenderer* renderer, N3DSDirectTextureAsset* asset, const char* relativePath) {
@@ -2906,6 +3055,100 @@ static const N3DSCachedTextLayout* N3DSRenderer_getCachedTextLayout(N3DSRenderer
     return layout;
 }
 
+static bool N3DSRenderer_tryDrawSingleGlyphTextFast(
+    Renderer* base,
+    N3DSRenderer* renderer,
+    Font* font,
+    const char* text,
+    int32_t len,
+    float x,
+    float y,
+    float effectiveXScale,
+    float effectiveYScale,
+    float angleDeg,
+    bool gradient,
+    int32_t c1,
+    float alpha,
+    bool useDirectFontAsset,
+    const C2D_Image* directFontImage,
+    const Tex3DS_SubTexture* directFontBaseSubtex,
+    const N3DSAtlasFragment* fontFragment,
+    N3DSLoadedAtlasPage* fontPage
+) {
+    if (text == NULL || len <= 0 || len > 4) return false;
+    if (TextUtils_isNewlineChar(text[0])) return false;
+
+    int32_t pos = 0;
+    uint16_t ch = TextUtils_decodeUtf8(text, len, &pos);
+    if (pos != len) return false;
+
+    float cursorX = 0.0f;
+    float lineWidth = TextUtils_measureLineWidth(font, text, len);
+    if (base->drawHalign == 1) cursorX -= lineWidth * 0.5f;
+    else if (base->drawHalign == 2) cursorX -= lineWidth;
+
+    float cursorY = 0.0f;
+    float totalHeight = TextUtils_lineStride(font);
+    if (base->drawValign == 1) cursorY -= totalHeight * 0.5f;
+    else if (base->drawValign == 2) cursorY -= totalHeight;
+    cursorY -= (float) font->ascenderOffset;
+
+    FontGlyph* glyph = TextUtils_findGlyph(font, ch);
+    if (glyph == NULL || glyph->sourceWidth == 0 || glyph->sourceHeight == 0) {
+        return true;
+    }
+
+    Tex3DS_SubTexture subtex;
+    C2D_Image image;
+    if (useDirectFontAsset) {
+        if (directFontImage == NULL || directFontBaseSubtex == NULL) return false;
+        subtex.width = glyph->sourceWidth;
+        subtex.height = glyph->sourceHeight;
+        float baseLeft = directFontBaseSubtex->left;
+        float baseRight = directFontBaseSubtex->right;
+        float baseTop = directFontBaseSubtex->top;
+        float baseBottom = directFontBaseSubtex->bottom;
+        float baseWidth = (float) directFontBaseSubtex->width;
+        float baseHeight = (float) directFontBaseSubtex->height;
+        subtex.left = baseLeft + (baseRight - baseLeft) * ((float) glyph->sourceX / baseWidth);
+        subtex.right = baseLeft + (baseRight - baseLeft) * (((float) glyph->sourceX + (float) glyph->sourceWidth) / baseWidth);
+        subtex.top = baseTop + (baseBottom - baseTop) * ((float) glyph->sourceY / baseHeight);
+        subtex.bottom = baseTop + (baseBottom - baseTop) * (((float) glyph->sourceY + (float) glyph->sourceHeight) / baseHeight);
+        image.tex = directFontImage->tex;
+        image.subtex = &subtex;
+    } else {
+        if (fontFragment == NULL || fontPage == NULL) return false;
+        image.tex = &fontPage->texture;
+        image.subtex = &subtex;
+        uint16_t px = (uint16_t) (fontFragment->x + glyph->sourceX);
+        uint16_t py = (uint16_t) (fontFragment->y + glyph->sourceY);
+        N3DSRenderer_fillSubTexture(&subtex, fontPage, px, py, glyph->sourceWidth, glyph->sourceHeight);
+    }
+
+    float drawX = x + (cursorX + (float) glyph->offset) * effectiveXScale;
+    float drawY = y + cursorY * effectiveYScale;
+    renderer->frameTextGlyphDraws++;
+    if (fabsf(angleDeg) < 0.001f) {
+        N3DSRenderer_drawImageFast(base, &image, drawX, drawY, effectiveXScale, effectiveYScale, gradient ? (uint32_t) c1 : base->drawColor, alpha);
+    } else {
+        N3DSRenderer_drawImage(
+            base,
+            &image,
+            drawX,
+            drawY,
+            (float) glyph->sourceWidth * effectiveXScale,
+            (float) glyph->sourceHeight * effectiveYScale,
+            0.0f,
+            0.0f,
+            angleDeg,
+            gradient ? (uint32_t) c1 : base->drawColor,
+            alpha
+        );
+    }
+
+    return true;
+}
+
 static void N3DSRenderer_preloadFontPages(N3DSRenderer* renderer) {
     DataWin* dw = renderer->base.dataWin;
     if (dw == NULL) return;
@@ -2928,6 +3171,16 @@ static void N3DSRenderer_prewarmRoomBlobCache(N3DSRenderer* renderer, Runner* ru
     Room* room = runner->currentRoom;
     uint32_t remainingBlobBytes = renderer->isNew3DS ? N3DS_PREWARM_BLOB_BYTES_NEW3DS : N3DS_PREWARM_BLOB_BYTES_OLD3DS;
     bool* seenPages = safeCalloc(renderer->atlasPageCount, sizeof(bool));
+    uint32_t roomIndex = UINT32_MAX;
+
+    if (dw != NULL && dw->room.rooms != NULL && room >= dw->room.rooms && room < (dw->room.rooms + dw->room.count)) {
+        roomIndex = (uint32_t) (room - dw->room.rooms);
+    }
+
+    if (roomIndex != UINT32_MAX) {
+        N3DSRenderer_prewarmRoomManifestBlobCache(renderer, roomIndex, seenPages, &remainingBlobBytes);
+        if (remainingBlobBytes == 0) goto done;
+    }
 
     repeat(8, i) {
         RuntimeBackground* bg = &runner->backgrounds[i];
@@ -3050,6 +3303,7 @@ static void N3DSRenderer_init(Renderer* base, DataWin* dataWin) {
     }
     N3DSRenderer_buildDirectAssetMaps(renderer);
     (void) N3DSRenderer_loadPackedDirectAssets(renderer);
+    (void) N3DSRenderer_loadRoomManifest(renderer);
     renderer->atlasTraceMask = safeCalloc(renderer->atlasItemCount > 0 ? renderer->atlasItemCount : 1u, sizeof(uint8_t));
     renderer->atlasTraceFile = fopen(N3DS_ATLAS_TRACE_LOG_PATH, "wb");
     if (renderer->atlasTraceFile != NULL) {
@@ -3082,6 +3336,8 @@ static void N3DSRenderer_destroy(Renderer* base) {
     }
     shfree(renderer->resolvedAssetPathCache);
     shfree(renderer->packedDirectAssetMap);
+    free(renderer->roomManifestEntries);
+    free(renderer->roomManifestPageRefs);
     free(renderer->atlasTraceMask);
     if (renderer->atlasTraceFile != NULL) fclose(renderer->atlasTraceFile);
     if (renderer->packedAtlasFile != NULL) fclose(renderer->packedAtlasFile);
@@ -4477,6 +4733,33 @@ static void N3DSRenderer_drawTextCommon(Renderer* base, const char* text, float 
         !font->isSpriteFont &&
         N3DSRenderer_tryResolveSingleFragmentFontPage(renderer, font->tpagIndex, &fontFragment, &fontPage);
     if (useDirectFontAsset || useSingleFragmentFontFastPath) {
+        if (N3DSRenderer_tryDrawSingleGlyphTextFast(
+                base,
+                renderer,
+                font,
+                text,
+                len,
+                x,
+                y,
+                effectiveXScale,
+                effectiveYScale,
+                angleDeg,
+                gradient,
+                c1,
+                alpha,
+                useDirectFontAsset,
+                useDirectFontAsset ? &directFontImage : NULL,
+                useDirectFontAsset ? &directFontBaseSubtex : NULL,
+                fontFragment,
+                fontPage)) {
+            (void) c2;
+            (void) c3;
+            (void) c4;
+            renderer->frameTextTenthsMs += (uint32_t) lround(N3DSRenderer_ticksToMs(svcGetSystemTick() - textStartTick) * 10.0);
+            renderer->textLinearFilterActive = savedTextLinearFilterActive;
+            return;
+        }
+
         const N3DSCachedTextLayout* layout = N3DSRenderer_getCachedTextLayout(renderer, font, base->drawFont, text);
         repeat(layout->glyphCount, i) {
             const N3DSCachedTextGlyph* cachedGlyph = &layout->glyphs[i];

@@ -60,6 +60,8 @@
 #define N3DS_ATLAS_VERSION_FRAGMENTED_TILE_FRAGMENTS_PACKED 8u
 #define N3DS_DIRECT_ASSET_MAGIC 0x3152444Eu /* NDR1 */
 #define N3DS_DIRECT_ASSET_VERSION 1u
+#define N3DS_ROOM_MANIFEST_MAGIC 0x4D52334Eu /* N3RM */
+#define N3DS_ROOM_MANIFEST_VERSION 1u
 #define N3DS_SOUND_BANK_MAGIC 0x314B4253u /* SBK1 */
 #define N3DS_SOUND_BANK_VERSION 2u
 #define N3DS_SOUND_BANK_ENTRY_CHANNEL_MASK 0x000000FFu
@@ -144,7 +146,6 @@ typedef struct {
     const char* inputPath;
     const char* outputDir;
     const char* tex3dsExe;
-    const char* cwavtoolExe;
     const char* spriteReplacementDir;
     const char* borderAssetDir;
     const char* pageFormatOverridesPath;
@@ -161,7 +162,6 @@ typedef struct {
     char finalOutputDirStorage[1024];
     char stagingOutputDirStorage[1024];
     char tex3dsExeStorage[1024];
-    char cwavtoolExeStorage[1024];
     char spriteReplacementDirStorage[1200];
     char borderAssetDirStorage[1200];
     char toolDirStorage[1024];
@@ -206,10 +206,24 @@ typedef struct {
     uint32_t dataSize;
 } DirectAssetPackEntry;
 
+typedef struct {
+    uint32_t roomIndex;
+    uint32_t pageStart;
+    uint32_t pageCount;
+    uint32_t directSpriteStart;
+    uint32_t directSpriteCount;
+    uint32_t directBackgroundStart;
+    uint32_t directBackgroundCount;
+} N3DSRoomManifestEntry;
+
+typedef struct {
+    uint16_t pageIndex;
+    uint8_t flags;
+    uint8_t reserved;
+} N3DSRoomManifestPageRef;
+
 static bool fileExists(const char* path);
 static bool directoryExists(const char* path);
-static bool commandAvailable(const char* command);
-static bool cwavtoolAvailable(const Options* options);
 static bool deleteDirectoryRecursive(const char* path);
 static bool ensureDirRecursive(const char* path);
 static char* dupParentDir(const char* path);
@@ -248,6 +262,7 @@ static void printUsage(const char* argv0) {
         "Outputs:\n"
         "  <output-dir>/gfx/atlas.bin\n"
         "  <output-dir>/gfx/direct_assets.bin\n"
+        "  <output-dir>/gfx/room_manifest.bin\n"
         "  <output-dir>/gfx/page_000.t3x ...\n"
         "  <output-dir>/audio/sound_bank.bin\n",
         argv0
@@ -288,12 +303,6 @@ static void applyDefaultToolPaths(Options* out) {
     if (getExecutableDir(out->toolDirStorage, sizeof(out->toolDirStorage))) {
         char adjacentPath[1024];
 
-        snprintf(adjacentPath, sizeof(adjacentPath), "%s\\cwavtool.exe", out->toolDirStorage);
-        if (fileExists(adjacentPath)) {
-            snprintf(out->cwavtoolExeStorage, sizeof(out->cwavtoolExeStorage), "%s", adjacentPath);
-            out->cwavtoolExe = out->cwavtoolExeStorage;
-        }
-
         snprintf(adjacentPath, sizeof(adjacentPath), "%s\\tex3ds.exe", out->toolDirStorage);
         if (fileExists(adjacentPath)) {
             snprintf(out->tex3dsExeStorage, sizeof(out->tex3dsExeStorage), "%s", adjacentPath);
@@ -320,7 +329,6 @@ static void applyDefaultToolPaths(Options* out) {
         }
     }
 
-    if (out->cwavtoolExe == NULL) out->cwavtoolExe = "cwavtool";
 }
 
 static bool parseArgs(int argc, char** argv, Options* out) {
@@ -2497,6 +2505,223 @@ static TileLookupKey* collectLegacyTileRequests(DataWin* dataWin) {
     return keys;
 }
 
+static void markRoomManifestOutputItemPages(
+    uint32_t tpagIndex,
+    uint32_t totalPageCount,
+    const OutputItem* items,
+    const OutputFragment* fragments,
+    bool* seenPages
+) {
+    if (items == NULL || fragments == NULL || seenPages == NULL) return;
+    const OutputItem* item = &items[tpagIndex];
+    if (item->fragmentCount == 0 || item->fragmentStart == UINT32_MAX) return;
+
+    repeat(item->fragmentCount, i) {
+        uint32_t fragmentIndex = item->fragmentStart + (uint32_t) i;
+        uint16_t pageIndex = fragments[fragmentIndex].atlasId;
+        if (pageIndex < totalPageCount) seenPages[pageIndex] = true;
+    }
+}
+
+static void markRoomManifestSpritePages(
+    const DataWin* dataWin,
+    int32_t spriteIndex,
+    uint32_t totalPageCount,
+    const OutputItem* items,
+    const OutputFragment* fragments,
+    bool* seenPages
+) {
+    if (dataWin == NULL || items == NULL || fragments == NULL || seenPages == NULL) return;
+    if (spriteIndex < 0 || (uint32_t) spriteIndex >= dataWin->sprt.count) return;
+
+    const Sprite* sprite = &dataWin->sprt.sprites[spriteIndex];
+    repeat(sprite->textureCount, i) {
+        int32_t tpagIndex = sprite->tpagIndices[i];
+        if (tpagIndex < 0 || (uint32_t) tpagIndex >= dataWin->tpag.count) continue;
+        markRoomManifestOutputItemPages((uint32_t) tpagIndex, totalPageCount, items, fragments, seenPages);
+    }
+}
+
+static void markRoomManifestBackgroundPages(
+    const DataWin* dataWin,
+    int32_t backgroundIndex,
+    uint32_t totalPageCount,
+    const OutputItem* items,
+    const OutputFragment* fragments,
+    bool* seenPages
+) {
+    if (dataWin == NULL || items == NULL || fragments == NULL || seenPages == NULL) return;
+    if (backgroundIndex < 0 || (uint32_t) backgroundIndex >= dataWin->bgnd.count) return;
+
+    const Background* background = &dataWin->bgnd.backgrounds[backgroundIndex];
+    if (background->tpagIndex < 0 || (uint32_t) background->tpagIndex >= dataWin->tpag.count) return;
+    markRoomManifestOutputItemPages((uint32_t) background->tpagIndex, totalPageCount, items, fragments, seenPages);
+}
+
+static void markRoomManifestTileEntryPages(
+    const OutputTileEntry* tileEntry,
+    uint32_t totalPageCount,
+    const OutputFragment* fragments,
+    bool* seenPages
+) {
+    if (tileEntry == NULL || fragments == NULL || seenPages == NULL) return;
+
+    if (tileEntry->atlasId != UINT16_MAX) {
+        if (tileEntry->atlasId < totalPageCount) seenPages[tileEntry->atlasId] = true;
+        return;
+    }
+
+    if (tileEntry->fragmentCount == 0 || tileEntry->fragmentStart == UINT32_MAX) return;
+    repeat(tileEntry->fragmentCount, i) {
+        uint32_t fragmentIndex = tileEntry->fragmentStart + (uint32_t) i;
+        uint16_t pageIndex = fragments[fragmentIndex].atlasId;
+        if (pageIndex < totalPageCount) seenPages[pageIndex] = true;
+    }
+}
+
+static bool writeRoomManifestFile(
+    const char* outputDir,
+    const DataWin* dataWin,
+    uint32_t totalPageCount,
+    const OutputItem* items,
+    const OutputFragment* fragments,
+    const OutputTileEntry* packedTileEntries,
+    uint32_t packedTileEntryCount
+) {
+    if (outputDir == NULL || dataWin == NULL || items == NULL || fragments == NULL) return false;
+
+    char manifestPath[1024];
+    snprintf(manifestPath, sizeof(manifestPath), "%s/gfx/room_manifest.bin", outputDir);
+
+    TileRequestMap* tileEntryMap = NULL;
+    repeat(packedTileEntryCount, i) {
+        TileLookupKey key = {
+            .bgDef = packedTileEntries[i].bgDef,
+            .srcX = packedTileEntries[i].srcX,
+            .srcY = packedTileEntries[i].srcY,
+            .srcW = packedTileEntries[i].srcW,
+            .srcH = packedTileEntries[i].srcH,
+        };
+        hmput(tileEntryMap, key, i);
+    }
+
+    N3DSRoomManifestEntry* entries = NULL;
+    N3DSRoomManifestPageRef* pageRefs = NULL;
+    uint32_t roomWithPagesCount = 0;
+
+    repeat(dataWin->room.count, roomIndex) {
+        Room* room = &dataWin->room.rooms[roomIndex];
+        bool* seenPages = safeCalloc(totalPageCount > 0 ? totalPageCount : 1u, sizeof(bool));
+        uint32_t pageStart = (uint32_t) arrlen(pageRefs);
+
+        repeat(8u, i) {
+            if (room->backgrounds == NULL || !room->backgrounds[i].enabled) continue;
+            markRoomManifestBackgroundPages(dataWin, room->backgrounds[i].backgroundDefinition, totalPageCount, items, fragments, seenPages);
+        }
+
+        repeat(room->gameObjectCount, objIndex) {
+            const RoomGameObject* roomObject = &room->gameObjects[objIndex];
+            if (roomObject->objectDefinition < 0 || (uint32_t) roomObject->objectDefinition >= dataWin->objt.count) continue;
+            const GameObject* object = &dataWin->objt.objects[roomObject->objectDefinition];
+            markRoomManifestSpritePages(dataWin, object->spriteId, totalPageCount, items, fragments, seenPages);
+        }
+
+        repeat(room->layerCount, layerIndex) {
+            RoomLayer* layer = &room->layers[layerIndex];
+            if (layer->backgroundData != NULL) {
+                markRoomManifestSpritePages(dataWin, layer->backgroundData->spriteIndex, totalPageCount, items, fragments, seenPages);
+            }
+            if (layer->assetsData != NULL) {
+                repeat(layer->assetsData->spriteCount, spriteSlot) {
+                    markRoomManifestSpritePages(
+                        dataWin,
+                        layer->assetsData->sprites[spriteSlot].spriteIndex,
+                        totalPageCount,
+                        items,
+                        fragments,
+                        seenPages
+                    );
+                }
+            }
+        }
+
+        TileLookupKey* roomTileKeys = NULL;
+        TileRequestMap* roomTileDedupe = NULL;
+        collectLegacyTileRequestsFromRoom(room, (DataWin*) dataWin, &roomTileKeys, &roomTileDedupe);
+        repeat(arrlen(roomTileKeys), tileKeyIndex) {
+            ptrdiff_t packedTileIndex = hmgeti(tileEntryMap, roomTileKeys[tileKeyIndex]);
+            if (packedTileIndex < 0) continue;
+            markRoomManifestTileEntryPages(
+                &packedTileEntries[tileEntryMap[packedTileIndex].value],
+                totalPageCount,
+                fragments,
+                seenPages
+            );
+        }
+        arrfree(roomTileKeys);
+        hmfree(roomTileDedupe);
+
+        repeat(totalPageCount, pageIndex) {
+            if (!seenPages[pageIndex]) continue;
+            N3DSRoomManifestPageRef ref = {
+                .pageIndex = (uint16_t) pageIndex,
+                .flags = 0,
+                .reserved = 0,
+            };
+            arrput(pageRefs, ref);
+        }
+
+        uint32_t pageCount = (uint32_t) arrlen(pageRefs) - pageStart;
+        if (pageCount > 0) roomWithPagesCount++;
+        N3DSRoomManifestEntry entry = {
+            .roomIndex = roomIndex,
+            .pageStart = pageStart,
+            .pageCount = pageCount,
+            .directSpriteStart = 0,
+            .directSpriteCount = 0,
+            .directBackgroundStart = 0,
+            .directBackgroundCount = 0,
+        };
+        arrput(entries, entry);
+        free(seenPages);
+    }
+
+    FILE* file = fopen(manifestPath, "wb");
+    if (file == NULL) {
+        hmfree(tileEntryMap);
+        arrfree(entries);
+        arrfree(pageRefs);
+        fprintf(stderr, "Failed to open room manifest output: %s\n", manifestPath);
+        return false;
+    }
+
+    uint32_t header[5] = {
+        N3DS_ROOM_MANIFEST_MAGIC,
+        N3DS_ROOM_MANIFEST_VERSION,
+        (uint32_t) arrlen(entries),
+        (uint32_t) arrlen(pageRefs),
+        dataWin->room.count,
+    };
+    bool ok = fwrite(header, sizeof(header), 1, file) == 1;
+    if (ok && arrlen(entries) > 0) ok = fwrite(entries, sizeof(N3DSRoomManifestEntry), arrlen(entries), file) == arrlen(entries);
+    if (ok && arrlen(pageRefs) > 0) ok = fwrite(pageRefs, sizeof(N3DSRoomManifestPageRef), arrlen(pageRefs), file) == arrlen(pageRefs);
+    fclose(file);
+
+    fprintf(
+        stderr,
+        "n3ds-preprocess: wrote room manifest (%u rooms, %u non-empty, %u page refs) -> %s\n",
+        dataWin->room.count,
+        roomWithPagesCount,
+        (unsigned int) arrlen(pageRefs),
+        manifestPath
+    );
+
+    hmfree(tileEntryMap);
+    arrfree(entries);
+    arrfree(pageRefs);
+    return ok;
+}
+
 static bool flushPackedPages(const Options* options, OutputPage* outputPages, PackedPage** packedPages, uint32_t packedPageCount) {
     uint32_t rgba5551Pages = 0;
     uint32_t etc1a4Pages = 0;
@@ -3141,6 +3366,15 @@ static bool convertTextures(const Options* options, DataWin* dataWin) {
     if (ok) ok = finalizeDirectSpriteAssets(options, dataWin, directSpriteFormatStates);
     if (ok) ok = writePackedDirectTextureAssets(options, dataWin);
     if (ok) ok = writeAtlasFile(options->outputDir, totalPageCount, pages, dataWin->tpag.count, items, arrlen(fragments), fragments, arrlen(packedTileEntries), packedTileEntries, options->textureFormat);
+    if (ok) ok = writeRoomManifestFile(
+        options->outputDir,
+        dataWin,
+        totalPageCount,
+        items,
+        fragments,
+        packedTileEntries,
+        (uint32_t) arrlen(packedTileEntries)
+    );
     free(items);
     free(pages);
     arrfree(fragments);
@@ -3357,42 +3591,6 @@ static N3DS_PREPROCESS_MAYBE_UNUSED bool readBytesFromFile(const char* path, uin
     return true;
 }
 
-static bool commandAvailable(const char* command) {
-    if (command == NULL || command[0] == '\0') return false;
-    if (fileExists(command)) return true;
-
-    char probe[4096];
-#if N3DS_PREPROCESS_HOST_WINDOWS
-    snprintf(probe, sizeof(probe), "where \"%s\" >nul 2>nul", command);
-#else
-    snprintf(probe, sizeof(probe), "command -v \"%s\" >/dev/null 2>&1", command);
-#endif
-    return system(probe) == 0;
-}
-
-static bool cwavtoolAvailable(const Options* options) {
-    if (options == NULL || options->cwavtoolExe == NULL || options->cwavtoolExe[0] == '\0') return false;
-    return commandAvailable(options->cwavtoolExe);
-}
-
-static bool runCwavtoolFromInput(const char* cwavtoolExe, const char* inputPath, const char* outputPath) {
-    char command[4096];
-    snprintf(
-        command,
-        sizeof(command),
-        "\"%s\" -i \"%s\" -o \"%s\" -e dspadpcm -ls 0 -le end",
-        cwavtoolExe,
-        inputPath,
-        outputPath
-    );
-    int rc = system(command);
-    if (rc != 0) {
-        fprintf(stderr, "cwavtool failed (%d): %s\n", rc, command);
-        return false;
-    }
-    return true;
-}
-
 static bool pathHasExtension(const char* path, const char* extension) {
     if (path == NULL || extension == NULL) return false;
     size_t pathLen = strlen(path);
@@ -3418,14 +3616,14 @@ static N3DS_PREPROCESS_MAYBE_UNUSED bool isBuiltinAudioInputPath(const char* pat
 static N3DS_PREPROCESS_MAYBE_UNUSED bool writeBcwavFromInputFile(const char* inputPath, const char* outputPath) {
     WavPcm16 wav;
     if (!loadAudioPcm16(inputPath, &wav)) {
-        fprintf(stderr, "Built-in BCWAV writer could not decode audio: %s\n", inputPath);
+        fprintf(stderr, "In-process BCWAV writer could not decode audio: %s\n", inputPath);
         return false;
     }
 
     bool ok = writeBcwavFile(outputPath, &wav);
     freeWavPcm16(&wav);
     if (!ok) {
-        fprintf(stderr, "Built-in BCWAV fallback failed to write %s\n", outputPath);
+        fprintf(stderr, "In-process BCWAV writer failed to write %s\n", outputPath);
         return false;
     }
     return true;
@@ -4431,7 +4629,6 @@ static bool loadPcmForSoundBank(
     const uint8_t* embeddedData,
     uint32_t embeddedDataSize,
     size_t soundIndex,
-    bool haveCwavtool,
     WavPcm16* outPcm
 ) {
     if (options == NULL || sound == NULL || outPcm == NULL) return false;
@@ -4464,33 +4661,14 @@ static bool loadPcmForSoundBank(
         return false;
     }
 
-    bool ok = false;
-    if (loadAudioPcm16(inputPath, outPcm)) {
-        ok = true;
-    } else if (haveCwavtool) {
-        char tempBcwavPath[1024];
-        snprintf(tempBcwavPath, sizeof(tempBcwavPath), "%s/audio/__tmp_bank_cwav_%05zu.bcwav", options->outputDir, soundIndex);
-        remove(tempBcwavPath);
-        if (runCwavtoolFromInput(options->cwavtoolExe, inputPath, tempBcwavPath)) {
-            uint8_t* bcwavData = NULL;
-            uint32_t bcwavSize = 0;
-            ParsedBcwav parsed;
-            if (readBytesFromFile(tempBcwavPath, &bcwavData, &bcwavSize) &&
-                parseBcwavBlob(bcwavData, bcwavSize, &parsed) &&
-                decodeBcwavToPcm(bcwavData, &parsed, outPcm)) {
-                ok = true;
-            }
-            free(bcwavData);
-        }
-        remove(tempBcwavPath);
-    }
+    bool ok = loadAudioPcm16(inputPath, outPcm);
 
     if (wroteTempInput) remove(tempInputPath);
     free(externalSourcePath);
     return ok;
 }
 
-static bool buildPackedSoundBank(Options* options, DataWin* dataWin, bool haveCwavtool) {
+static bool buildPackedSoundBank(Options* options, DataWin* dataWin) {
     if (options == NULL || dataWin == NULL) return false;
 
     uint32_t soundCount = (uint32_t) dataWin->sond.count;
@@ -4532,7 +4710,6 @@ static bool buildPackedSoundBank(Options* options, DataWin* dataWin, bool haveCw
             sourceData,
             sourceSize,
             soundIndex,
-            haveCwavtool,
             &pcm
         )) {
             if (sound->name != NULL && sound->name[0] != '\0') {
@@ -4606,7 +4783,7 @@ cleanup:
     return ok;
 }
 
-static bool convertStreamedMusicBcwavs(Options* options, DataWin* dataWin, bool haveCwavtool) {
+static bool convertStreamedMusicBcwavs(Options* options, DataWin* dataWin) {
     if (options == NULL || dataWin == NULL) return false;
 
     bool allOk = true;
@@ -4649,9 +4826,6 @@ static bool convertStreamedMusicBcwavs(Options* options, DataWin* dataWin, bool 
         );
 
         bool ok = writeBcwavFromInputFile(externalSourcePath, outPath);
-        if (!ok && haveCwavtool) {
-            ok = runCwavtoolFromInput(options->cwavtoolExe, externalSourcePath, outPath);
-        }
         free(externalSourcePath);
 
         if (!ok) {
@@ -4674,19 +4848,11 @@ static bool convertStreamedMusicBcwavs(Options* options, DataWin* dataWin, bool 
 }
 
 static bool convertAudio(Options* options, DataWin* dataWin) {
-    bool haveCwavtool = false;
-
     fprintf(stderr, "n3ds-preprocess: processing audio\n");
+    fprintf(stderr, "Using in-process audio conversion (WAV and Ogg Vorbis supported; other codecs unavailable).\n");
 
-    haveCwavtool = cwavtoolAvailable(options);
-    if (!haveCwavtool) {
-        fprintf(stderr, "Using PCM16 sound bank writer (WAV and Ogg Vorbis supported in-process; other codecs unavailable).\n");
-    } else {
-        fprintf(stderr, "Using PCM16 sound bank writer (WAV/Ogg Vorbis in-process, cwavtool fallback for other codecs).\n");
-    }
-
-    bool ok = convertStreamedMusicBcwavs(options, dataWin, haveCwavtool);
-    if (ok) ok = buildPackedSoundBank(options, dataWin, haveCwavtool);
+    bool ok = convertStreamedMusicBcwavs(options, dataWin);
+    if (ok) ok = buildPackedSoundBank(options, dataWin);
     if (ok) fprintf(stderr, "Packed SFX audio into PCM16 sound_bank.bin at %u Hz\n", N3DS_AUDIO_SAMPLE_RATE);
     return ok;
 }

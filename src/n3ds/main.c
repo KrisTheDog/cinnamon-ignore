@@ -42,6 +42,8 @@ static int gN3DSBootLogLineCount = 0;
 typedef struct {
     C2D_TextBuf textBuf;
     double displayedFps;
+    double displayedRenderMs;
+    double sampledRenderMs;
     uint32_t sampledFrames;
     u64 sampleStartMs;
 } N3DSDebugMonitor;
@@ -78,16 +80,21 @@ static void N3DSDebugMonitor_free(N3DSDebugMonitor* monitor) {
     }
 }
 
-static void N3DSDebugMonitor_tickFrame(N3DSDebugMonitor* monitor) {
+static void N3DSDebugMonitor_tickFrame(N3DSDebugMonitor* monitor, double renderMs) {
     if (monitor == NULL) return;
 
     monitor->sampledFrames++;
+    monitor->sampledRenderMs += renderMs;
     u64 nowMs = osGetTime();
     u64 elapsedMs = nowMs - monitor->sampleStartMs;
     if (elapsedMs < 250) return;
 
     monitor->displayedFps = ((double) monitor->sampledFrames * 1000.0) / (double) elapsedMs;
+    monitor->displayedRenderMs = monitor->sampledFrames > 0
+        ? monitor->sampledRenderMs / (double) monitor->sampledFrames
+        : 0.0;
     monitor->sampledFrames = 0;
+    monitor->sampledRenderMs = 0.0;
     monitor->sampleStartMs = nowMs;
 }
 
@@ -242,7 +249,7 @@ static void N3DSDebugMonitor_draw(N3DSDebugMonitor* monitor, Runner* runner, Ren
     uint32_t ramTotalBytes = osGetMemRegionSize(MEMREGION_APPLICATION);
     uint32_t linearFreeBytes = linearSpaceFree();
 
-    char fpsLine[64];
+    char fpsLine[96];
     char vramLine[64];
     char atlasLine[96];
     char ramLine[96];
@@ -265,7 +272,13 @@ static void N3DSDebugMonitor_draw(N3DSDebugMonitor* monitor, Runner* runner, Ren
 
     N3DSAudioSystem_getCacheStats(runner->audioSystem, &cachedSounds, &totalSounds, &cachedSoundBytes, &cacheLimitBytes);
 
-    snprintf(fpsLine, sizeof(fpsLine), "FPS %.1f", monitor->displayedFps > 0.0 ? monitor->displayedFps : 0.0);
+    snprintf(
+        fpsLine,
+        sizeof(fpsLine),
+        "FPS %.1f  R %.1fms",
+        monitor->displayedFps > 0.0 ? monitor->displayedFps : 0.0,
+        monitor->displayedRenderMs > 0.0 ? monitor->displayedRenderMs : 0.0
+    );
     N3DS_formatDebugSize(vramUsed, sizeof(vramUsed), trackedVRAMBytes);
     N3DS_formatDebugSize(vramTotal, sizeof(vramTotal), N3DS_TOTAL_VRAM_BYTES);
     N3DS_formatDebugSize(atlasUsed, sizeof(atlasUsed), atlasVRAMBytes);
@@ -608,6 +621,41 @@ static s64 N3DS_ticksToNs(u64 ticks) {
     return (s64) ((ticks * 1000000000ULL) / SYSCLOCK_ARM11);
 }
 
+static void N3DS_sleepUntilTick(u64 targetTick) {
+    const u64 coarseGuardTicks = SYSCLOCK_ARM11 / 2000u; // ~0.5 ms
+
+    while (true) {
+        u64 now = svcGetSystemTick();
+        if (now >= targetTick) return;
+
+        u64 remaining = targetTick - now;
+        if (remaining <= coarseGuardTicks) break;
+
+        svcSleepThread(N3DS_ticksToNs(remaining - coarseGuardTicks));
+    }
+
+    while (svcGetSystemTick() < targetTick) {
+    }
+}
+
+static void N3DS_beginPacedFrame(u64* nextFrameTick, u64 frameTicks) {
+    if (nextFrameTick == NULL || frameTicks == 0) return;
+
+    u64 now = svcGetSystemTick();
+    if (*nextFrameTick == 0) {
+        *nextFrameTick = now;
+    } else if (now > *nextFrameTick + frameTicks * 4u) {
+        *nextFrameTick = now;
+    } else {
+        while (now > *nextFrameTick) {
+            *nextFrameTick += frameTicks;
+        }
+    }
+
+    N3DS_sleepUntilTick(*nextFrameTick);
+    *nextFrameTick += frameTicks;
+}
+
 static void N3DSDataWinProgressCallback(const char* chunkName, int chunkIndex, int totalChunks, MAYBE_UNUSED DataWin* dataWin, void* userData) {
     N3DSLoadingScreen* screen = (N3DSLoadingScreen*) userData;
     if (screen == NULL) return;
@@ -749,8 +797,9 @@ int main(int argc, char** argv) {
     int32_t gameH = (int32_t) gen8->defaultWindowHeight;
 
     const u64 frameTicks = (SYSCLOCK_ARM11 + 15u) / 30u;
-    u64 nextFrameTick = svcGetSystemTick() + frameTicks;
+    u64 nextFrameTick = svcGetSystemTick();
     while (aptMainLoop() && !runner->shouldExit) {
+        N3DS_beginPacedFrame(&nextFrameTick, frameTicks);
         hidScanInput();
         u32 held = hidKeysHeld();
         u32 down = hidKeysDown();
@@ -785,7 +834,7 @@ int main(int argc, char** argv) {
         float displayScaleX = 1.0f;
         float displayScaleY = 1.0f;
         Runner_computeViewDisplayScale(runner, gameW, gameH, &displayScaleX, &displayScaleY);
-        N3DSDebugMonitor_tickFrame(&debugMonitor);
+        u64 renderStartMs = osGetTime();
         C3D_FrameBegin(0);
         renderer->vtable->beginFrame(renderer, gameW, gameH, 400, 240);
         Runner_drawViews(runner, gameW, gameH, displayScaleX, displayScaleY, false);
@@ -797,16 +846,9 @@ int main(int argc, char** argv) {
         }
         renderer->vtable->endFrame(renderer);
         C3D_FrameEnd(0);
+        N3DSDebugMonitor_tickFrame(&debugMonitor, (double) (osGetTime() - renderStartMs));
 
         RunnerKeyboard_beginFrame(runner->keyboard);
-
-        u64 now = svcGetSystemTick();
-        if (now < nextFrameTick) {
-            svcSleepThread(N3DS_ticksToNs(nextFrameTick - now));
-            nextFrameTick += frameTicks;
-        } else {
-            nextFrameTick = now + frameTicks;
-        }
     }
 
     audioSystem->vtable->destroy(audioSystem);

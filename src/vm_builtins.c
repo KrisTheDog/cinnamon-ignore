@@ -2899,6 +2899,159 @@ static void nativeOverride_drawSnowDot3DS(Renderer* rend, GMLReal dotX, GMLReal 
     rend->vtable->drawRectangle(rend, (float) (dotX - 2.0), (float) (dotY + 1.5), (float) (dotX + 2.0), (float) (dotY + 2.5), rend->drawColor, rend->drawAlpha, false);
 }
 
+static int32_t nativeOverride_resolveSelfVarId(VMContext* ctx, const char* varName) {
+    if (ctx == NULL || varName == NULL) return -1;
+    ptrdiff_t slot = shgeti(ctx->selfVarNameMap, (char*) varName);
+    if (slot < 0) return -1;
+    return ctx->selfVarNameMap[slot].value;
+}
+
+static GMLReal nativeOverride_getSelfVarReal(Instance* inst, int32_t varId, GMLReal defaultValue) {
+    if (inst == NULL || varId < 0) return defaultValue;
+    RValue value = Instance_getSelfVar(inst, varId);
+    if (value.type == RVALUE_UNDEFINED) return defaultValue;
+    return RValue_toReal(value);
+}
+
+static void nativeOverride_setSelfVarReal(Instance* inst, int32_t varId, GMLReal value) {
+    if (inst == NULL || varId < 0) return;
+    Instance_setSelfVar(inst, varId, RValue_makeReal(value));
+}
+
+static GMLReal nativeOverride_randomReal(GMLReal maxValue) {
+    if (maxValue <= 0.0) return 0.0;
+    return (((GMLReal) rand()) / (((GMLReal) RAND_MAX) + 1.0)) * maxValue;
+}
+
+typedef struct {
+    bool resolved;
+    int32_t sprSteamerBottom;
+    int32_t sprSteamerTop;
+    int32_t objSteamplume2;
+    int32_t varTimer;
+    int32_t varFL;
+    int32_t varFD;
+    int32_t varAA;
+    int32_t varT;
+} NativeVentCache;
+
+static NativeVentCache g_nativeVentCache = {
+    .resolved = false,
+    .sprSteamerBottom = -1,
+    .sprSteamerTop = -1,
+    .objSteamplume2 = -1,
+    .varTimer = -1,
+    .varFL = -1,
+    .varFD = -1,
+    .varAA = -1,
+    .varT = -1,
+};
+
+static void nativeOverride_ensureVentCache(VMContext* ctx) {
+    if (g_nativeVentCache.resolved || ctx == NULL || ctx->runner == NULL) return;
+
+    Runner* runner = (Runner*) ctx->runner;
+    g_nativeVentCache.sprSteamerBottom = shget(runner->assetsByName, "spr_steamer_bottom");
+    g_nativeVentCache.sprSteamerTop = shget(runner->assetsByName, "spr_steamer_top");
+    g_nativeVentCache.objSteamplume2 = shget(runner->assetsByName, "obj_steamplume2");
+    g_nativeVentCache.varTimer = nativeOverride_resolveSelfVarId(ctx, "timer");
+    g_nativeVentCache.varFL = nativeOverride_resolveSelfVarId(ctx, "f_l");
+    g_nativeVentCache.varFD = nativeOverride_resolveSelfVarId(ctx, "f_d");
+    g_nativeVentCache.varAA = nativeOverride_resolveSelfVarId(ctx, "aa");
+    g_nativeVentCache.varT = nativeOverride_resolveSelfVarId(ctx, "t");
+    g_nativeVentCache.resolved = true;
+}
+
+// Native translation of gml_Object_obj_piper_steam_Draw_0.
+static RValue builtinPiperSteamDraw(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    if (ctx == NULL || ctx->runner == NULL || ctx->runner->renderer == NULL) return RValue_makeUndefined();
+
+    Runner* runner = (Runner*) ctx->runner;
+    Instance* self = (Instance*) ctx->currentInstance;
+    if (self == NULL) return RValue_makeUndefined();
+
+    nativeOverride_ensureVentCache(ctx);
+
+    GMLReal timer = nativeOverride_getSelfVarReal(self, g_nativeVentCache.varTimer, 0.0);
+    GMLReal f_l = nativeOverride_getSelfVarReal(self, g_nativeVentCache.varFL, 0.0);
+
+    timer += 1.0;
+    Renderer_drawSprite(runner->renderer, g_nativeVentCache.sprSteamerBottom, 0, self->x, self->y);
+    Renderer_drawSprite(runner->renderer, g_nativeVentCache.sprSteamerTop, 0, self->x, self->y + (float) (f_l * 3.0));
+
+    if (timer == 30.0) {
+        f_l = 0.0;
+        nativeOverride_setSelfVarReal(self, g_nativeVentCache.varFD, 1.0);
+    }
+
+    if (timer > 30.0 && 50.0 > timer) {
+        Instance* plume = Runner_createInstance(runner, self->x + 7.0, self->y + 6.0 + f_l * 3.0, g_nativeVentCache.objSteamplume2);
+        if (plume != NULL && ctx->creatorVarID >= 0) {
+            Instance_setSelfVar(plume, ctx->creatorVarID, RValue_makeReal((GMLReal) self->instanceId));
+        }
+
+        f_l += 0.3;
+        if (f_l >= 3.0) timer = 50.0;
+    }
+
+    if (timer >= 50.0 && 90.0 > timer) {
+        f_l -= 0.1;
+        if (f_l <= 0.0) {
+            f_l = 0.0;
+            timer = 25.0;
+        }
+    }
+
+    nativeOverride_setSelfVarReal(self, g_nativeVentCache.varTimer, timer);
+    nativeOverride_setSelfVarReal(self, g_nativeVentCache.varFL, f_l);
+    return RValue_makeUndefined();
+}
+
+// Native translation of gml_Object_obj_steamplume2_Create_0.
+static RValue builtinSteamplume2Create(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Instance* self = (Instance*) ctx->currentInstance;
+    if (self == NULL) return RValue_makeUndefined();
+
+    nativeOverride_ensureVentCache(ctx);
+
+    self->friction = 0.1f;
+    self->vspeed = -6.0f;
+    self->imageXscale = 0.3f;
+    self->imageYscale = 0.3f;
+    self->imageAngle = (float) nativeOverride_randomReal(360.0);
+    self->hspeed = (float) (0.2 - nativeOverride_randomReal(0.4));
+    Instance_computeSpeedFromComponents(self);
+
+    nativeOverride_setSelfVarReal(self, g_nativeVentCache.varAA, 2.0 - nativeOverride_randomReal(4.0));
+    nativeOverride_setSelfVarReal(self, g_nativeVentCache.varT, 0.0);
+    return RValue_makeUndefined();
+}
+
+// Native translation of gml_Object_obj_steamplume2_Step_0.
+static RValue builtinSteamplume2Step(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    if (ctx == NULL || ctx->runner == NULL) return RValue_makeUndefined();
+
+    Runner* runner = (Runner*) ctx->runner;
+    Instance* self = (Instance*) ctx->currentInstance;
+    if (self == NULL) return RValue_makeUndefined();
+
+    nativeOverride_ensureVentCache(ctx);
+
+    GMLReal t = nativeOverride_getSelfVarReal(self, g_nativeVentCache.varT, 0.0);
+    GMLReal aa = nativeOverride_getSelfVarReal(self, g_nativeVentCache.varAA, 0.0);
+
+    self->imageXscale += 0.1f;
+    self->imageYscale += 0.1f;
+    t += 1.0;
+
+    if (t > 7.0) self->imageAlpha -= 0.08f;
+    if (self->imageAlpha <= 0.02f) Runner_destroyInstance(runner, self);
+
+    self->imageAngle += (float) aa;
+    nativeOverride_setSelfVarReal(self, g_nativeVentCache.varT, t);
+    return RValue_makeUndefined();
+}
+
 static bool battleDraw_isValidObjectIndex(VMContext* ctx, int32_t objectIndex) {
     return ctx != NULL &&
         ctx->dataWin != NULL &&
@@ -10328,6 +10481,9 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerCodeOverride(ctx, "gml_Object_obj_battlecontroller_Draw_0", builtinBattleControllerDraw);
     VM_registerCodeOverride(ctx, "gml_Object_obj_blackborderer_Draw_0", builtinBlackBordererDraw);
     VM_registerCodeOverride(ctx, "gml_Object_obj_snowfloor_Draw_0", builtinSnowfloorDraw);
+    VM_registerCodeOverride(ctx, "gml_Object_obj_piper_steam_Draw_0", builtinPiperSteamDraw);
+    VM_registerCodeOverride(ctx, "gml_Object_obj_steamplume2_Create_0", builtinSteamplume2Create);
+    VM_registerCodeOverride(ctx, "gml_Object_obj_steamplume2_Step_0", builtinSteamplume2Step);
     VM_registerCodeOverride(ctx, "gml_Object_obj_lastruins_bg_Step_0", builtinLastruinsBgStep);
     VM_registerCodeOverride(ctx, "gml_Object_obj_backgrounder_lastruins_Other_10", builtinBackgrounderLastruinsOther10);
 #if IS_BC17_OR_HIGHER_ENABLED
