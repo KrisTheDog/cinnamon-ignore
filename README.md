@@ -65,6 +65,8 @@ Of course, there are exceptions that break game compatibility altogether:
 
 You must have a proper devkitPro Wii U enviroment set up and configured for your platform.
 
+On Windows, make sure MinGW is located in your system PATH (C:/MinGW/bin) before proceeding with build instructions
+
 Configure with the Wii U CMake wrapper and then build:
 
 ```bash
@@ -93,6 +95,7 @@ On Windows, build from PowerShell with:
 
 You must have a proper devkitPro 3DS environment set up and configured for your platform.
 
+On Windows, make sure MinGW is located in your system PATH (C:/MinGW/bin) before proceeding with build instructions
 
 Configure and build it with the devkitPro 3DS toolchain:
 
@@ -102,6 +105,7 @@ cmake --build build/n3ds
 ```
 
 On Windows, build from PowerShell with:
+
 
 ```powershell
 .\build-windows-n3ds.ps1
