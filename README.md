@@ -24,7 +24,7 @@ If this already exists, then whats stopping people from porting Butterscotch to 
 
 This is where Cinnamon, a fork of Butterscotch comes in!
 
-Cinnamon aims to be a open source re-implementation of GameMaker Studios runner **for the 3DS and Wii U.** This opens up lots of opportunities for games like Pizza Tower, Hyper Light Drifter, Undertale, and Deltarune to run on the 3DS and Wii U.
+Cinnamon aims to be a open source re-implementation of GameMaker Studios runner **for the 3DS and Wii U.** This opens up lots of opportunities for games like Pizza Tower, Undertale Yellow, Undertale, and Deltarune to run on the 3DS and Wii U.
 
 
 ## Game Compatibility
