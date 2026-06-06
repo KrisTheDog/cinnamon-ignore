@@ -25,6 +25,7 @@
 
 #if N3DS_PREPROCESS_HOST_WINDOWS
 #include <windows.h>
+#include <process.h>
 #endif
 
 #if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MSYS__)
@@ -1358,6 +1359,53 @@ static bool pixelsLookMonochrome(const uint8_t* rgba, uint32_t width, uint32_t h
 }
 
 static bool runTex3ds(const char* tex3dsExe, const char* pngPath, const char* t3xPath, N3DSTextureFormat format) {
+#if N3DS_PREPROCESS_HOST_WINDOWS
+    char tex3dsExeNormalized[1024];
+    char pngPathNormalized[1024];
+    char t3xPathNormalized[1024];
+    char command[4096];
+
+    snprintf(tex3dsExeNormalized, sizeof(tex3dsExeNormalized), "%s", tex3dsExe);
+    snprintf(pngPathNormalized, sizeof(pngPathNormalized), "%s", pngPath);
+    snprintf(t3xPathNormalized, sizeof(t3xPathNormalized), "%s", t3xPath);
+    for (char* cursor = tex3dsExeNormalized; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') *cursor = '\\';
+    }
+    for (char* cursor = pngPathNormalized; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') *cursor = '\\';
+    }
+    for (char* cursor = t3xPathNormalized; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') *cursor = '\\';
+    }
+
+    snprintf(
+        command,
+        sizeof(command),
+        "\"%s\" -f %s -z none -o \"%s\" \"%s\"",
+        tex3dsExeNormalized,
+        getTex3dsFormatName(format),
+        t3xPathNormalized,
+        pngPathNormalized
+    );
+    intptr_t rc = spawnl(
+        _P_WAIT,
+        tex3dsExeNormalized,
+        tex3dsExeNormalized,
+        "-f",
+        getTex3dsFormatName(format),
+        "-z",
+        "none",
+        "-o",
+        t3xPathNormalized,
+        pngPathNormalized,
+        NULL
+    );
+    if (rc != 0) {
+        fprintf(stderr, "tex3ds failed (%ld): %s\n", (long) rc, command);
+        return false;
+    }
+    return true;
+#else
     char command[4096];
     snprintf(
         command,
@@ -1374,9 +1422,58 @@ static bool runTex3ds(const char* tex3dsExe, const char* pngPath, const char* t3
         return false;
     }
     return true;
+#endif
 }
 
 static bool runTex3dsAtlas(const char* tex3dsExe, const char* pngGlobPath, const char* t3xPath, N3DSTextureFormat format) {
+#if N3DS_PREPROCESS_HOST_WINDOWS
+    char tex3dsExeNormalized[1024];
+    char pngGlobPathNormalized[1024];
+    char t3xPathNormalized[1024];
+    char command[4096];
+
+    snprintf(tex3dsExeNormalized, sizeof(tex3dsExeNormalized), "%s", tex3dsExe);
+    snprintf(pngGlobPathNormalized, sizeof(pngGlobPathNormalized), "%s", pngGlobPath);
+    snprintf(t3xPathNormalized, sizeof(t3xPathNormalized), "%s", t3xPath);
+    for (char* cursor = tex3dsExeNormalized; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') *cursor = '\\';
+    }
+    for (char* cursor = pngGlobPathNormalized; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') *cursor = '\\';
+    }
+    for (char* cursor = t3xPathNormalized; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') *cursor = '\\';
+    }
+
+    snprintf(
+        command,
+        sizeof(command),
+        "\"%s\" --atlas -f %s -z none -o \"%s\" \"%s\"",
+        tex3dsExeNormalized,
+        getTex3dsFormatName(format),
+        t3xPathNormalized,
+        pngGlobPathNormalized
+    );
+    intptr_t rc = spawnl(
+        _P_WAIT,
+        tex3dsExeNormalized,
+        tex3dsExeNormalized,
+        "--atlas",
+        "-f",
+        getTex3dsFormatName(format),
+        "-z",
+        "none",
+        "-o",
+        t3xPathNormalized,
+        pngGlobPathNormalized,
+        NULL
+    );
+    if (rc != 0) {
+        fprintf(stderr, "tex3ds atlas failed (%ld): %s\n", (long) rc, command);
+        return false;
+    }
+    return true;
+#else
     char command[4096];
     snprintf(
         command,
@@ -1393,6 +1490,7 @@ static bool runTex3dsAtlas(const char* tex3dsExe, const char* pngGlobPath, const
         return false;
     }
     return true;
+#endif
 }
 
 static uint16_t rgbaToRgb5551(const uint8_t* rgba) {
