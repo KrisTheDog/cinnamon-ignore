@@ -103,7 +103,7 @@ static void Runner_executeResolvedEvent(Runner* runner, Instance* instance, int3
 
 #ifdef __3DS__
 //bottom screen battlefield offset factor
-static const float k3DSBottomBattleFieldScale = 2.0f;
+static const float k3DSBottomBattleFieldScale = 1.0f;
 static const float k3DSBottomBattleFieldYOffset = -60.0f;
 static const float k3DSTopBattleEnemyInstanceYOffset = 112.0f;
 
