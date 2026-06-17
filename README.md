@@ -127,7 +127,7 @@ cmake -S . -B build/n3ds -DPLATFORM=n3ds \
 cmake --build build/n3ds
 ```
 
-To build without bottom screen features, pass the disable flag like so:
+By defualt, cinnamon is compiled with the bottom screen features for UNDERTALE. To build without bottom screen features, pass the disable flag like so:
 
 ```bash
 cmake -S . -B build/n3ds -DN3DS_DISABLE_BOTTOM_SCREEN=ON
