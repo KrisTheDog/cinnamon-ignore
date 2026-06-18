@@ -17,6 +17,7 @@ TO DO (3DS):
 - Fix culling, do not cull from middle
 - Fix a weird glitch where bullets shake VERY badly
 - Fix bullets appearing on the wrong screen
+- Fix bottom screen appearing OVER menu
 
 When you create a game in GameMaker: Studio and export it, GameMaker: Studio exports the game code as bytecode instead of native compiled code, and that bytecode is compatible with any other GameMaker: Studio runner (also known as YoYo runner), as long as they have matching GameMaker: Studio versions. This is similar to how Java applications work.
 
