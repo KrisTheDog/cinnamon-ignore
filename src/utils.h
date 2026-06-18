@@ -18,7 +18,7 @@
 
 // The "typeof((typeof(n))0" is used to remove the "const" from the typeof
 
-#define repeat(n, it) for (size_t it = 0; it < n; it++)
+#define repeat(n, it) for (int it = 0; it < (int)(n); it++)
 
 #define require(condition) \
     do { \

@@ -6,6 +6,10 @@ Renderer* N3DSRenderer_create(void);
 bool N3DSRenderer_isReady(Renderer* renderer);
 const char* N3DSRenderer_getStartupError(Renderer* renderer);
 void N3DSRenderer_beginOverlay(Renderer* renderer);
+void N3DSRenderer_beginWorldBottomScreen(Renderer* renderer, bool textAtBottom);
+void N3DSRenderer_endWorldBottomScreen(Renderer* renderer);
+float N3DSRenderer_getViewY(Renderer* renderer);
+float N3DSRenderer_getViewScaleY(Renderer* renderer);
 void N3DSRenderer_beginBottomScreenGUIEx(Renderer* renderer, int32_t guiW, int32_t guiH, float scaleX, float scaleY, float offsetX, float offsetY);
 void N3DSRenderer_beginBottomScreenGUI(Renderer* renderer, int32_t guiW, int32_t guiH);
 void N3DSRenderer_endBottomScreenGUI(Renderer* renderer);
@@ -34,3 +38,4 @@ uint32_t N3DSRenderer_getFrameTextGlyphDraws(Renderer* renderer);
 uint32_t N3DSRenderer_getFrameTextTenthsMs(Renderer* renderer);
 int32_t N3DSRenderer_findTileEntryIndex(Renderer* renderer, int32_t backgroundIndex, int32_t srcX, int32_t srcY, int32_t srcW, int32_t srcH);
 bool N3DSRenderer_drawCachedTileEntry(Renderer* renderer, int32_t tileEntryIndex, float drawX, float drawY, float xscale, float yscale, uint32_t color, float alpha);
+

@@ -805,6 +805,7 @@ int main(int argc, char** argv) {
         u32 down = hidKeysDown();
 
         if (down & KEY_START) break;
+
         if (down & KEY_SELECT) debugMonitorVisible = !debugMonitorVisible;
         bool debugWarpToAsriel = debugMonitorVisible && (down & KEY_L) &&
             (uint32_t) N3DS_DEBUG_ASRIEL_ROOM < runner->dataWin->room.count;
@@ -820,11 +821,11 @@ int main(int argc, char** argv) {
         syncKey(runner->keyboard, &upHeld, VK_UP, (held & KEY_UP) || circle.dy > 80);
         syncKey(runner->keyboard, &downHeld, VK_DOWN, (held & KEY_DOWN) || circle.dy < -80);
 
-        syncKey(runner->keyboard, &aHeld, 'Z', (held & KEY_A));
-        syncKey(runner->keyboard, &bHeld, 'X', (held & KEY_B));
+        syncKey(runner->keyboard, &aHeld, 'Z', held & KEY_A);
+        syncKey(runner->keyboard, &bHeld, 'X', held & KEY_B);
         syncKey(runner->keyboard, &yHeld, 'C', (held & KEY_Y) || (held & KEY_X));
         syncKey(runner->keyboard, &lHeld, VK_PAGEDOWN, (held & KEY_L) && !debugWarpToAsriel);
-        syncKey(runner->keyboard, &rHeld, VK_PAGEUP, (held & KEY_R));
+        syncKey(runner->keyboard, &rHeld, VK_PAGEUP, held & KEY_R);
 
         Runner_step(runner);
         N3DS_tryTriggerAsrielLed(runner);
