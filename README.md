@@ -21,6 +21,8 @@ TO DO (3DS):
 - Fix room_introstory (text renders on bottom which is disabled due to issues)
 - Fix room_gameover (Text not rendering)
 - Implement touch
+- Fix asgore bergentruckung scene, no text, spear animation not showing
+- Fix Undyne camera issue (? not sure if its been fixed)
 
 When you create a game in GameMaker: Studio and export it, GameMaker: Studio exports the game code as bytecode instead of native compiled code, and that bytecode is compatible with any other GameMaker: Studio runner (also known as YoYo runner), as long as they have matching GameMaker: Studio versions. This is similar to how Java applications work.
 
