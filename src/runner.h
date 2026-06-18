@@ -60,6 +60,19 @@ void Runner_platformBootLog(const char* message);
 // ===[ Operating System Types ]===
 // See GameMaker-HTML5's Globals.js
 typedef enum {
+    N3DS_BORDER_NONE,
+    N3DS_BORDER_DYNAMIC,
+    N3DS_BORDER_GASTER,
+    N3DS_BORDER_RUINS,
+    N3DS_BORDER_SNOWDIN,
+    N3DS_BORDER_WATERFALL,
+    N3DS_BORDER_HOTLAND,
+    N3DS_BORDER_NEW_HOME,
+    N3DS_BORDER_TRUE_LAB,
+    N3DS_BORDER_COUNT
+} N3DSBorderMode;
+
+typedef enum {
     OS_UNKNOWN = -1,
     OS_WINDOWS,
     OS_MACOSX,
@@ -487,6 +500,12 @@ typedef struct Runner {
 
     // GMS legacy (pre 2022.1) collision behavior: AABB overlap treats touching edges as overlap.
     bool collisionCompatibilityMode;
+
+    // N3DS bottom screen toggles
+    bool n3dsBottomScreenBattles;
+    bool n3dsBottomScreenText;
+    bool n3dsBottomScreenInventory;
+    int32_t n3dsBorderMode;
 } Runner;
 
 typedef struct {

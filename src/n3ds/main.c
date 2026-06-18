@@ -53,6 +53,8 @@ static bool fileExists(const char* path) {
     return stat(path, &st) == 0;
 }
 
+static void N3DSDebugTinyFont_drawText(const char* text, float x, float y, uint32_t color);
+
 static void N3DS_formatDebugSize(char* out, size_t outSize, uint32_t bytes) {
     if (out == NULL || outSize == 0) return;
 
@@ -70,6 +72,122 @@ static void N3DSDebugMonitor_init(N3DSDebugMonitor* monitor) {
     memset(monitor, 0, sizeof(*monitor));
     monitor->textBuf = C2D_TextBufNew(1024);
     monitor->sampleStartMs = osGetTime();
+}
+
+typedef struct {
+    bool visible;
+    int32_t cursor;
+} N3DSMenuState;
+
+static const char* N3DSBorderMode_toAssetName(int32_t mode) {
+    switch (mode) {
+        case N3DS_BORDER_NONE: return "border_none";
+        case N3DS_BORDER_DYNAMIC: return NULL;
+        case N3DS_BORDER_GASTER: return "room_gaster";
+        case N3DS_BORDER_RUINS: return "room_ruins";
+        case N3DS_BORDER_SNOWDIN: return "room_tundra";
+        case N3DS_BORDER_WATERFALL: return "room_water";
+        case N3DS_BORDER_HOTLAND: return "room_fire";
+        case N3DS_BORDER_NEW_HOME: return "room_castle";
+        case N3DS_BORDER_TRUE_LAB: return "room_truelab";
+        default: return "border_none";
+    }
+}
+
+static const char* N3DSBorderMode_toDisplayName(int32_t mode) {
+    switch (mode) {
+        case N3DS_BORDER_NONE: return "None";
+        case N3DS_BORDER_DYNAMIC: return "Dynamic";
+        case N3DS_BORDER_GASTER: return "Basic";
+        case N3DS_BORDER_RUINS: return "Ruins";
+        case N3DS_BORDER_SNOWDIN: return "Snowdin";
+        case N3DS_BORDER_WATERFALL: return "Waterfall";
+        case N3DS_BORDER_HOTLAND: return "Hotland";
+        case N3DS_BORDER_NEW_HOME: return "New Home";
+        case N3DS_BORDER_TRUE_LAB: return "True Lab";
+        default: return "???";
+    }
+}
+
+static void N3DSMenu_draw(N3DSMenuState* menu, Runner* runner, Renderer* renderer) {
+    if (menu == NULL || runner == NULL || renderer == NULL) return;
+    if (!menu->visible) return;
+
+    N3DSRenderer_beginBottomScreenGUI(renderer, 320, 240);
+    const float boxX = 8.0f;
+    const float boxY = 8.0f;
+    const float boxW = 304.0f;
+    const float boxH = 224.0f;
+    const float textX = boxX + 10.0f;
+    const float titleSize = 8.0f;
+
+    C2D_DrawRectSolid(0.0f, 0.0f, 0.0f, 320.0f, 240.0f, C2D_Color32(0, 0, 0, 255));
+    C2D_DrawRectSolid(boxX, boxY, 0.0f, boxW, boxH, C2D_Color32(8, 10, 16, 255));
+    C2D_DrawRectSolid(boxX, boxY, 0.0f, boxW, 2.0f, C2D_Color32(77, 118, 255, 255));
+    C2D_DrawRectSolid(boxX, boxY + boxH - 2.0f, 0.0f, boxW, 2.0f, C2D_Color32(77, 118, 255, 255));
+
+    float y = boxY + titleSize;
+    N3DSDebugTinyFont_drawText("== CINNAMON MENU ==", textX, y, C2D_Color32(255, 255, 255, 255));
+    y += 24.0f;
+
+    const char* batt = runner->n3dsBottomScreenBattles ? "ON" : "OFF";
+    const char* txt = runner->n3dsBottomScreenText ? "ON" : "OFF";
+    const char* inv = runner->n3dsBottomScreenInventory ? "ON" : "OFF";
+    const char* border = N3DSBorderMode_toDisplayName(runner->n3dsBorderMode);
+
+    char line0[64]; snprintf(line0, sizeof(line0), "%c Bottom Screen Battles: %s", menu->cursor == 0 ? '>' : ' ', batt);
+    char line1[64]; snprintf(line1, sizeof(line1), "%c Bottom Screen Text Boxes: %s", menu->cursor == 1 ? '>' : ' ', txt);
+    char line2[64]; snprintf(line2, sizeof(line2), "%c Bottom Screen Inventory: %s", menu->cursor == 2 ? '>' : ' ', inv);
+    char line3[64]; snprintf(line3, sizeof(line3), "%c Borders: %s", menu->cursor == 3 ? '>' : ' ', border);
+
+    uint32_t selColor = C2D_Color32(255, 255, 100, 255);
+    uint32_t normalColor = C2D_Color32(196, 230, 255, 255);
+
+    N3DSDebugTinyFont_drawText(line0, textX, y, menu->cursor == 0 ? selColor : normalColor); y += 20.0f;
+    N3DSDebugTinyFont_drawText(line1, textX, y, menu->cursor == 1 ? selColor : normalColor); y += 20.0f;
+    N3DSDebugTinyFont_drawText(line2, textX, y, menu->cursor == 2 ? selColor : normalColor); y += 20.0f;
+    N3DSDebugTinyFont_drawText(line3, textX, y, menu->cursor == 3 ? selColor : normalColor); y += 20.0f;
+
+    y = boxY + boxH - 28.0f;
+    N3DSDebugTinyFont_drawText("L/R: change   B: close", textX, y, C2D_Color32(146, 153, 168, 255));
+    N3DSRenderer_endBottomScreenGUI(renderer);
+}
+
+static void N3DSMenu_handleInput(N3DSMenuState* menu, Runner* runner, u32 held, u32 down) {
+    if (menu == NULL || runner == NULL) return;
+    if (!menu->visible) return;
+
+    if ((down & KEY_B) && !(held & KEY_L) && !(held & KEY_R)) {
+        menu->visible = false;
+        menu->cursor = 0;
+        return;
+    }
+
+    if ((down & KEY_UP) && menu->cursor > 0) menu->cursor--;
+    if ((down & KEY_DOWN) && menu->cursor < 3) menu->cursor++;
+
+    if (down & KEY_LEFT) {
+        switch (menu->cursor) {
+            case 0: runner->n3dsBottomScreenBattles = !runner->n3dsBottomScreenBattles; break;
+            case 1: runner->n3dsBottomScreenText = !runner->n3dsBottomScreenText; break;
+            case 2: runner->n3dsBottomScreenInventory = !runner->n3dsBottomScreenInventory; break;
+            case 3:
+                runner->n3dsBorderMode--;
+                if (runner->n3dsBorderMode < 0) runner->n3dsBorderMode = N3DS_BORDER_COUNT - 1;
+                break;
+        }
+    }
+    if (down & KEY_RIGHT) {
+        switch (menu->cursor) {
+            case 0: runner->n3dsBottomScreenBattles = !runner->n3dsBottomScreenBattles; break;
+            case 1: runner->n3dsBottomScreenText = !runner->n3dsBottomScreenText; break;
+            case 2: runner->n3dsBottomScreenInventory = !runner->n3dsBottomScreenInventory; break;
+            case 3:
+                runner->n3dsBorderMode++;
+                if (runner->n3dsBorderMode >= N3DS_BORDER_COUNT) runner->n3dsBorderMode = 0;
+                break;
+        }
+    }
 }
 
 static void N3DSDebugMonitor_free(N3DSDebugMonitor* monitor) {
@@ -374,6 +492,12 @@ static const char* N3DS_getRoomBorderAssetName(const Room* room) {
     return "border_none";
 }
 
+static const char* N3DS_getBorderAssetForRunner(const Room* room, int32_t borderMode) {
+    const char* modeAsset = N3DSBorderMode_toAssetName(borderMode);
+    if (modeAsset != NULL) return modeAsset;
+    return N3DS_getRoomBorderAssetName(room);
+}
+
 static bool N3DS_tryLoadRoomBorderSprite(const char* assetName, C2D_Sprite* outSprite, C2D_SpriteSheet* outSheet) {
     if (assetName == NULL || outSprite == NULL || outSheet == NULL) return false;
 
@@ -406,14 +530,15 @@ static bool N3DS_refreshRoomBorderSprite(
     C2D_SpriteSheet* borderSheet,
     bool* haveRoomBorder,
     char* loadedBorderAssetName,
-    size_t loadedBorderAssetNameSize
+    size_t loadedBorderAssetNameSize,
+    int32_t borderMode
 ) {
     if (borderSprite == NULL || borderSheet == NULL || haveRoomBorder == NULL ||
         loadedBorderAssetName == NULL || loadedBorderAssetNameSize == 0) {
         return false;
     }
 
-    const char* desiredAssetName = N3DS_getRoomBorderAssetName(room);
+    const char* desiredAssetName = N3DS_getBorderAssetForRunner(room, borderMode);
     if (strcmp(loadedBorderAssetName, desiredAssetName) == 0) return *haveRoomBorder;
 
     if (*borderSheet != NULL) {
@@ -777,7 +902,14 @@ int main(int argc, char** argv) {
     N3DSDebugMonitor debugMonitor;
     N3DSDebugMonitor_init(&debugMonitor);
 
+    N3DSMenuState menuState;
+    memset(&menuState, 0, sizeof(menuState));
+
     runner->osType = OS_3DS;
+    runner->n3dsBottomScreenBattles = true;
+    runner->n3dsBottomScreenText = true;
+    runner->n3dsBottomScreenInventory = true;
+    runner->n3dsBorderMode = N3DS_BORDER_DYNAMIC;
     Runner_initFirstRoom(runner);
 
     bool haveRoomBorder = false;
@@ -786,7 +918,7 @@ int main(int argc, char** argv) {
     C2D_SpriteSheet roomBorderSheet = NULL;
     char loadedRoomBorderAsset[32] = "";
     bool debugMonitorVisible = false;
-    N3DS_refreshRoomBorderSprite(runner->currentRoom, &roomBorder, &roomBorderSheet, &haveRoomBorder, loadedRoomBorderAsset, sizeof(loadedRoomBorderAsset));
+    N3DS_refreshRoomBorderSprite(runner->currentRoom, &roomBorder, &roomBorderSheet, &haveRoomBorder, loadedRoomBorderAsset, sizeof(loadedRoomBorderAsset), runner->n3dsBorderMode);
 
     bool leftHeld = false, rightHeld = false, upHeld = false, downHeld = false;
     bool aHeld = false, bHeld = false, yHeld = false;
@@ -807,30 +939,42 @@ int main(int argc, char** argv) {
         if (down & KEY_START) break;
 
         if (down & KEY_SELECT) debugMonitorVisible = !debugMonitorVisible;
-        bool debugWarpToAsriel = debugMonitorVisible && (down & KEY_L) &&
-            (uint32_t) N3DS_DEBUG_ASRIEL_ROOM < runner->dataWin->room.count;
-        if (debugWarpToAsriel) {
-            runner->pendingRoom = N3DS_DEBUG_ASRIEL_ROOM;
+
+        if ((held & KEY_L) && (held & KEY_R) && (down & KEY_B)) {
+            menuState.visible = !menuState.visible;
+            if (!menuState.visible) menuState.cursor = 0;
         }
 
-        circlePosition circle;
-        hidCircleRead(&circle);
+        bool menuActive = menuState.visible;
 
-        syncKey(runner->keyboard, &leftHeld, VK_LEFT, (held & KEY_LEFT) || circle.dx < -80);
-        syncKey(runner->keyboard, &rightHeld, VK_RIGHT, (held & KEY_RIGHT) || circle.dx > 80);
-        syncKey(runner->keyboard, &upHeld, VK_UP, (held & KEY_UP) || circle.dy > 80);
-        syncKey(runner->keyboard, &downHeld, VK_DOWN, (held & KEY_DOWN) || circle.dy < -80);
+        if (menuActive) {
+            N3DSMenu_handleInput(&menuState, runner, held, down);
+        } else {
+            bool debugWarpToAsriel = debugMonitorVisible && (down & KEY_L) &&
+                (uint32_t) N3DS_DEBUG_ASRIEL_ROOM < runner->dataWin->room.count;
+            if (debugWarpToAsriel) {
+                runner->pendingRoom = N3DS_DEBUG_ASRIEL_ROOM;
+            }
 
-        syncKey(runner->keyboard, &aHeld, 'Z', held & KEY_A);
-        syncKey(runner->keyboard, &bHeld, 'X', held & KEY_B);
-        syncKey(runner->keyboard, &yHeld, 'C', (held & KEY_Y) || (held & KEY_X));
-        syncKey(runner->keyboard, &lHeld, VK_PAGEDOWN, (held & KEY_L) && !debugWarpToAsriel);
-        syncKey(runner->keyboard, &rHeld, VK_PAGEUP, held & KEY_R);
+            circlePosition circle;
+            hidCircleRead(&circle);
+
+            syncKey(runner->keyboard, &leftHeld, VK_LEFT, (held & KEY_LEFT) || circle.dx < -80);
+            syncKey(runner->keyboard, &rightHeld, VK_RIGHT, (held & KEY_RIGHT) || circle.dx > 80);
+            syncKey(runner->keyboard, &upHeld, VK_UP, (held & KEY_UP) || circle.dy > 80);
+            syncKey(runner->keyboard, &downHeld, VK_DOWN, (held & KEY_DOWN) || circle.dy < -80);
+
+            syncKey(runner->keyboard, &aHeld, 'Z', held & KEY_A);
+            syncKey(runner->keyboard, &bHeld, 'X', held & KEY_B);
+            syncKey(runner->keyboard, &yHeld, 'C', (held & KEY_Y) || (held & KEY_X));
+            syncKey(runner->keyboard, &lHeld, VK_PAGEDOWN, (held & KEY_L) && !debugWarpToAsriel);
+            syncKey(runner->keyboard, &rHeld, VK_PAGEUP, held & KEY_R);
+        }
 
         Runner_step(runner);
         N3DS_tryTriggerAsrielLed(runner);
         runner->audioSystem->vtable->update(runner->audioSystem, 1.0f / 30.0f);
-        N3DS_refreshRoomBorderSprite(runner->currentRoom, &roomBorder, &roomBorderSheet, &haveRoomBorder, loadedRoomBorderAsset, sizeof(loadedRoomBorderAsset));
+        N3DS_refreshRoomBorderSprite(runner->currentRoom, &roomBorder, &roomBorderSheet, &haveRoomBorder, loadedRoomBorderAsset, sizeof(loadedRoomBorderAsset), runner->n3dsBorderMode);
 
         float displayScaleX = 1.0f;
         float displayScaleY = 1.0f;
@@ -844,6 +988,9 @@ int main(int argc, char** argv) {
         else N3DS_drawFallbackRoomBorder();
         if (debugMonitorVisible) {
             N3DSDebugMonitor_draw(&debugMonitor, runner, renderer);
+        }
+        if (menuState.visible) {
+            N3DSMenu_draw(&menuState, runner, renderer);
         }
         renderer->vtable->endFrame(renderer);
         C3D_FrameEnd(0);

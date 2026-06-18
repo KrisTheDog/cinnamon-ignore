@@ -3479,6 +3479,56 @@ void N3DSRenderer_endWorldBottomScreen(Renderer* base) {
     renderer->frameScaleY = renderer->savedFrameScaleY;
 }
 
+void N3DSRenderer_beginWorldTopScreen(Renderer* base, bool textAtBottom) {
+    if (base == NULL) return;
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    if (renderer->topTarget == NULL) return;
+
+    N3DSRenderer_flushC2DQueue(renderer);
+    N3DSRenderer_setDefaultGPUState(renderer);
+
+    renderer->savedFrameOffsetX = renderer->frameOffsetX;
+    renderer->savedFrameOffsetY = renderer->frameOffsetY;
+    renderer->savedViewScaleX = renderer->viewScaleX;
+    renderer->savedViewScaleY = renderer->viewScaleY;
+    renderer->savedFrameScaleX = renderer->frameScaleX;
+    renderer->savedFrameScaleY = renderer->frameScaleY;
+    renderer->savedPortOffsetX = renderer->portOffsetX;
+    renderer->savedPortOffsetY = renderer->portOffsetY;
+    renderer->savedViewX = renderer->viewX;
+    renderer->savedViewY = renderer->viewY;
+
+    renderer->portOffsetX = 0.0f;
+    renderer->portOffsetY = 0.0f;
+    renderer->frameScaleX = N3DS_BOTTOM_SCALE_FACTOR * (float) N3DS_BOTTOM_WIDTH / 640.0f;
+    renderer->frameScaleY = N3DS_BOTTOM_SCALE_FACTOR * (float) N3DS_BOTTOM_HEIGHT / 480.0f;
+    renderer->viewScaleX = renderer->frameScaleX;
+    renderer->viewScaleY = renderer->frameScaleY;
+
+    renderer->frameOffsetX = ((float) N3DS_TOP_WIDTH - (float) N3DS_BOTTOM_WIDTH) * 0.5f;
+
+    float textBoxTopWorld = textAtBottom ? 160.0f : 5.0f;
+    float textBoxTopScreen = 8.0f;
+    renderer->frameOffsetY = textBoxTopScreen - textBoxTopWorld * renderer->viewScaleY;
+}
+
+void N3DSRenderer_endWorldTopScreen(Renderer* base) {
+    if (base == NULL) return;
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    if (renderer->topTarget == NULL) return;
+    N3DSRenderer_flushC2DQueue(renderer);
+    renderer->frameOffsetX = renderer->savedFrameOffsetX;
+    renderer->frameOffsetY = renderer->savedFrameOffsetY;
+    renderer->viewScaleX = renderer->savedViewScaleX;
+    renderer->viewScaleY = renderer->savedViewScaleY;
+    renderer->frameScaleX = renderer->savedFrameScaleX;
+    renderer->frameScaleY = renderer->savedFrameScaleY;
+    renderer->portOffsetX = renderer->savedPortOffsetX;
+    renderer->portOffsetY = renderer->savedPortOffsetY;
+    renderer->viewX = renderer->savedViewX;
+    renderer->viewY = renderer->savedViewY;
+}
+
 float N3DSRenderer_getViewY(Renderer* base) {
     if (base == NULL) return 0.0f;
     return ((N3DSRenderer*) base)->viewY;
@@ -3567,6 +3617,10 @@ void N3DSRenderer_endBottomScreenGUI2x(Renderer* base) {
 }
 
 void N3DSRenderer_beginTopScreenGUI(Renderer* base, int32_t guiW, int32_t guiH) {
+    N3DSRenderer_beginTopScreenGUIEx(base, guiW, guiH, N3DS_TOP_BATTLE_SCENE_Y_OFFSET);
+}
+
+void N3DSRenderer_beginTopScreenGUIEx(Renderer* base, int32_t guiW, int32_t guiH, float yOffset) {
     if (base == NULL) return;
 
     N3DSRenderer* renderer = (N3DSRenderer*) base;
@@ -3583,7 +3637,7 @@ void N3DSRenderer_beginTopScreenGUI(Renderer* base, int32_t guiW, int32_t guiH) 
     renderer->savedViewScaleX = renderer->viewScaleX;
     renderer->savedViewScaleY = renderer->viewScaleY;
 
-    N3DSRenderer_setTopBattle320x240Layout(renderer, guiW, guiH, N3DS_TOP_BATTLE_SCENE_Y_OFFSET);
+    N3DSRenderer_setTopBattle320x240Layout(renderer, guiW, guiH, yOffset);
     renderer->topScreenGuiActive = true;
     renderer->topScreenGui2xActive = false;
 

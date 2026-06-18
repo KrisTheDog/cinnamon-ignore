@@ -32,6 +32,7 @@ void N3DSRenderer_endBottomScreenGUI(Renderer* renderer);
 void N3DSRenderer_beginBottomScreenGUI2x(Renderer* renderer, int32_t guiW, int32_t guiH);
 void N3DSRenderer_endBottomScreenGUI2x(Renderer* renderer);
 void N3DSRenderer_beginTopScreenGUI(Renderer* renderer, int32_t guiW, int32_t guiH);
+void N3DSRenderer_beginTopScreenGUIEx(Renderer* renderer, int32_t guiW, int32_t guiH, float yOffset);
 void N3DSRenderer_endTopScreenGUI(Renderer* renderer);
 void N3DSRenderer_beginTopScreenGUI2x(Renderer* renderer, int32_t guiW, int32_t guiH);
 void N3DSRenderer_endTopScreenGUI2x(Renderer* renderer);
@@ -45,6 +46,8 @@ bool N3DSRenderer_drawTileLayerChunkCache(Renderer* renderer, int32_t cacheId, f
 void N3DSRenderer_destroyTileLayerChunkCache(Renderer* renderer, int32_t cacheId);
 void N3DSRenderer_beginWorldBottomScreen(Renderer* renderer, bool textAtBottom);
 void N3DSRenderer_endWorldBottomScreen(Renderer* renderer);
+void N3DSRenderer_beginWorldTopScreen(Renderer* renderer, bool textAtBottom);
+void N3DSRenderer_endWorldTopScreen(Renderer* renderer);
 float N3DSRenderer_getViewY(Renderer* renderer);
 float N3DSRenderer_getViewScaleY(Renderer* renderer);
 #endif
@@ -696,10 +699,15 @@ static void Runner_draw3DSBottomBattleUI(Runner* runner, Drawable* drawables, in
     if (guiW <= 0) guiW = 320;
     if (guiH <= 0) guiH = 240;
 
-    if (scale == 1.0f && yOffset == 0.0f) {
-        N3DSRenderer_beginBottomScreenGUI(runner->renderer, guiW, guiH);
+    bool useBottomScreen = runner->n3dsBottomScreenBattles;
+    if (useBottomScreen) {
+        if (scale == 1.0f && yOffset == 0.0f) {
+            N3DSRenderer_beginBottomScreenGUI(runner->renderer, guiW, guiH);
+        } else {
+            N3DSRenderer_beginBottomScreenGUIEx(runner->renderer, guiW, guiH, scale, scale, 0.0f, yOffset);
+        }
     } else {
-        N3DSRenderer_beginBottomScreenGUIEx(runner->renderer, guiW, guiH, scale, scale, 0.0f, yOffset);
+        N3DSRenderer_beginTopScreenGUIEx(runner->renderer, guiW, guiH, 0.0f);
     }
     repeat(instanceCount, i) {
         Instance* inst = instances[i];
@@ -719,7 +727,26 @@ static void Runner_draw3DSBottomBattleUI(Runner* runner, Drawable* drawables, in
             }
         }
     }
-    N3DSRenderer_endBottomScreenGUI(runner->renderer);
+    if (useBottomScreen) {
+        N3DSRenderer_endBottomScreenGUI(runner->renderer);
+    } else {
+        N3DSRenderer_endTopScreenGUI(runner->renderer);
+    }
+}
+
+static bool Runner_is3DSTextBoxObjectIndex(Runner* runner, int32_t objectIndex) {
+    if (!Runner_is3DSValidObjectIndex(runner, objectIndex)) return false;
+    return Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_dialoguer") ||
+        Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_torbody") ||
+        Runner_objectContains3DSTokenInHierarchy(runner, objectIndex, "face") ||
+        Runner_is3DSBattleWriterObjectIndex(runner, objectIndex) ||
+        Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_overworldcontroller");
+}
+
+static bool Runner_is3DSInventoryObjectIndex(Runner* runner, int32_t objectIndex) {
+    if (!Runner_is3DSValidObjectIndex(runner, objectIndex)) return false;
+    return Runner_objectMatches3DSNameInHierarchy(runner, objectIndex, "obj_itemswapper") ||
+        Runner_objectContains3DSTokenInHierarchy(runner, objectIndex, "itemswapper");
 }
 
 static bool Runner_shouldHideOn3DSTopScreen(Runner* runner, Instance* inst) {
@@ -1865,22 +1892,22 @@ void Runner_draw(Runner* runner) {
             bool offsetTopBattleDamageWriter = false;
             double savedY = 0.0;
 #ifdef __3DS__
-            if (runner->osType == OS_3DS && n3dsBattleActiveForDraw &&
+            if (runner->osType == OS_3DS && n3dsBattleActiveForDraw && runner->n3dsBottomScreenBattles &&
                 Runner_shouldOffset3DSTopBattleInstance(runner, inst)) {
                 offsetTopBattleEnemy = true;
                 savedY = inst->y;
                 inst->y += k3DSTopBattleEnemyInstanceYOffset;
-            } else if (runner->osType == OS_3DS && n3dsBattleActiveForDraw &&
+            } else if (runner->osType == OS_3DS && n3dsBattleActiveForDraw && runner->n3dsBottomScreenBattles &&
                 Runner_is3DSBattleBackdropInstance(runner, inst)) {
                 offsetTopBattleBackdrop = true;
                 savedY = inst->y;
                 inst->y += k3DSTopBattleEnemyInstanceYOffset;
-            } else if (runner->osType == OS_3DS && n3dsBattleActiveForDraw &&
+            } else if (runner->osType == OS_3DS && n3dsBattleActiveForDraw && runner->n3dsBottomScreenBattles &&
                 Runner_objectMatches3DSNameInHierarchy(runner, inst->objectIndex, "obj_dmgwriter")) {
                 offsetTopBattleDamageWriter = true;
                 savedY = inst->y;
                 inst->y += k3DSTopBattleEnemyInstanceYOffset;
-            } else if (runner->osType == OS_3DS && n3dsBattleActiveForDraw &&
+            } else if (runner->osType == OS_3DS && n3dsBattleActiveForDraw && runner->n3dsBottomScreenBattles &&
                 Runner_is3DSBattleWriterObjectIndex(runner, inst->objectIndex)) {
                 offsetTopBattleEnemy = true;
                 savedY = inst->y;
@@ -2097,6 +2124,8 @@ void Runner_draw(Runner* runner) {
             Instance* inst = d->instance;
             if (inst == NULL || !inst->active) continue;
             if (Runner_is3DSOverworldDialogueObjectIndex(runner, inst->objectIndex)) {
+                if (!runner->n3dsBottomScreenText && Runner_is3DSTextBoxObjectIndex(runner, inst->objectIndex)) continue;
+                if (!runner->n3dsBottomScreenInventory && Runner_is3DSInventoryObjectIndex(runner, inst->objectIndex)) continue;
                 int32_t ownerObjectIndex = -1;
                 int32_t codeId = drawNormalSlot >= 0
                     ? ResolvedEventTable_lookup(&runner->eventTable, inst->objectIndex, drawNormalSlot, &ownerObjectIndex)
@@ -2109,6 +2138,31 @@ void Runner_draw(Runner* runner) {
             }
         }
         N3DSRenderer_endWorldBottomScreen(runner->renderer);
+        if (!runner->n3dsBottomScreenText || !runner->n3dsBottomScreenInventory) {
+            N3DSRenderer_beginWorldTopScreen(runner->renderer, textAtBottom);
+            repeat(drawableCount, i) {
+                Drawable* d = &drawables[i];
+                if (d->type != DRAWABLE_INSTANCE) continue;
+                Instance* inst = d->instance;
+                if (inst == NULL || !inst->active) continue;
+                if (!Runner_is3DSOverworldDialogueObjectIndex(runner, inst->objectIndex)) continue;
+                bool isTextBox = Runner_is3DSTextBoxObjectIndex(runner, inst->objectIndex);
+                bool isInventory = Runner_is3DSInventoryObjectIndex(runner, inst->objectIndex);
+                bool drawOnTop = (!runner->n3dsBottomScreenText && isTextBox) ||
+                                 (!runner->n3dsBottomScreenInventory && isInventory);
+                if (!drawOnTop) continue;
+                int32_t ownerObjectIndex = -1;
+                int32_t codeId = drawNormalSlot >= 0
+                    ? ResolvedEventTable_lookup(&runner->eventTable, inst->objectIndex, drawNormalSlot, &ownerObjectIndex)
+                    : -1;
+                if (codeId >= 0) {
+                    Runner_executeResolvedEvent(runner, inst, EVENT_DRAW, DRAW_NORMAL, codeId, ownerObjectIndex);
+                } else if (runner->renderer != nullptr) {
+                    Renderer_drawSelf(runner->renderer, inst);
+                }
+            }
+            N3DSRenderer_endWorldTopScreen(runner->renderer);
+        }
         }
     }
 #endif

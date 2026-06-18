@@ -3134,7 +3134,9 @@ static RValue builtinBattleControllerDraw(VMContext* ctx, MAYBE_UNUSED RValue* a
     if (runner == NULL || runner->renderer == NULL) return RValue_makeUndefined();
 
 #ifdef __3DS__
-    if (runner->osType == OS_3DS && N3DSRenderer_isTopScreenGUIActive(runner->renderer)) {
+    if (runner->osType == OS_3DS &&
+        runner->n3dsBottomScreenBattles &&
+        N3DSRenderer_isTopScreenGUIActive(runner->renderer)) {
         return RValue_makeUndefined();
     }
 #endif
@@ -3386,7 +3388,9 @@ static RValue builtinBlackBordererDraw(VMContext* ctx, MAYBE_UNUSED RValue* args
     if (runner == NULL || runner->renderer == NULL) return RValue_makeUndefined();
 
 #ifdef __3DS__
-    if (runner->osType == OS_3DS && N3DSRenderer_isTopScreenGUIActive(runner->renderer)) {
+    if (runner->osType == OS_3DS &&
+        runner->n3dsBottomScreenBattles &&
+        N3DSRenderer_isTopScreenGUIActive(runner->renderer)) {
         return RValue_makeUndefined();
     }
 #endif
@@ -6896,12 +6900,32 @@ static bool shouldSkipDeltaruneTextFragment(Renderer* renderer, const char* text
     return false;
 }
 
-static float builtin_get3DSTopEnemyDialogueTextScale(Runner* runner) {
+static bool builtin_is3DSTopEnemyDialogueTextOwner(VMContext* ctx) {
+#ifdef __3DS__
+    if (ctx == NULL || ctx->currentInstance == NULL) return false;
+    Instance* inst = (Instance*) ctx->currentInstance;
+    int32_t objectIndex = inst->objectIndex;
+    return battleDraw_objectMatchesNameInHierarchy(ctx, objectIndex, "obj_writer") ||
+        battleDraw_objectMatchesNameInHierarchy(ctx, objectIndex, "obj_writer_quiz") ||
+        battleDraw_objectMatchesNameInHierarchy(ctx, objectIndex, "obj_healwriter") ||
+        battleDraw_objectMatchesNameInHierarchy(ctx, objectIndex, "OBJ_WRITER") ||
+        battleDraw_objectMatchesNameInHierarchy(ctx, objectIndex, "OBJ_NOMSCWRITER") ||
+        battleDraw_objectMatchesNameInHierarchy(ctx, objectIndex, "obj_blconsm") ||
+        battleDraw_objectMatchesNameInHierarchy(ctx, objectIndex, "obj_blconwdflowey") ||
+        battleDraw_objectMatchesNameInHierarchy(ctx, objectIndex, "obj_blconwideslave");
+#else
+    (void) ctx;
+    return false;
+#endif
+}
+
+static float builtin_get3DSTopEnemyDialogueTextScale(VMContext* ctx, Runner* runner) {
 #ifdef __3DS__
     if (runner != NULL &&
         runner->osType == OS_3DS &&
         runner->renderer != NULL &&
         runner->n3dsDrawHasTopEnemyDialogue &&
+        builtin_is3DSTopEnemyDialogueTextOwner(ctx) &&
         N3DSRenderer_isTopScreenGUIActive(runner->renderer)) {
         return 2.0f;
     }
@@ -7042,7 +7066,7 @@ static RValue builtin_drawText(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_
     }
 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
-    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(runner);
+    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(ctx, runner);
     runner->renderer->vtable->drawText(runner->renderer, processedText.text, x, y, dialogueTextScale, dialogueTextScale, 0.0f);
     PreprocessedText_free(processedText);
     free(ownedStr);
@@ -7066,7 +7090,7 @@ static RValue builtin_drawTextTransformed(VMContext* ctx, RValue* args, MAYBE_UN
     }
 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
-    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(runner);
+    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(ctx, runner);
     runner->renderer->vtable->drawText(runner->renderer, processedText.text, x, y, xscale * dialogueTextScale, yscale * dialogueTextScale, angle);
     PreprocessedText_free(processedText);
     free(ownedStr);
@@ -7089,7 +7113,7 @@ static RValue builtin_drawTextExt(VMContext* ctx, RValue* args, MAYBE_UNUSED int
     }
 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
-    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(runner);
+    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(ctx, runner);
     char* wrappedText = builtin_wrapProcessedTextForWidth(runner->renderer, processedText.text, (float) width, dialogueTextScale);
     const char* drawText = wrappedText != NULL ? wrappedText : processedText.text;
     runner->renderer->vtable->drawText(runner->renderer, drawText, x, y, dialogueTextScale, dialogueTextScale, 0.0f);
@@ -7119,7 +7143,7 @@ static RValue builtin_drawTextExtTransformed(VMContext* ctx, RValue* args, MAYBE
     }
 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
-    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(runner);
+    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(ctx, runner);
     char* wrappedText = builtin_wrapProcessedTextForWidth(runner->renderer, processedText.text, (float) width, xscale * dialogueTextScale);
     const char* drawText = wrappedText != NULL ? wrappedText : processedText.text;
     runner->renderer->vtable->drawText(runner->renderer, drawText, x, y, xscale * dialogueTextScale, yscale * dialogueTextScale, angle);
@@ -7149,7 +7173,7 @@ static RValue builtin_drawTextColor(VMContext* ctx, RValue* args, MAYBE_UNUSED i
     }
 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
-    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(runner);
+    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(ctx, runner);
     runner->renderer->vtable->drawTextColor(runner->renderer, processedText.text, x, y, dialogueTextScale, dialogueTextScale, 0.0f, c1, c2, c3, c4, alpha);
     PreprocessedText_free(processedText);
     free(ownedStr);
@@ -7178,7 +7202,7 @@ static RValue builtin_drawTextColorTransformed(VMContext* ctx, RValue* args, MAY
     }
 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
-    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(runner);
+    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(ctx, runner);
     runner->renderer->vtable->drawTextColor(runner->renderer, processedText.text, x, y, xscale * dialogueTextScale, yscale * dialogueTextScale, angle, c1, c2, c3, c4, alpha);
     PreprocessedText_free(processedText);
     free(ownedStr);
@@ -7204,7 +7228,7 @@ static RValue builtin_drawTextColorExt(VMContext* ctx, RValue* args, MAYBE_UNUSE
     }
 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
-    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(runner);
+    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(ctx, runner);
     char* wrappedText = builtin_wrapProcessedTextForWidth(runner->renderer, processedText.text, (float) RValue_toInt32(args[4]), dialogueTextScale);
     const char* drawText = wrappedText != NULL ? wrappedText : processedText.text;
     runner->renderer->vtable->drawTextColor(runner->renderer, drawText, x, y, dialogueTextScale, dialogueTextScale, 0.0f, c1, c2, c3, c4, alpha);
@@ -7236,7 +7260,7 @@ static RValue builtin_drawTextColorExtTransformed(VMContext* ctx, RValue* args, 
     }
 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
-    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(runner);
+    float dialogueTextScale = builtin_get3DSTopEnemyDialogueTextScale(ctx, runner);
     char* wrappedText = builtin_wrapProcessedTextForWidth(runner->renderer, processedText.text, (float) RValue_toInt32(args[4]), xscale * dialogueTextScale);
     const char* drawText = wrappedText != NULL ? wrappedText : processedText.text;
     runner->renderer->vtable->drawTextColor(runner->renderer, drawText, x, y, xscale * dialogueTextScale, yscale * dialogueTextScale, angle, c1, c2, c3, c4, alpha);
