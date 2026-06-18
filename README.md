@@ -9,8 +9,6 @@
 
 ---
 
-> [!IMPORTANT]  
-> Cinnamon is not finished and will have bugs. This branch is an experimental branch.
 
 When you create a game in GameMaker: Studio and export it, GameMaker: Studio exports the game code as bytecode instead of native compiled code, and that bytecode is compatible with any other GameMaker: Studio runner (also known as YoYo runner), as long as they have matching GameMaker: Studio versions. This is similar to how Java applications work.
 
