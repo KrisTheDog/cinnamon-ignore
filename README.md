@@ -29,6 +29,7 @@ TO DO (3DS):
 - fix undyne battle box (i think???)
 - im pretty sure flowey has a different battle room (first encounter) so implement bottom screen for that room
 - fix dust animation
+- native scripts for asgore orange particles, bullets, and omega flowey
 
 THINGS TO PONDER (3DS):
 - So Sorry fight, can i render the tail to BOTH top and bottom? Would it still look "good"?
