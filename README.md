@@ -27,6 +27,7 @@ TO DO (3DS):
 - fix flowey (i hope lmfao)
 - fix battle box because it looks weird
 - fix undyne battle box (i think???)
+- im pretty sure flowey has a different battle room (first encounter) so implement bottom screen for that room
 
 When you create a game in GameMaker: Studio and export it, GameMaker: Studio exports the game code as bytecode instead of native compiled code, and that bytecode is compatible with any other GameMaker: Studio runner (also known as YoYo runner), as long as they have matching GameMaker: Studio versions. This is similar to how Java applications work.
 
