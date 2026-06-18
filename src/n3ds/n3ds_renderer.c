@@ -70,7 +70,7 @@
 // bottom screen dialogue scale multiplier (2.0 = fills 288 of 320px width)
 #define N3DS_BOTTOM_SCALE_FACTOR 2.0f
 #define N3DS_TOP_BATTLE_ENEMY_Y_OFFSET 112.0f
-#define N3DS_C2D_FLUSH_DRAW_BUDGET 192u
+#define N3DS_C2D_FLUSH_DRAW_BUDGET 1500u
 #define N3DS_PERF_LOG_INTERVAL_FRAMES 30u
 #define N3DS_ATLAS_TRACE_LOG_PATH "sdmc:/3ds/cinnamon/atlas_trace.log"
 
