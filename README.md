@@ -29,6 +29,13 @@ TO DO (3DS):
 - fix undyne battle box (i think???)
 - im pretty sure flowey has a different battle room (first encounter) so implement bottom screen for that room
 
+THINGS TO PONDER (3DS):
+- So Sorry fight, can i render the tail to BOTH top and bottom? Would it still look "good"?
+- ASGORE Spear attack, can i render the spear animation to BOTH screens?
+- Asriel.. Can I make Asriel work with bottom screen?
+- I should make the White soul to render on top and the red soul to render on bottom when you kill toriel or ASGORE
+- Omega Flowey with LED support? 
+
 When you create a game in GameMaker: Studio and export it, GameMaker: Studio exports the game code as bytecode instead of native compiled code, and that bytecode is compatible with any other GameMaker: Studio runner (also known as YoYo runner), as long as they have matching GameMaker: Studio versions. This is similar to how Java applications work.
 
 This is how projects such as Droidtale can exist. We exploit that GameMaker: Studio games compile to bytecode, which means they can be ran on any platform that has an official runner for it!
