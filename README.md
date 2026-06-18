@@ -23,6 +23,10 @@ TO DO (3DS):
 - Implement touch
 - Fix asgore bergentruckung scene, no text, spear animation not showing
 - Fix Undyne camera issue (? not sure if its been fixed)
+- native script for asgore bg
+- fix flowey (i hope lmfao)
+- fix battle box because it looks weird
+- fix undyne battle box (i think???)
 
 When you create a game in GameMaker: Studio and export it, GameMaker: Studio exports the game code as bytecode instead of native compiled code, and that bytecode is compatible with any other GameMaker: Studio runner (also known as YoYo runner), as long as they have matching GameMaker: Studio versions. This is similar to how Java applications work.
 
