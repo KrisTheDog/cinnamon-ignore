@@ -9,34 +9,6 @@
 
 ---
 
-> [!IMPORTANT]  
-> This is an experimental branch of cinnamon and may have bugs.
-
-TO DO (3DS):
-- Fix inventory and menu glitch where they both appear even with one off
-- Fix culling, do not cull from middle
-- Fix a weird glitch where bullets shake VERY badly
-- Fix bullets appearing on the wrong screen
-- Fix bottom screen appearing OVER menu
-- Fix room_introstory (text renders on bottom which is disabled due to issues)
-- Fix room_gameover (Text not rendering)
-- Implement touch
-- Fix asgore bergentruckung scene, no text, spear animation not showing
-- Fix Undyne camera issue (? not sure if its been fixed)
-- native script for asgore bg
-- fix flowey (i hope lmfao)
-- fix battle box because it looks weird
-- fix undyne battle box (i think???)
-- im pretty sure flowey has a different battle room (first encounter) so implement bottom screen for that room
-- fix dust animation
-- native scripts for asgore orange particles, bullets, and omega flowey
-
-THINGS TO PONDER (3DS):
-- So Sorry fight, can i render the tail to BOTH top and bottom? Would it still look "good"?
-- ASGORE Spear attack, can i render the spear animation to BOTH screens?
-- Asriel.. Can I make Asriel work with bottom screen?
-- I should make the White soul to render on top and the red soul to render on bottom when you kill toriel or ASGORE
-- Omega Flowey with LED support? 
 
 When you create a game in GameMaker: Studio and export it, GameMaker: Studio exports the game code as bytecode instead of native compiled code, and that bytecode is compatible with any other GameMaker: Studio runner (also known as YoYo runner), as long as they have matching GameMaker: Studio versions. This is similar to how Java applications work.
 
