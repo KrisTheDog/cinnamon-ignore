@@ -1,3 +1,8 @@
+TODO
+- Fix Text Box Allignment
+- Touch Support
+- Fix menu, text boxes off also turns off inventory
+
 <h1 align="center">Cinnamon</h1>
 
 <p align="center">
